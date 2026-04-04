@@ -321,4 +321,106 @@ export function summarizeDiff(patches: Patch[]): DiffSummary {
 function generateChangeDescription(
   changeType: FileSummary['changeType'],
   insertions: number,
-  deletions:
+  deletions: number
+): string {
+  switch (changeType) {
+    case 'added':
+      return `Added ${insertions} line${insertions !== 1 ? 's' : ''}`;
+    case 'deleted':
+      return `Deleted ${deletions} line${deletions !== 1 ? 's' : ''}`;
+    case 'modified':
+      return `Modified (${insertions} added, ${deletions} removed)`;
+  }
+}
+
+/**
+ * Generate overview text for diff stats
+ */
+function generateOverview(stats: DiffStats): string {
+  const { filesChanged, insertions, deletions } = stats;
+  const fileWord = filesChanged === 1 ? 'file' : 'files';
+  
+  if (insertions === 0 && deletions === 0) {
+    return `No changes in ${filesChanged} ${fileWord}`;
+  }
+  
+  const parts: string[] = [];
+  if (insertions > 0) parts.push(`${insertions} insertion${insertions !== 1 ? 's' : ''}`);
+  if (deletions > 0) parts.push(`${deletions} deletion${deletions !== 1 ? 's' : ''}`);
+  
+  return `${filesChanged} ${fileWord} changed, ${parts.join(', ')}`;
+}
+
+/**
+ * Get patch history
+ */
+export function getPatchHistory(): readonly PatchHistoryEntry[] {
+  return Object.freeze([...patchHistory]);
+}
+
+/**
+ * Check if a patch can be rolled back
+ */
+export function canRollback(patchId: string): boolean {
+  return activeSnapshots.has(patchId);
+}
+
+/**
+ * Get all active snapshot IDs
+ */
+export function getActiveSnapshotIds(): string[] {
+  return Array.from(activeSnapshots.keys());
+}
+
+/**
+ * Clear old snapshots based on retention policy
+ */
+export function cleanupSnapshots(maxAgeDays?: number): string[] {
+  const config = DEFAULT_CONFIG;
+  const retentionMs = (maxAgeDays ?? config.snapshotRetentionDays) * 24 * 60 * 60 * 1000;
+  const now = Date.now();
+  const removed: string[] = [];
+
+  // Filter history entries
+  const cutoff = now - retentionMs;
+  
+  for (const [id, snapshot] of activeSnapshots) {
+    const historyEntry = patchHistory.find(h => h.id === id);
+    if (historyEntry && historyEntry.timestamp < cutoff) {
+      activeSnapshots.delete(id);
+      removed.push(id);
+    }
+  }
+
+  return removed;
+}
+
+/**
+ * Generate unified diff format output
+ */
+export function generateUnifiedDiff(patch: Patch): string {
+  const lines: string[] = [];
+  lines.push(`--- a/${patch.targetPath}`);
+  lines.push(`+++ b/${patch.targetPath}`);
+
+  for (const hunk of patch.hunks) {
+    const oldCount = hunk.oldRange.end - hunk.oldRange.start;
+    const newCount = hunk.newRange.end - hunk.newRange.start;
+    lines.push(`@@ -${hunk.oldRange.start},${oldCount} +${hunk.newRange.start},${newCount} @@`);
+    
+    for (const line of hunk.contextBefore) {
+      lines.push(` ${line}`);
+    }
+    for (const line of hunk.removedLines) {
+      lines.push(`-${line}`);
+    }
+    for (const line of hunk.addedLines) {
+      lines.push(`+${line}`);
+    }
+    for (const line of hunk.contextAfter) {
+      lines.push(` ${line}`);
+    }
+  }
+
+  return lines.join('\n');
+}
