@@ -245,4 +245,144 @@ export class DeepSeekReasonerRouter {
     score += specificSteps * 0.1;
 
     // Penalize high estimated effort
-    if (strategy.estimatedEffort === 'high')
+    if (strategy.estimatedEffort === 'high') {
+      score -= 0.2;
+    }
+
+    // Adjust based on risk level
+    if (strategy.risks.includes('breaking_change')) {
+      score -= 0.15;
+    }
+
+    // Clamp to 0-1 range
+    return Math.max(0, Math.min(1, score));
+  }
+
+  /**
+   * Estimate effort level for a repair plan
+   */
+  private estimateEffort(plan: RepairPlan): RepairStrategy['estimatedEffort'] {
+    const stepCount = plan.steps.length;
+    if (stepCount <= 2) return 'low';
+    if (stepCount <= 4) return 'medium';
+    return 'high';
+  }
+
+  /**
+   * Assess risks for a given failure analysis
+   */
+  private assessRisks(analysis: FailureAnalysis): RepairStrategy['risks'] {
+    const risks: RepairStrategy['risks'] = [];
+
+    if (analysis.affectedFiles.length > 3) {
+      risks.push('wide_impact');
+    }
+    if (analysis.failureType === 'dependency_error') {
+      risks.push('cascading_failure');
+    }
+    if (analysis.failureType === 'test_failure') {
+      risks.push('breaking_change');
+    }
+
+    return risks;
+  }
+
+  /**
+   * Suggest alternative approaches
+   */
+  private suggestAlternatives(analysis: FailureAnalysis): RepairStrategy['alternatives'] {
+    const alternatives: RepairStrategy['alternatives'] = [];
+
+    if (analysis.failureType === 'test_failure') {
+      alternatives.push({
+        description: 'Revert changes and try different approach',
+        confidence: 0.6,
+      });
+    }
+
+    if (analysis.failureType === 'type_error') {
+      alternatives.push({
+        description: 'Use type assertion as temporary fix',
+        confidence: 0.4,
+      });
+    }
+
+    return alternatives;
+  }
+
+  /**
+   * Estimate token count for repair steps
+   */
+  private estimateRepairTokens(steps: RepairPlan['steps']): number {
+    // Rough estimate: 500 tokens per step
+    return steps.length * 500;
+  }
+
+  /**
+   * Get confidence level category
+   */
+  getConfidenceLevel(score: number): ConfidenceLevel {
+    if (score >= 0.8) return 'high';
+    if (score >= 0.5) return 'medium';
+    return 'low';
+  }
+
+  /**
+   * Register a custom reasoning hook
+   */
+  registerHook(name: string, hook: ReasoningHook): void {
+    this.reasoningHooks.set(name, hook);
+  }
+
+  /**
+   * Execute a registered hook
+   */
+  async executeHook(name: string, context: RepairContext): Promise<ReasoningResult | null> {
+    const hook = this.reasoningHooks.get(name);
+    if (hook) {
+      return await hook(context);
+    }
+    return null;
+  }
+
+  /**
+   * Register default reasoning hooks
+   */
+  private registerDefaultHooks(): void {
+    // Default fallback hook
+    this.registerHook('default', async (context) => {
+      return await this.analyzeFailure(context);
+    });
+
+    // Quick fix hook for simple errors
+    this.registerHook('quick_fix', async (context) => {
+      if (context.errors.length === 1 && context.attemptNumber === 1) {
+        // Fast path for single errors on first attempt
+        const analysis = await this.performFailureAnalysis(context);
+        if (analysis.failureType !== 'unknown') {
+          const strategy = this.generateRepairStrategy(analysis);
+          const confidence = Math.min(0.9, this.scoreConfidence(strategy) + 0.2);
+          return {
+            rootCause: analysis.rootCause,
+            strategy,
+            confidence,
+            reasoningChain: [...analysis.reasoningChain, 'Quick fix path taken'],
+            metadata: {
+              model: this.config.model,
+              analyzedAt: Date.now(),
+              errorCount: context.errors.length,
+            },
+          };
+        }
+      }
+      return null;
+    });
+  }
+}
+
+/**
+ * Singleton instance for global use
+ */
+export const deepseekRouter = new DeepSeekReasonerRouter();
+
+export default DeepSeekReasonerRouter;
