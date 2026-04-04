@@ -2,6 +2,7 @@
  * JackCode Type Definitions
  */
 
+export * from './cli.js';
 export * from './impact-analyzer.js';
 export * from './memory-adapter.js';
 export * from './patch.js';
