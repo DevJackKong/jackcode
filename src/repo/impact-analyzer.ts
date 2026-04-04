@@ -261,3 +261,279 @@ export class ImpactAnalyzer implements IImpactAnalyzer {
     affectedTests.push(...testFiles);
   }
 
+  /**
+   * Helper: Add or update an impacted file
+   */
+  private addImpactedFile(
+    impactedFiles: Map<string, ImpactedFile>,
+    file: ImpactedFile
+  ): void {
+    const existing = impactedFiles.get(file.path);
+    if (existing) {
+      // Merge with existing entry
+      existing.category = this.mergeCategory(existing.category, file.category);
+      existing.severity = this.higherSeverity(existing.severity, file.severity);
+      existing.reasons = [...new Set([...existing.reasons, ...file.reasons])];
+      existing.distance = Math.min(existing.distance, file.distance);
+      if (file.affectedSymbols) {
+        existing.affectedSymbols = [...new Set([...(existing.affectedSymbols || []), ...file.affectedSymbols])];
+      }
+    } else {
+      impactedFiles.set(file.path, file);
+    }
+  }
+
+  /**
+   * Calculate severity from change type
+   */
+  private severityFromChangeType(type: ChangeType): ImpactSeverity {
+    switch (type) {
+      case 'delete':
+        return 'critical';
+      case 'rename':
+        return 'high';
+      case 'modify':
+        return 'high';
+      case 'add':
+        return 'medium';
+      default:
+        return 'medium';
+    }
+  }
+
+  /**
+   * Calculate severity for transitive impact
+   */
+  private calculateTransitiveSeverity(distance: number, isTest: boolean): ImpactSeverity {
+    if (isTest) {
+      return 'low';
+    }
+    if (distance <= 1) {
+      return 'high';
+    }
+    if (distance <= 3) {
+      return 'medium';
+    }
+    return 'low';
+  }
+
+  /**
+   * Merge two impact categories (prefer more specific)
+   */
+  private mergeCategory(a: ImpactCategory, b: ImpactCategory): ImpactCategory {
+    const priority: ImpactCategory[] = ['direct', 'transitive', 'test', 'type-only', 'dynamic'];
+    const aIdx = priority.indexOf(a);
+    const bIdx = priority.indexOf(b);
+    return priority[Math.min(aIdx, bIdx)];
+  }
+
+  /**
+   * Return the higher severity
+   */
+  private higherSeverity(a: ImpactSeverity, b: ImpactSeverity): ImpactSeverity {
+    const order: ImpactSeverity[] = ['critical', 'high', 'medium', 'low', 'none'];
+    return order[Math.min(order.indexOf(a), order.indexOf(b))];
+  }
+
+  /**
+   * Check if a file is a test file
+   */
+  private isTestFile(path: string): boolean {
+    return this.options.testPatterns.some(pattern => {
+      // Simple glob matching - real implementation would use proper glob
+      const regex = pattern
+        .replace(/\*\*/g, '.*')
+        .replace(/\*/g, '[^/]*')
+        .replace(/\?/g, '.');
+      return new RegExp(regex).test(path);
+    });
+  }
+
+  /**
+   * Find tests that cover a given source file
+   * Stub implementation - should integrate with test mapping
+   */
+  private findCoveringTests(sourcePath: string): string[] {
+    // This would integrate with a test coverage mapping system
+    // For now, return empty - real implementation would:
+    // 1. Check coverage data if available
+    // 2. Look for tests in same directory
+    // 3. Check test file naming conventions
+    return [];
+  }
+
+  /**
+   * Calculate test priority based on impacted file
+   */
+  private calculateTestPriority(file: ImpactedFile): 'critical' | 'high' | 'normal' {
+    if (file.severity === 'critical') {
+      return 'critical';
+    }
+    if (file.severity === 'high' || file.distance <= 1) {
+      return 'high';
+    }
+    return 'normal';
+  }
+
+  /**
+   * Infer test scope from test file path
+   */
+  private inferTestScope(testPath: string): 'unit' | 'integration' | 'e2e' {
+    const lower = testPath.toLowerCase();
+    if (lower.includes('e2e') || lower.includes('end-to-end') || lower.includes('integration')) {
+      return 'e2e';
+    }
+    if (lower.includes('integration')) {
+      return 'integration';
+    }
+    return 'unit';
+  }
+
+  /**
+   * Calculate summary statistics
+   */
+  private calculateSummary(
+    impactedFiles: Map<string, ImpactedFile>,
+    affectedTests: AffectedTest[]
+  ): ImpactReport['summary'] {
+    const files = Array.from(impactedFiles.values());
+    const directImpacts = files.filter(f => f.category === 'direct').length;
+    const transitiveImpacts = files.filter(f => f.category === 'transitive').length;
+    const testFilesImpacted = files.filter(f => f.category === 'test').length;
+    const maxDistance = files.length > 0 ? Math.max(...files.map(f => f.distance)) : 0;
+
+    return {
+      totalFilesImpacted: files.length,
+      directImpacts,
+      transitiveImpacts,
+      testFilesImpacted,
+      maxDistance,
+    };
+  }
+
+  /**
+   * Assess overall risk level
+   */
+  private assessRiskLevel(
+    impactedFiles: Map<string, ImpactedFile>,
+    affectedTests: AffectedTest[]
+  ): 'low' | 'medium' | 'high' {
+    const files = Array.from(impactedFiles.values());
+
+    // Critical severity found
+    if (files.some(f => f.severity === 'critical')) {
+      return 'high';
+    }
+
+    // Many high severity or transitive impacts
+    const highSeverityCount = files.filter(f => f.severity === 'high').length;
+    if (highSeverityCount > 5 || files.length > 20) {
+      return 'high';
+    }
+
+    // Moderate impact
+    if (highSeverityCount > 0 || files.length > 5) {
+      return 'medium';
+    }
+
+    return 'low';
+  }
+
+  /**
+   * Generate recommendations based on impact
+   */
+  private generateRecommendations(
+    impactedFiles: Map<string, ImpactedFile>,
+    affectedTests: AffectedTest[],
+    riskLevel: 'low' | 'medium' | 'high'
+  ): string[] {
+    const recommendations: string[] = [];
+    const files = Array.from(impactedFiles.values());
+
+    if (riskLevel === 'high') {
+      recommendations.push('Run full test suite due to high impact changes');
+      recommendations.push('Consider incremental rollout or feature flags');
+    }
+
+    if (files.some(f => f.category === 'transitive' && f.distance > 3)) {
+      recommendations.push('Deep dependency chain detected - review for potential circular dependencies');
+    }
+
+    if (affectedTests.length === 0) {
+      recommendations.push('No tests detected for changed files - consider adding test coverage');
+    }
+
+    const criticalFiles = files.filter(f => f.severity === 'critical');
+    if (criticalFiles.length > 0) {
+      recommendations.push(`Review ${criticalFiles.length} critical impact(s) before merging`);
+    }
+
+    return recommendations;
+  }
+
+  // Public API methods
+
+  /**
+   * Invalidate cached dependency data for specific paths
+   */
+  invalidateCache(paths?: string[]): void {
+    if (paths) {
+      for (const path of paths) {
+        this.dependencyGraph.delete(path);
+      }
+    } else {
+      this.dependencyGraph.clear();
+    }
+  }
+
+  /**
+   * Rebuild the entire dependency graph
+   * Stub - requires integration with repo scanner and symbol index
+   */
+  async rebuildGraph(): Promise<void> {
+    // This would integrate with:
+    // 1. RepoScanner to find all source files
+    // 2. SymbolIndex to parse imports/exports
+    // For now, clear the cache
+    this.dependencyGraph.clear();
+  }
+
+  /**
+   * Get the dependency node for a file
+   */
+  getNode(path: string): DependencyNode | undefined {
+    return this.dependencyGraph.get(path);
+  }
+
+  /**
+   * Check if a file depends on another
+   */
+  hasDependency(from: string, to: string): boolean {
+    const fromNode = this.dependencyGraph.get(from);
+    if (!fromNode) {
+      return false;
+    }
+    return fromNode.imports.some(imp => this.resolveImportPath(imp.source, from) === to);
+  }
+
+  /**
+   * Add or update a node in the dependency graph
+   * Called by external systems (symbol index, repo scanner)
+   */
+  updateNode(node: DependencyNode): void {
+    this.dependencyGraph.set(node.path, node);
+  }
+
+  /**
+   * Get all registered nodes
+   */
+  getAllNodes(): Map<string, DependencyNode> {
+    return new Map(this.dependencyGraph);
+  }
+}
+
+// Factory function for creating analyzer instances
+export function createImpactAnalyzer(options?: Partial<ImpactAnalyzerOptions>): ImpactAnalyzer {
+  return new ImpactAnalyzer(options);
+}
+

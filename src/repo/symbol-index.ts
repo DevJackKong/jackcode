@@ -305,6 +305,327 @@ export class SymbolIndex {
           });
         }
       }
+    }
+
+    return entries;
+  }
+
+  /**
+   * Check if node is an export
+   */
+  private isExport(node: ts.Node): boolean {
+    if (ts.isExportDeclaration(node)) return true;
+    if (ts.isVariableStatement(node) || ts.isFunctionDeclaration(node)) {
+      return node.modifiers?.some((m) => m.kind === ts.SyntaxKind.ExportKeyword) ?? false;
+    }
+    return false;
+  }
+
+  /**
+   * Parse export declaration
+   */
+  private parseExport(
+    node: ts.Node,
+    filePath: string,
+    sourceFile: ts.SourceFile
+  ): ExportEntry[] {
+    const entries: ExportEntry[] = [];
+
+    // Named exports: export { x, y }
+    if (ts.isExportDeclaration(node)) {
+      const specifiers = node.exportClause;
+      if (specifiers && ts.isNamedExports(specifiers)) {
+        for (const element of specifiers.elements) {
+          const name = element.name.getText(sourceFile);
+          const symbolId = makeSymbolId(filePath, name);
+
+          // Create definition
+          const def: SymbolDefinition = {
+            id: symbolId,
+            name,
+            kind: 'const',
+            location: this.getNodeLocation(node, sourceFile),
+            isDefault: false,
+            isNamed: true,
+          };
+
+          this.definitions.set(symbolId, def);
+          entries.push({ symbolId });
+        }
+      }
+
+      // Re-export: export { x } from './module'
+      if (node.moduleSpecifier) {
+        const reExportPath = node.moduleSpecifier.getText(sourceFile).slice(1, -1);
+        const resolvedPath = this.resolveImportPath(reExportPath, filePath);
+
+        if (specifiers && ts.isNamedExports(specifiers)) {
+          for (const element of specifiers.elements) {
+            const name = element.name.getText(sourceFile);
+            const symbolId = makeSymbolId(resolvedPath ?? filePath, name);
+            entries.push({ symbolId, reExportedFrom: reExportPath });
+          }
+        }
+      }
+    }
+
+    // Exported function: export function foo()
+    if (ts.isFunctionDeclaration(node) && node.name) {
+      const name = node.name.getText(sourceFile);
+      const symbolId = makeSymbolId(filePath, name);
+
+      const def: SymbolDefinition = {
+        id: symbolId,
+        name,
+        kind: 'function',
+        location: this.getNodeLocation(node, sourceFile),
+        isDefault: false,
+        isNamed: true,
+      };
+
+      this.definitions.set(symbolId, def);
+      entries.push({ symbolId });
+    }
+
+    // Exported variable: export const x = ...
+    if (ts.isVariableStatement(node)) {
+      for (const decl of node.declarationList.declarations) {
+        if (ts.isIdentifier(decl.name)) {
+          const name = decl.name.getText(sourceFile);
+          const symbolId = makeSymbolId(filePath, name);
+
+          const kind = this.inferSymbolKind(node, decl);
+          const def: SymbolDefinition = {
+            id: symbolId,
+            name,
+            kind,
+            location: this.getNodeLocation(node, sourceFile),
+            isDefault: false,
+            isNamed: true,
+          };
+
+          this.definitions.set(symbolId, def);
+          entries.push({ symbolId });
+        }
+      }
+    }
+
+    // Class/Interface/Enum declarations with export modifier
+    if (
+      ts.isClassDeclaration(node) ||
+      ts.isInterfaceDeclaration(node) ||
+      ts.isEnumDeclaration(node) ||
+      ts.isTypeAliasDeclaration(node)
+    ) {
+      if (node.name && this.hasExportModifier(node)) {
+        const name = node.name.getText(sourceFile);
+        const symbolId = makeSymbolId(filePath, name);
+
+        const kind = this.getKindFromNode(node);
+        const def: SymbolDefinition = {
+          id: symbolId,
+          name,
+          kind,
+          location: this.getNodeLocation(node, sourceFile),
+          isDefault: false,
+          isNamed: true,
+        };
+
+        this.definitions.set(symbolId, def);
+        entries.push({ symbolId });
+      }
+    }
+
+    // Default export: export default x
+    if (ts.isExportAssignment(node)) {
+      const name = node.expression.getText(sourceFile);
+      const symbolId = makeSymbolId(filePath, name);
+
+      // Mark existing definition as default
+      const existing = this.definitions.get(symbolId);
+      if (existing) {
+        existing.isDefault = true;
+        entries.push({ symbolId });
+      }
+    }
+
+    return entries;
+  }
+
+  /**
+   * Check if node has export modifier
+   */
+  private hasExportModifier(node: ts.Node): boolean {
+    return node.modifiers?.some((m) => m.kind === ts.SyntaxKind.ExportKeyword) ?? false;
+  }
+
+  /**
+   * Infer symbol kind from declaration
+   */
+  private inferSymbolKind(
+    stmt: ts.VariableStatement,
+    decl: ts.VariableDeclaration
+  ): SymbolKind {
+    if (decl.type) {
+      const typeStr = decl.type.getText();
+      if (typeStr.includes('=>')) return 'function';
+    }
+    return stmt.declarationList.flags & ts.NodeFlags.Const ? 'const' : 'let';
+  }
+
+  /**
+   * Get symbol kind from node type
+   */
+  private getKindFromNode(node: ts.Node): SymbolKind {
+    if (ts.isClassDeclaration(node)) return 'class';
+    if (ts.isInterfaceDeclaration(node)) return 'interface';
+    if (ts.isEnumDeclaration(node)) return 'enum';
+    if (ts.isTypeAliasDeclaration(node)) return 'type';
+    return 'const';
+  }
+
+  /**
+   * Resolve import path to absolute path
+   */
+  private resolveImportPath(importPath: string, fromFile: string): string | undefined {
+    // npm package imports
+    if (!importPath.startsWith('.')) {
+      return `npm:${importPath}`;
+    }
+
+    // Relative imports
+    const dir = dirname(fromFile);
+
+    // Check path aliases
+    for (const [alias, targets] of Object.entries(this.config.pathAliases)) {
+      const aliasPattern = alias.replace('/*', '');
+      if (importPath.startsWith(aliasPattern)) {
+        for (const target of targets) {
+          const targetBase = target.replace('/*', '');
+          const relativePart = importPath.slice(aliasPattern.length);
+          const resolved = join(this.config.rootDir, targetBase, relativePart);
+
+          // Try common extensions
+          for (const ext of this.config.include) {
+            const withExt = resolved + ext;
+            if (existsSync(withExt)) return withExt;
+          }
+
+          // Try index file
+          const indexFile = join(resolved, 'index');
+          for (const ext of this.config.include) {
+            const withExt = indexFile + ext;
+            if (existsSync(withExt)) return withExt;
+          }
+        }
+      }
+    }
+
+    // Resolve relative path
+    const basePath = resolve(dir, importPath);
+
+    for (const ext of this.config.include) {
+      const withExt = basePath + ext;
+      if (existsSync(withExt)) return withExt;
+    }
+
+    // Try index file
+    const indexPath = join(basePath, 'index');
+    for (const ext of this.config.include) {
+      const withExt = indexPath + ext;
+      if (existsSync(withExt)) return withExt;
+    }
+
+    return undefined;
+  }
+
+  /**
+   * Get location info from AST node
+   */
+  private getNodeLocation(
+    node: ts.Node,
+    sourceFile: ts.SourceFile
+  ): { filePath: string; line: number; column: number; length: number } {
+    const pos = node.getSourceFile().getLineAndCharacterOfPosition(node.getStart());
+    const end = node.getSourceFile().getLineAndCharacterOfPosition(node.getEnd());
+
+    // Calculate length (simple approximation for single-line nodes)
+    let length = node.getEnd() - node.getStart();
+    if (ts.isIdentifier(node)) {
+      length = node.text.length;
+    }
+
+    return {
+      filePath: sourceFile.fileName,
+      line: pos.line + 1,
+      column: pos.character,
+      length,
+    };
+  }
+
+  /**
+   * Serialize index to JSON for persistence
+   */
+  toJSON(): object {
+    return {
+      definitions: Object.fromEntries(this.definitions),
+      fileIndex: Object.fromEntries(this.fileIndex),
+      reverseImports: Object.fromEntries(
+        Array.from(this.reverseImports.entries()).map(([k, v]) => [k, Array.from(v)])
+      ),
+    };
+  }
+
+  /**
+   * Load index from JSON
+   */
+  static fromJSON(data: object): SymbolIndex {
+    const index = new SymbolIndex({
+      rootDir: '',
+      include: ['.ts'],
+      exclude: [],
+      pathAliases: {},
+    });
+
+    const typed = data as {
+      definitions?: Record<string, SymbolDefinition>;
+      fileIndex?: Record<string, FileIndexEntry>;
+      reverseImports?: Record<string, string[]>;
+    };
+
+    if (typed.definitions) {
+      index.definitions = new Map(Object.entries(typed.definitions));
+    }
+    if (typed.fileIndex) {
+      index.fileIndex = new Map(Object.entries(typed.fileIndex));
+      // Rebuild derived maps
+      for (const [filePath, entry] of index.fileIndex) {
+        index.fileToSymbols.set(filePath, new Set(entry.definedSymbols));
+      }
+    }
+    if (typed.reverseImports) {
+      index.reverseImports = new Map(
+        Object.entries(typed.reverseImports).map(([k, v]) => [k, new Set(v)])
+      );
+    }
+
+    return index;
+  }
+}
+
+// Factory function for convenience
+export async function buildSymbolIndex(
+  filePaths: string[],
+  config: SymbolIndexConfig
+): Promise<{ index: SymbolIndex; result: IndexResult }> {
+  const index = new SymbolIndex(config);
+  const result = await index.build(filePaths);
+  return { index, result };
+}
+
+          });
+        }
+      }
 
       // Namespace import: import * as ns from '...'
       if (ts.isNamespaceImport(bindings)) {
