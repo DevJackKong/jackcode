@@ -298,4 +298,156 @@ export class ContextCompressor {
  * Handles repo map integration and file-aware compression
  */
 export class RepoContextCompressor extends ContextCompressor {
-  private repoConfig: RepoCompression
+  private repoConfig: RepoCompressionConfig;
+  private repoMap: RepoMap | null = null;
+
+  constructor(
+    baseStrategy: CompressionStrategy = DEFAULT_STRATEGIES[1],
+    repoConfig?: Partial<RepoCompressionConfig>
+  ) {
+    super(baseStrategy);
+    this.repoConfig = {
+      baseStrategy,
+      includePatterns: repoConfig?.includePatterns ?? [],
+      excludePatterns: repoConfig?.excludePatterns ?? ['node_modules/**', '.git/**', '*.log'],
+      languageStrategies: repoConfig?.languageStrategies ?? new Map(),
+      maxInlineSize: repoConfig?.maxInlineSize ?? 50000,
+    };
+  }
+
+  /**
+   * Set repo map for context generation
+   */
+  setRepoMap(repoMap: RepoMap): void {
+    this.repoMap = repoMap;
+  }
+
+  /**
+   * Compress repository context
+   */
+  compressRepo(
+    files: FileContext[],
+    budget?: number
+  ): RepoCompressedContext {
+    const targetBudget = budget ?? MODEL_BUDGETS.qwen.effectiveBudget;
+    
+    // Filter files by patterns
+    const filteredFiles = this.filterByPatterns(files);
+    
+    // Apply size-based strategy
+    const processedFiles = this.applySizeStrategy(filteredFiles);
+    
+    // Pack and compress
+    const packed = this.pack(processedFiles);
+    const compressed = this.compress(packed, targetBudget);
+
+    const includedFiles = compressed.fragments
+      .map((f) => (f as FileContext).relativePath)
+      .filter(Boolean);
+
+    const allPaths = files.map((f) => f.relativePath);
+    const omittedFiles = allPaths.filter((p) => !includedFiles.includes(p));
+
+    return {
+      content: compressed.content,
+      repoMap: this.repoMap ?? {
+        rootPath: '.',
+        fileTree: [],
+        symbols: { definitions: new Map(), references: new Map() },
+        generatedAt: Date.now(),
+      },
+      includedFiles,
+      omittedFiles,
+      metrics: {
+        totalFiles: files.length,
+        includedFiles: includedFiles.length,
+        totalTokens: compressed.stats.originalTokens,
+        compressedTokens: compressed.stats.finalTokens,
+      },
+    };
+  }
+
+  /**
+   * Filter files by include/exclude patterns
+   */
+  private filterByPatterns(files: FileContext[]): FileContext[] {
+    return files.filter((file) => {
+      const path = file.relativePath;
+
+      // Check excludes first
+      for (const pattern of this.repoConfig.excludePatterns) {
+        if (this.matchPattern(path, pattern)) return false;
+      }
+
+      // If includes specified, must match at least one
+      if (this.repoConfig.includePatterns.length > 0) {
+        return this.repoConfig.includePatterns.some((p) =>
+          this.matchPattern(path, p)
+        );
+      }
+
+      return true;
+    });
+  }
+
+  /**
+   * Simple pattern matching (glob-like)
+   */
+  private matchPattern(path: string, pattern: string): boolean {
+    // Convert glob to regex
+    const regex = pattern
+      .replace(/\*\*/g, '{{GLOBSTAR}}')
+      .replace(/\*/g, '[^/]*')
+      .replace(/\?/g, '.')
+      .replace(/{{GLOBSTAR}}/g, '.*');
+    
+    return new RegExp(regex).test(path);
+  }
+
+  /**
+   * Apply size-based compression strategy
+   * Large files get summarized or marked for omission
+   */
+  private applySizeStrategy(files: FileContext[]): FileContext[] {
+    return files.map((file) => {
+      if (file.fileSize > this.repoConfig.maxInlineSize) {
+        // Mark for summarization (v0.1: just truncate indicator)
+        return {
+          ...file,
+          content: `// File too large (${file.fileSize} bytes), showing first 500 chars:\n${file.content.slice(0, 500)}\n// ... truncated`,
+          metadata: {
+            ...file.metadata,
+            tags: [...file.metadata.tags, 'summarized'],
+          },
+        };
+      }
+      return file;
+    });
+  }
+}
+
+/**
+ * Factory function for quick compression
+ */
+export function compressContext(
+  fragments: ContextFragment[],
+  budget?: number,
+  level: CompressionLevel = 1
+): CompressedContext {
+  const compressor = new ContextCompressor(DEFAULT_STRATEGIES[level]);
+  const packed = compressor.pack(fragments);
+  return compressor.compress(packed, budget);
+}
+
+/**
+ * Factory function for repo compression
+ */
+export function compressRepoContext(
+  files: FileContext[],
+  repoMap: RepoMap,
+  budget?: number
+): RepoCompressedContext {
+  const compressor = new RepoContextCompressor();
+  compressor.setRepoMap(repoMap);
+  return compressor.compressRepo(files, budget);
+}
