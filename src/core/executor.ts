@@ -546,4 +546,181 @@ export class ApprovalController {
       case 'file_pattern': {
         const patterns = condition.patterns;
         return files.some((f) =>
+          patterns.some((p) => this.matchGlob(f.path, p))
+        );
+      }
+
+      case 'risk_level': {
+        const levels: RiskLevel[] = ['low', 'medium', 'high', 'critical'];
+        const operationLevel = levels.indexOf(riskLevel);
+        const thresholdLevel = levels.indexOf(condition.level);
+        return operationLevel >= thresholdLevel;
+      }
+
+      case 'deletion_count': {
+        const totalDeletions = files.reduce((sum, f) => sum + f.linesRemoved, 0);
+        return totalDeletions > condition.threshold;
+      }
+
+      case 'lines_changed': {
+        const totalLines = files.reduce(
+          (sum, f) => sum + f.linesAdded + f.linesRemoved,
+          0
+        );
+        return totalLines > condition.threshold;
+      }
+
+      case 'outside_workspace': {
+        if (!condition.enabled) return false;
+        return files.some((f) => !f.path.startsWith(workspacePath));
+      }
+
+      default:
+        return false;
+    }
+  }
+
+  /**
+   * Simple glob matching
+   */
+  private matchGlob(path: string, pattern: string): boolean {
+    const regex = new RegExp(
+      '^' + pattern.replace(/\./g, '\\.').replace(/\*/g, '.*').replace(/\?/g, '.') + '$'
+    );
+    return regex.test(path);
+  }
+
+  /**
+   * Build approval prompt from matching rules
+   */
+  private buildPrompt(
+    files: FileChangeSummary[],
+    riskLevel: RiskLevel,
+    rules: ApprovalRule[]
+  ): ApprovalPrompt {
+    const changes: ChangePreview[] = files.map((f) => ({
+      path: f.path,
+      changeType: f.changeType,
+      linesAdded: f.linesAdded,
+      linesRemoved: f.linesRemoved,
+    }));
+
+    const totalLines = files.reduce((sum, f) => sum + f.linesAdded + f.linesRemoved, 0);
+    const fileCount = files.length;
+
+    return {
+      title: 'Approval Required',
+      description: `This operation will modify ${fileCount} files (${totalLines} lines changed).\n\n` +
+        `Triggered rules: ${rules.map((r) => r.name).join(', ')}`,
+      changes,
+      riskLevel,
+      estimatedImpact: `${fileCount} files, +${files.reduce((sum, f) => sum + f.linesAdded, 0)} -${files.reduce((sum, f) => sum + f.linesRemoved, 0)} lines`,
+    };
+  }
+}
+
+// =============================================================================
+// Executor Integration
+// =============================================================================
+
+/**
+ * Main executor class integrating workflow UX components
+ */
+export class WorkflowExecutor {
+  private presenter: WorkflowPresenter;
+  private approval: ApprovalController;
+
+  constructor(
+    presenterConfig?: Partial<WorkflowPresenterConfig>,
+    approvalRules?: ApprovalRule[]
+  ) {
+    this.presenter = new WorkflowPresenter(presenterConfig);
+    this.approval = new ApprovalController(approvalRules);
+  }
+
+  /**
+   * Execute with full workflow UX
+   */
+  async execute(
+    task: TaskContext,
+    operation: () => Promise<{ patchResult: PatchResult; verification?: VerificationResult }>,
+    options: {
+      workspacePath: string;
+      onApprovalRequest?: (prompt: ApprovalPrompt) => Promise<boolean>;
+    }
+  ): Promise<{ approved: boolean; result?: PatchResult; summary?: TaskSummary }> {
+    // Build initial workflow state
+    const state: WorkflowSessionState = {
+      sessionId: task.id,
+      intent: task.intent,
+      steps: [
+        { id: '1', label: 'Planning', status: 'completed' },
+        { id: '2', label: 'Executing', status: 'running' },
+        { id: '3', label: 'Verifying', status: 'pending' },
+      ],
+      startTime: Date.now(),
+    };
+
+    // Run operation
+    const { patchResult, verification } = await operation();
+
+    // Generate summary
+    const summary = SummaryGenerator.create(patchResult, verification, {
+      level: 'standard',
+      intent: task.intent,
+    });
+
+    // Check approval
+    const decision = this.approval.evaluate(
+      {
+        files: summary.filesChanged,
+        riskLevel: this.calculateRiskLevel(summary),
+        workspacePath: options.workspacePath,
+      }
+    );
+
+    if (decision.requiresApproval && decision.prompt) {
+      if (options.onApprovalRequest) {
+        const approved = await options.onApprovalRequest(decision.prompt);
+        if (!approved) {
+          return { approved: false };
+        }
+      } else {
+        // Default: require approval but no handler provided
+        return { approved: false };
+      }
+    }
+
+    // Update state
+    state.steps[1].status = patchResult.success ? 'completed' : 'failed';
+    state.steps[2].status = verification?.decision === 'approve' ? 'completed' : 'failed';
+    state.endTime = Date.now();
+
+    return { approved: true, result: patchResult, summary };
+  }
+
+  /**
+   * Render current workflow state
+   */
+  renderState(state: WorkflowSessionState): string {
+    return this.presenter.render(state);
+  }
+
+  /**
+   * Calculate risk level from summary
+   */
+  private calculateRiskLevel(summary: TaskSummary): RiskLevel {
+    const fileCount = summary.filesChanged.length;
+    const totalLines = summary.totalLinesAdded + summary.totalLinesRemoved;
+    const errorCount = summary.issues.filter((i) => i.severity === 'error').length;
+
+    if (errorCount > 0 || totalLines > 500 || fileCount > 50) return 'critical';
+    if (totalLines > 200 || fileCount > 20) return 'high';
+    if (totalLines > 50 || fileCount > 5) return 'medium';
+    return 'low';
+  }
+}
+
+// Export singleton for convenience
+export const workflowExecutor = new WorkflowExecutor();
 
