@@ -287,3 +287,263 @@ export class WorkflowPresenter {
       completed: '✓',
       failed: '✗',
       skipped: '⊘',
+    };
+    return icons[status];
+  }
+}
+
+// =============================================================================
+// Summary Generator
+// =============================================================================
+
+/**
+ * Generates human-readable task summaries
+ */
+export class SummaryGenerator {
+  /**
+   * Create a summary from patch result and verification
+   */
+  static create(
+    patchResult: PatchResult,
+    verification?: VerificationResult,
+    options: { level?: SummaryLevel; intent?: string } = {}
+  ): TaskSummary {
+    const level = options.level || 'standard';
+    const intent = options.intent || 'Task';
+
+    const filesChanged: FileChangeSummary[] = [];
+    let totalLinesAdded = 0;
+    let totalLinesRemoved = 0;
+
+    // Summarize applied patches
+    for (const patch of patchResult.applied) {
+      const fileChange: FileChangeSummary = {
+        path: patch.targetPath,
+        changeType: 'modified',
+        linesAdded: 0,
+        linesRemoved: 0,
+      };
+
+      for (const hunk of patch.hunks) {
+        fileChange.linesAdded += hunk.addedLines.length;
+        fileChange.linesRemoved += hunk.removedLines.length;
+      }
+
+      totalLinesAdded += fileChange.linesAdded;
+      totalLinesRemoved += fileChange.linesRemoved;
+      filesChanged.push(fileChange);
+    }
+
+    // Collect issues from verification
+    const issues: SummaryIssue[] = [];
+    if (verification) {
+      for (const issue of verification.issues) {
+        issues.push({
+          severity: this.mapSeverity(issue.severity),
+          message: issue.description,
+          filePath: issue.location.filePath,
+        });
+      }
+    }
+
+    return {
+      intent,
+      completed: patchResult.success,
+      durationMs: verification?.metadata.durationMs || 0,
+      filesChanged,
+      totalLinesAdded,
+      totalLinesRemoved,
+      issues,
+      rollbackAvailable: patchResult.canRollback,
+    };
+  }
+
+  /**
+   * Format summary as string
+   */
+  static format(summary: TaskSummary, level: SummaryLevel = 'standard'): string {
+    switch (level) {
+      case 'brief':
+        return this.formatBrief(summary);
+      case 'detailed':
+        return this.formatDetailed(summary);
+      case 'standard':
+      default:
+        return this.formatStandard(summary);
+    }
+  }
+
+  /**
+   * Brief one-line summary
+   */
+  private static formatBrief(summary: TaskSummary): string {
+    const status = summary.completed ? '✓' : '✗';
+    const fileCount = summary.filesChanged.length;
+    const lines = summary.totalLinesAdded + summary.totalLinesRemoved;
+    return `${status} ${summary.intent}: ${fileCount} files, ${lines} lines changed`;
+  }
+
+  /**
+   * Standard bullet list summary
+   */
+  private static formatStandard(summary: TaskSummary): string {
+    const lines: string[] = [];
+    const status = summary.completed ? 'Completed' : 'Failed';
+
+    lines.push(`${status}: ${summary.intent}`);
+    lines.push(`  Files changed: ${summary.filesChanged.length}`);
+    lines.push(`  Lines: +${summary.totalLinesAdded} -${summary.totalLinesRemoved}`);
+
+    if (summary.issues.length > 0) {
+      lines.push('  Issues:');
+      for (const issue of summary.issues.slice(0, 5)) {
+        const icon = issue.severity === 'error' ? '✗' : issue.severity === 'warning' ? '⚠' : 'ℹ';
+        lines.push(`    ${icon} ${issue.message}`);
+      }
+    }
+
+    return lines.join('\n');
+  }
+
+  /**
+   * Detailed summary with full file list
+   */
+  private static formatDetailed(summary: TaskSummary): string {
+    const lines: string[] = [];
+    const status = summary.completed ? 'Completed' : 'Failed';
+
+    lines.push(`${status}: ${summary.intent}`);
+    lines.push(`Duration: ${(summary.durationMs / 1000).toFixed(1)}s`);
+    lines.push('');
+    lines.push('Files changed:');
+
+    for (const file of summary.filesChanged) {
+      const icon = file.changeType === 'added' ? '+' : file.changeType === 'deleted' ? '-' : '~';
+      lines.push(`  ${icon} ${file.path}`);
+      lines.push(`     +${file.linesAdded} -${file.linesRemoved}`);
+    }
+
+    lines.push('');
+    lines.push(`Total: +${summary.totalLinesAdded} -${summary.totalLinesRemoved}`);
+
+    if (summary.rollbackAvailable) {
+      lines.push('');
+      lines.push('Rollback: Available via `jackcode rollback`');
+    }
+
+    return lines.join('\n');
+  }
+
+  /**
+   * Map verification severity to summary severity
+   */
+  private static mapSeverity(severity: IssueSeverity): SummaryIssue['severity'] {
+    switch (severity) {
+      case 'critical':
+      case 'high':
+        return 'error';
+      case 'medium':
+        return 'warning';
+      case 'low':
+      default:
+        return 'info';
+    }
+  }
+}
+
+// =============================================================================
+// Approval Controller
+// =============================================================================
+
+/**
+ * Evaluates operations and determines approval requirements
+ */
+export class ApprovalController {
+  private rules: ApprovalRule[];
+
+  constructor(rules: ApprovalRule[] = DEFAULT_APPROVAL_RULES) {
+    this.rules = [...rules];
+  }
+
+  /**
+   * Add custom approval rule
+   */
+  addRule(rule: ApprovalRule): void {
+    this.rules.push(rule);
+  }
+
+  /**
+   * Evaluate operation against rules
+   */
+  evaluate(
+    operation: {
+      files: FileChangeSummary[];
+      riskLevel?: RiskLevel;
+      workspacePath: string;
+    },
+    userOverrides?: { autoApprove?: boolean; autoReject?: string[] }
+  ): ApprovalDecision {
+    const { files, riskLevel = 'low', workspacePath } = operation;
+
+    // User overrides take precedence
+    if (userOverrides?.autoApprove) {
+      return {
+        requiresApproval: false,
+        action: 'auto',
+        reason: 'User auto-approval enabled',
+      };
+    }
+
+    // Check for blocked patterns first
+    for (const rule of this.rules) {
+      if (rule.action === 'block' && this.matchesCondition(rule.condition, files, riskLevel, workspacePath)) {
+        return {
+          requiresApproval: true,
+          action: 'block',
+          reason: rule.name,
+        };
+      }
+    }
+
+    // Check for prompt rules
+    const matchingPromptRules: ApprovalRule[] = [];
+    for (const rule of this.rules) {
+      if (rule.action === 'prompt' && this.matchesCondition(rule.condition, files, riskLevel, workspacePath)) {
+        matchingPromptRules.push(rule);
+      }
+    }
+
+    if (matchingPromptRules.length > 0) {
+      return {
+        requiresApproval: true,
+        action: 'prompt',
+        reason: matchingPromptRules.map((r) => r.name).join(', '),
+        prompt: this.buildPrompt(files, riskLevel, matchingPromptRules),
+      };
+    }
+
+    // No rules triggered - auto-approve
+    return {
+      requiresApproval: false,
+      action: 'auto',
+      reason: 'No approval rules triggered',
+    };
+  }
+
+  /**
+   * Check if condition matches operation
+   */
+  private matchesCondition(
+    condition: ApprovalCondition,
+    files: FileChangeSummary[],
+    riskLevel: RiskLevel,
+    workspacePath: string
+  ): boolean {
+    switch (condition.type) {
+      case 'file_count':
+        return files.length > condition.threshold;
+
+      case 'file_pattern': {
+        const patterns = condition.patterns;
+        return files.some((f) =>
+

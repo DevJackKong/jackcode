@@ -603,3 +603,151 @@ export class RecoveryEngine {
       result = {
         success: false,
         action: 'halt',
+        message: `Safety violations: ${safetyCheck.violations.map((v) => v.description).join(', ')}`,
+      };
+    } else {
+      // Determine recovery action based on failure category
+      switch (classified.category) {
+        case 'transient':
+          result = await this.handleTransientFailure(context);
+          break;
+        case 'permanent':
+          result = await this.handlePermanentFailure(context);
+          break;
+        case 'safety':
+          result = {
+            success: false,
+            action: 'halt',
+            message: `Safety violation: ${classified.reason}`,
+          };
+          break;
+        default:
+          // Unknown - try retry once, then escalate
+          if (context.remainingRetries > 0) {
+            result = await this.handleTransientFailure(context);
+          } else {
+            result = await this.handlePermanentFailure(context);
+          }
+      }
+    }
+
+    // Store in history
+    this.recoveryHistory.set(context.taskId, result);
+
+    // Execute hooks
+    await this.executeHooks(context, result);
+
+    return result;
+  }
+
+  /**
+   * Handle transient failure with retry
+   */
+  private async handleTransientFailure(
+    context: RecoveryContext
+  ): Promise<RecoveryResult> {
+    this.safetyGuardian.incrementTaskRetry(context.taskId);
+
+    return {
+      success: true,
+      action: 'retry',
+      newState: 'retrying',
+      message: `Transient failure detected, will retry. Remaining: ${context.remainingRetries - 1}`,
+    };
+  }
+
+  /**
+   * Handle permanent failure with rollback or escalation
+   */
+  private async handlePermanentFailure(
+    context: RecoveryContext
+  ): Promise<RecoveryResult> {
+    // If checkpoint available, rollback
+    if (context.lastCheckpointId) {
+      return {
+        success: true,
+        action: 'rollback',
+        newState: 'rolling_back',
+        rollbackCheckpointId: context.lastCheckpointId,
+        message: `Permanent failure, rolling back to checkpoint ${context.lastCheckpointId}`,
+      };
+    }
+
+    // Otherwise escalate to reasoner
+    const escalation: EscalationInfo = {
+      targetModel: 'deepseek-reasoner',
+      reason: context.failure.reason,
+      contextSummary: `Task ${context.taskId} failed with ${context.failure.category} error`,
+      escalatedAt: Date.now(),
+    };
+
+    return {
+      success: false,
+      action: 'escalate',
+      newState: 'escalated',
+      escalation,
+      message: `Escalating to ${escalation.targetModel}: ${escalation.reason}`,
+    };
+  }
+
+  /**
+   * Register recovery hook
+   */
+  registerHook(hook: RecoveryHook): void {
+    this.hooks.push(hook);
+  }
+
+  /**
+   * Execute registered hooks
+   */
+  private async executeHooks(
+    context: RecoveryContext,
+    result: RecoveryResult
+  ): Promise<void> {
+    for (const hook of this.hooks) {
+      try {
+        await hook(context, result);
+      } catch (error) {
+        console.error('Recovery hook failed:', error);
+      }
+    }
+  }
+
+  /**
+   * Get retry manager instance
+   */
+  getRetryManager(): RetryManager {
+    return this.retryManager;
+  }
+
+  /**
+   * Get circuit breaker instance
+   */
+  getCircuitBreaker(): CircuitBreaker {
+    return this.circuitBreaker;
+  }
+
+  /**
+   * Get safety guardian instance
+   */
+  getSafetyGuardian(): SafetyGuardian {
+    return this.safetyGuardian;
+  }
+
+  /**
+   * Get recovery history for task
+   */
+  getRecoveryHistory(taskId: string): RecoveryResult | undefined {
+    return this.recoveryHistory.get(taskId);
+  }
+}
+
+/** Singleton recovery engine instance */
+export const recoveryEngine = new RecoveryEngine();
+
+/** Factory for custom recovery engine instances */
+export function createRecoveryEngine(
+  config?: Partial<RecoveryConfig>
+): RecoveryEngine {
+  return new RecoveryEngine(config);
+}
