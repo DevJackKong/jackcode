@@ -9,3 +9,4 @@ export * from './memory-adapter.js';
 export * from './patch.js';
 export * from './repairer.js';
 export * from './reviewer.js';
+export * from './telemetry.js';
