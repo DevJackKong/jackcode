@@ -8,10 +8,21 @@ import { EventEmitter } from 'node:events';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 
-import type { SessionManager } from './session.js';
+import type { Session, SessionManager } from './session.js';
 import type { RecoveryEngine } from './repairer.js';
+import { RepoScanner } from './scanner.ts';
+import type { FileChange, FileIndex, ScanResult, ScannerConfig } from '../types/scanner.js';
 import type { QwenRouteRequest, QwenRouteResult, RoutePriority } from '../model/types.js';
 import type { HandoffPayload } from '../types/session.js';
+import type { ChangeRequest, Patch, PatchPlan, PatchResult, RollbackResult } from '../types/patch.js';
+import type { LoopRunResult, RunResult as BuildRunResult } from '../tools/test-runner.ts';
+import {
+  applyPatch as defaultApplyPatch,
+  buildPatchFromRequest as defaultBuildPatchFromRequest,
+  rollbackPatch as defaultRollbackPatch,
+  validatePatch as defaultValidatePatch,
+} from '../tools/patch.ts';
+import { BuildTestLoopOrchestrator } from '../tools/test-runner.ts';
 import type {
   ClassifiedFailure,
   RecoveryResult,
@@ -72,6 +83,14 @@ export interface ErrorLog {
   recoverable: boolean;
   classification: ErrorClassification;
   details?: Record<string, unknown>;
+}
+
+export interface RuntimePatchRequest {
+  description: string;
+  targetPath: string;
+  range?: { start: number; end: number };
+  replacement?: string;
+  insertion?: string;
 }
 
 export interface TaskContext {
@@ -156,6 +175,10 @@ export interface RuntimeEventMap {
 
 export interface SessionContextAdapter {
   createSession?(rootGoal: string, memoryPath?: string): { id: string };
+  getSession?(sessionId: string): Session | undefined;
+  pushTask?(sessionId: string, goal: string, options?: { metadata?: Record<string, unknown>; status?: 'pending' | 'in-progress' | 'completed' | 'blocked' | 'failed' }): { id: string } | null;
+  restoreCheckpoint?(sessionId: string, checkpointIdOrTag: string): boolean;
+  setScannerSnapshot?(sessionId: string, snapshot: unknown): boolean;
   updateTaskStatus?(sessionId: string, taskId: string, status: 'pending' | 'in-progress' | 'completed' | 'blocked'): boolean;
   prepareHandoff?(
     sessionId: string,
@@ -178,6 +201,7 @@ export interface ExecutorResult {
   relevantFiles?: Array<{ path: string; content: string; relevance: 'high' | 'medium' | 'low' }>;
   summary?: string;
   error?: string;
+  patches?: RuntimePatchRequest[];
 }
 
 export interface ReviewResult {
@@ -205,17 +229,40 @@ export interface RepairerAdapter {
   }): Promise<RecoveryResult>;
 }
 
+export interface PatchEngineAdapter {
+  buildPatchFromRequest(request: ChangeRequest): Promise<Patch>;
+  validatePatch(patch: Patch): { valid: boolean; errors: string[] };
+  applyPatch(plan: PatchPlan, sessionId?: string): Promise<PatchResult>;
+  rollbackPatch(patchId: string): Promise<RollbackResult>;
+}
+
+export interface BuildTestAdapter {
+  run(options?: Record<string, unknown>): Promise<LoopRunResult>;
+}
+
+export interface RepoScannerAdapter {
+  scan(options?: { force?: boolean; paths?: string[]; includeBinary?: boolean }): Promise<ScanResult>;
+  scanIncremental?(changes: FileChange[]): Promise<FileIndex | null>;
+  getIndex?(): FileIndex | null;
+}
+
 export interface RuntimeDependencies {
   session?: SessionContextAdapter | SessionManager;
   router?: RouterAdapter;
   executor?: ExecutorAdapter;
   repairer?: RepairerAdapter | RecoveryEngine;
+  patchEngine?: PatchEngineAdapter;
+  buildTest?: BuildTestAdapter;
+  repoScanner?: RepoScannerAdapter;
+  scanner?: RepoScannerAdapter;
 }
 
 export interface RuntimeConfig {
   persistencePath: string;
   autoPersist: boolean;
   autoStart: boolean;
+  repoRoot: string;
+  scannerConfig?: Partial<ScannerConfig>;
 }
 
 const PRIORITY_WEIGHT: Record<TaskPriority, number> = {
@@ -268,11 +315,19 @@ export class RuntimeStateMachine {
   private readonly router?: RouterAdapter;
   private readonly executor?: ExecutorAdapter;
   private readonly repairer?: RepairerAdapter;
+  private readonly patchEngine: PatchEngineAdapter;
+  private readonly buildTest: BuildTestAdapter;
+  private readonly repoScanner: RepoScannerAdapter;
+  private readonly explicitPatchEngine: boolean;
+  private readonly explicitBuildTest: boolean;
+  private readonly explicitRepoScanner: boolean;
+  private repoScanResult: ScanResult | null = null;
+  private repoIndex: FileIndex | null = null;
   private activeTaskId: string | null = null;
   private timeoutHandles = new Map<string, ReturnType<typeof setTimeout>>();
 
   constructor(dependencies: RuntimeDependencies = {}, config: Partial<RuntimeConfig> = {}) {
-    this.session = isSessionManagerLike(dependencies.session) ? dependencies.session : undefined;
+    this.session = isSessionManagerLike(dependencies.session) ? normalizeSessionAdapter(dependencies.session) : undefined;
     this.router = dependencies.router;
     this.executor = dependencies.executor;
     this.repairer = isRepairerLike(dependencies.repairer)
@@ -283,8 +338,36 @@ export class RuntimeStateMachine {
       persistencePath: path.resolve(process.cwd(), '.jackcode', 'runtime-state.json'),
       autoPersist: true,
       autoStart: false,
+      repoRoot: process.cwd(),
       ...config,
     };
+
+    this.explicitPatchEngine = Boolean(dependencies.patchEngine);
+    this.explicitBuildTest = Boolean(dependencies.buildTest);
+    this.explicitRepoScanner = Boolean(dependencies.repoScanner ?? dependencies.scanner);
+
+    this.patchEngine = dependencies.patchEngine ?? {
+      buildPatchFromRequest: defaultBuildPatchFromRequest,
+      validatePatch: defaultValidatePatch,
+      applyPatch: defaultApplyPatch,
+      rollbackPatch: defaultRollbackPatch,
+    };
+
+    this.buildTest = dependencies.buildTest ?? {
+      run: async () => {
+        const orchestrator = new BuildTestLoopOrchestrator({ rootDir: this.config.repoRoot });
+        return orchestrator.run();
+      },
+    };
+
+    this.repoScanner = dependencies.repoScanner ?? dependencies.scanner ?? new RepoScanner({
+      rootDir: this.config.repoRoot,
+      ...(this.config.scannerConfig ?? {}),
+    });
+
+    if (!dependencies.repoScanner && !dependencies.scanner) {
+      void this.initializeRepoState();
+    }
   }
 
   on<K extends keyof RuntimeEventMap>(event: K, handler: (payload: RuntimeEventMap[K]) => void): void {
@@ -293,6 +376,22 @@ export class RuntimeStateMachine {
 
   off<K extends keyof RuntimeEventMap>(event: K, handler: (payload: RuntimeEventMap[K]) => void): void {
     this.events.off(event, handler as (payload: unknown) => void);
+  }
+
+  getSession(taskId: string): Session | undefined {
+    const task = this.tasks.get(taskId);
+    if (!task?.sessionId || !this.session?.getSession) {
+      return undefined;
+    }
+    return this.session.getSession(task.sessionId);
+  }
+
+  getRepoIndex(): FileIndex | null {
+    return this.repoIndex;
+  }
+
+  getRepoScanResult(): ScanResult | null {
+    return this.repoScanResult;
   }
 
   createTask(intent: string, options: RuntimeTaskCreateOptions = {}): TaskContext {
@@ -319,10 +418,22 @@ export class RuntimeStateMachine {
       throw new Error('timeoutMs must be a positive number');
     }
 
+    let sessionId = options.sessionId;
+    if (!sessionId && this.session?.createSession) {
+      sessionId = this.session.createSession(normalizedIntent).id;
+    }
+
+    const sessionTask = sessionId && this.session?.pushTask
+      ? this.session.pushTask(sessionId, normalizedIntent, {
+          metadata: { runtimeTaskId: id },
+          status: 'pending',
+        })
+      : null;
+
     const createdAt = now();
     const task: TaskContext = {
       id,
-      sessionId: options.sessionId,
+      sessionId,
       state: 'idle',
       status: 'queued',
       intent: normalizedIntent,
@@ -336,10 +447,13 @@ export class RuntimeStateMachine {
       updatedAt: createdAt,
       timeoutMs,
       retryCount: 0,
-      metadata: { ...(options.metadata ?? {}) },
+      metadata: { ...(options.metadata ?? {}), sessionTaskId: sessionTask?.id },
     };
 
     this.tasks.set(id, task);
+    if (sessionId && this.session?.updateTaskStatus) {
+      this.session.updateTaskStatus(sessionId, this.getSessionTaskId(task), 'pending');
+    }
     this.emit('task-created', { task: cloneTask(task) });
     this.enqueueTask(id);
     return cloneTask(task);
@@ -508,6 +622,9 @@ export class RuntimeStateMachine {
       task.completedAt = now();
       this.clearTimeoutForTask(task.id);
       this.activeTaskId = null;
+      if (task.sessionId && this.session?.updateTaskStatus) {
+        this.session.updateTaskStatus(task.sessionId, this.getSessionTaskId(task), 'completed');
+      }
       this.emit('task-completed', { task: cloneTask(task) });
       this.persistIfNeeded();
       return cloneTask(task);
@@ -606,9 +723,14 @@ export class RuntimeStateMachine {
     }
 
     this.validatePlan(task.plan);
+    await this.refreshRepoScan({ force: true });
+    task.metadata.repoScannedAt = this.repoIndex?.generatedAt ?? null;
+    if (task.sessionId && this.session?.setScannerSnapshot && this.repoIndex) {
+      this.session.setScannerSnapshot(task.sessionId, this.repoIndex);
+    }
 
     if (task.sessionId && this.session?.updateTaskStatus) {
-      this.session.updateTaskStatus(task.sessionId, task.id, 'in-progress');
+      this.session.updateTaskStatus(task.sessionId, this.getSessionTaskId(task), 'in-progress');
     }
 
     this.persistIfNeeded();
@@ -678,21 +800,49 @@ export class RuntimeStateMachine {
 
     this.throwIfTimedOut(task);
 
-    if (this.executor) {
-      const execution = await this.executor.execute(cloneTask(task));
-      if (execution.artifacts?.length) {
-        task.artifacts.push(...execution.artifacts);
+    const execution = this.executor
+      ? await this.executor.execute(cloneTask(task))
+      : { success: true, patches: this.buildFallbackPatchRequests(task) };
+
+    if (execution.artifacts?.length) {
+      task.artifacts.push(...execution.artifacts);
+    }
+    if (execution.summary) {
+      task.artifacts.push({
+        id: `log-${task.id}-${task.attempts}`,
+        type: 'log',
+        path: `runtime/${task.id}/execution.log`,
+        content: execution.summary,
+      });
+    }
+    if (!execution.success) {
+      throw new Error(execution.error || 'Executor reported failure');
+    }
+
+    const patchRequests = execution.patches ?? [];
+    const shouldRunPatchPipeline = (this.explicitPatchEngine || this.explicitBuildTest || this.explicitRepoScanner) && patchRequests.length > 0;
+
+    if (shouldRunPatchPipeline && patchRequests.length > 0) {
+      const patchPlan = await this.buildPatchPlan(task, patchRequests);
+      const validationErrors = patchPlan.patches
+        .flatMap((patch) => this.patchEngine.validatePatch(patch).errors.map((error) => `${patch.targetPath}: ${error}`));
+      if (validationErrors.length > 0) {
+        throw new Error(`Patch validation failed: ${validationErrors.join('; ')}`);
       }
-      if (execution.summary) {
-        task.artifacts.push({
-          id: `log-${task.id}-${task.attempts}`,
-          type: 'log',
-          path: `runtime/${task.id}/execution.log`,
-          content: execution.summary,
-        });
+
+      const patchResult = await this.patchEngine.applyPatch(patchPlan, task.sessionId);
+      this.recordPatchArtifacts(task, patchPlan, patchResult);
+      if (!patchResult.success) {
+        throw new Error(patchResult.failed?.map((entry) => `${entry.patch.targetPath}: ${entry.error}`).join('; ') || 'Patch apply failed');
       }
-      if (!execution.success) {
-        throw new Error(execution.error || 'Executor reported failure');
+
+      const changedFiles = patchPlan.patches.map((patch) => patch.targetPath);
+      await this.refreshRepoAfterChanges(changedFiles);
+
+      const testResult = await this.buildTest.run();
+      this.recordBuildTestArtifacts(task, testResult);
+      if (!testResult.success) {
+        throw new Error(testResult.errors.join('; ') || testResult.output || 'Build/test pipeline failed');
       }
     }
 
@@ -785,7 +935,12 @@ export class RuntimeStateMachine {
         return this.resumeRecoveredTask(task);
       }
 
-      if (recovery.action === 'rollback' && task.checkpointId) {
+      const canRollbackArtifacts = task.artifacts.some((artifact) => artifact.type === 'patch' && typeof artifact.metadata?.patchId === 'string');
+      if (recovery.action === 'rollback' && (task.checkpointId || canRollbackArtifacts) && task.attempts < task.maxAttempts) {
+        await this.rollbackTaskArtifacts(task);
+        if (task.sessionId && task.checkpointId && this.session?.restoreCheckpoint) {
+          this.session.restoreCheckpoint(task.sessionId, recovery.rollbackCheckpointId ?? task.checkpointId);
+        }
         this.transitionTask(task, 'rolling_back');
         task.retryCount += 1;
         this.persistIfNeeded();
@@ -802,13 +957,12 @@ export class RuntimeStateMachine {
     this.activeTaskId = null;
 
     if (task.sessionId && this.session?.updateTaskStatus) {
-      this.session.updateTaskStatus(task.sessionId, task.id, 'blocked');
+      this.session.updateTaskStatus(task.sessionId, this.getSessionTaskId(task), 'blocked');
     }
 
     this.emit('task-failed', { task: cloneTask(task), error });
     return cloneTask(task);
   }
-
 
   private async resumeRecoveredTask(task: TaskContext): Promise<TaskContext> {
     this.throwIfTimedOut(task);
@@ -823,6 +977,9 @@ export class RuntimeStateMachine {
       task.completedAt = now();
       this.clearTimeoutForTask(task.id);
       this.activeTaskId = null;
+      if (task.sessionId && this.session?.updateTaskStatus) {
+        this.session.updateTaskStatus(task.sessionId, this.getSessionTaskId(task), 'completed');
+      }
       this.emit('task-completed', { task: cloneTask(task) });
       this.persistIfNeeded();
       return cloneTask(task);
@@ -847,7 +1004,28 @@ export class RuntimeStateMachine {
 
     task.state = to;
     task.updatedAt = now();
+    this.syncSessionState(task, to);
     this.emit('state-changed', { task: cloneTask(task), from, to });
+  }
+
+  private syncSessionState(task: TaskContext, state: RuntimeTaskState): void {
+    if (!task.sessionId || !this.session?.updateTaskStatus) {
+      return;
+    }
+
+    const mappedStatus = (() => {
+      switch (state) {
+        case 'completed':
+          return 'completed' as const;
+        case 'error':
+        case 'rolling_back':
+          return 'blocked' as const;
+        default:
+          return 'in-progress' as const;
+      }
+    })();
+
+    this.session.updateTaskStatus(task.sessionId, this.getSessionTaskId(task), mappedStatus);
   }
 
   private applyTimeout(task: TaskContext): void {
@@ -933,6 +1111,150 @@ export class RuntimeStateMachine {
     }
   }
 
+  private buildFallbackPatchRequests(task: TaskContext): RuntimePatchRequest[] {
+    return task.plan?.steps
+      .filter((step) => step.targetFiles.length > 0)
+      .map((step) => ({
+        description: step.description,
+        targetPath: step.targetFiles[0]!,
+        insertion: `\n// ${step.description}`,
+      })) ?? [];
+  }
+
+  private async buildPatchPlan(task: TaskContext, requests: RuntimePatchRequest[]): Promise<PatchPlan> {
+    const changeRequests = requests.map((request) => ({
+      targetPath: request.targetPath,
+      description: request.description,
+      range: request.range,
+      replacement: request.replacement,
+      insertion: request.insertion,
+    } satisfies ChangeRequest));
+
+    const patches = await Promise.all(changeRequests.map((request) => this.patchEngine.buildPatchFromRequest(request)));
+    const impact = patches.reduce(
+      (acc, patch) => {
+        acc.filesAffected.add(patch.targetPath);
+        for (const hunk of patch.hunks) {
+          acc.linesAdded += hunk.addedLines.length;
+          acc.linesRemoved += hunk.removedLines.length;
+        }
+        return acc;
+      },
+      {
+        filesAffected: new Set<string>(),
+        linesAdded: 0,
+        linesRemoved: 0,
+      }
+    );
+
+    return {
+      id: `runtime-plan-${task.id}-${task.attempts}`,
+      createdAt: now(),
+      patches,
+      impact: {
+        filesAffected: impact.filesAffected.size,
+        linesAdded: impact.linesAdded,
+        linesRemoved: impact.linesRemoved,
+        riskLevel: impact.linesAdded + impact.linesRemoved > 200 ? 'high' : impact.linesAdded + impact.linesRemoved > 50 ? 'medium' : 'low',
+      },
+    };
+  }
+
+  private recordPatchArtifacts(task: TaskContext, patchPlan: PatchPlan, patchResult: PatchResult): void {
+    task.artifacts.push({
+      id: `patch-plan-${patchPlan.id}`,
+      type: 'patch',
+      path: `runtime/${task.id}/patch-plan.json`,
+      content: JSON.stringify({
+        id: patchPlan.id,
+        patchCount: patchPlan.patches.length,
+        impact: patchPlan.impact,
+        success: patchResult.success,
+      }, null, 2),
+      metadata: {
+        patchCount: patchPlan.patches.length,
+        appliedCount: patchResult.applied.length,
+        canRollback: patchResult.canRollback,
+      },
+    });
+
+    for (const patch of patchPlan.patches) {
+      task.artifacts.push({
+        id: `patch-${patch.id}`,
+        type: 'patch',
+        path: patch.targetPath,
+        metadata: {
+          patchId: patch.id,
+          targetPath: patch.targetPath,
+        },
+      });
+    }
+  }
+
+  private recordBuildTestArtifacts(task: TaskContext, result: LoopRunResult): void {
+    task.artifacts.push({
+      id: `build-test-${task.id}-${task.attempts}`,
+      type: 'log',
+      path: `runtime/${task.id}/build-test.log`,
+      content: result.output,
+      metadata: {
+        success: result.success,
+        retries: result.retries,
+        prePatchPassed: result.prePatchPassed,
+        postPatchPassed: result.postPatchPassed,
+      },
+    });
+  }
+
+  private async rollbackTaskArtifacts(task: TaskContext): Promise<void> {
+    const patchArtifacts = task.artifacts.filter((artifact) => artifact.type === 'patch');
+    for (const artifact of [...patchArtifacts].reverse()) {
+      const patchId = artifact.metadata?.patchId;
+      if (typeof patchId === 'string') {
+        await this.patchEngine.rollbackPatch(patchId);
+      }
+    }
+  }
+
+  private async initializeRepoState(): Promise<void> {
+    this.repoIndex = this.repoScanner.getIndex?.() ?? null;
+    if (!this.repoIndex) {
+      await this.refreshRepoScan({ force: true });
+    }
+  }
+
+  private async refreshRepoScan(options: { force?: boolean; paths?: string[] } = {}): Promise<void> {
+    const result = await this.repoScanner.scan(options);
+    this.repoScanResult = result;
+    this.repoIndex = result.index ?? this.repoScanner.getIndex?.() ?? null;
+  }
+
+  private async refreshRepoAfterChanges(changedFiles: string[]): Promise<void> {
+    const normalized = changedFiles
+      .map((file) => path.isAbsolute(file) ? path.relative(this.config.repoRoot, file) : file)
+      .filter(Boolean);
+
+    if (normalized.length === 0) {
+      await this.refreshRepoScan({ force: true });
+      return;
+    }
+
+    if (this.repoScanner.scanIncremental) {
+      const index = await this.repoScanner.scanIncremental(normalized.map((file) => ({ path: file, type: 'modified' as const })));
+      this.repoIndex = index ?? this.repoScanner.getIndex?.() ?? this.repoIndex;
+      this.repoScanResult = {
+        success: true,
+        index: this.repoIndex ?? undefined,
+        filesProcessed: this.repoIndex?.files.size ?? 0,
+        durationMs: 0,
+        errors: [],
+      };
+      return;
+    }
+
+    await this.refreshRepoScan({ force: true, paths: normalized });
+  }
+
   private classifyFailure(error: unknown): ClassifiedFailure {
     if (this.repairer?.classifyError) {
       return this.repairer.classifyError(error);
@@ -959,6 +1281,11 @@ export class RuntimeStateMachine {
       timestamp: now(),
       retryable: category === 'transient' || category === 'unknown',
     };
+  }
+
+  private getSessionTaskId(task: TaskContext): string {
+    const sessionTaskId = task.metadata.sessionTaskId;
+    return typeof sessionTaskId === 'string' && sessionTaskId.trim() ? sessionTaskId : task.id;
   }
 
   private mapFailureCategory(category: ClassifiedFailure['category']): ErrorClassification {
@@ -1067,6 +1394,37 @@ export class RuntimeStateMachine {
       })),
     };
   }
+}
+
+function normalizeSessionAdapter(adapter: SessionContextAdapter | SessionManager): SessionContextAdapter {
+  const candidate = adapter as SessionManager & SessionContextAdapter;
+  return {
+    createSession: candidate.createSession
+      ? (rootGoal: string, memoryPath?: string) => candidate.createSession!({ rootGoal, memoryPath })
+      : undefined,
+    getSession: candidate.getSession ? (sessionId: string) => candidate.getSession!(sessionId) : undefined,
+    pushTask: candidate.pushTask
+      ? (sessionId: string, goal: string, options?: { metadata?: Record<string, unknown>; status?: 'pending' | 'in-progress' | 'completed' | 'blocked' | 'failed' }) =>
+          candidate.pushTask!(sessionId, goal, options)
+      : undefined,
+    restoreCheckpoint: candidate.restoreCheckpoint
+      ? (sessionId: string, checkpointIdOrTag: string) => candidate.restoreCheckpoint!(sessionId, checkpointIdOrTag)
+      : undefined,
+    setScannerSnapshot: candidate.setScannerSnapshot
+      ? (sessionId: string, snapshot: unknown) => candidate.setScannerSnapshot!(sessionId, snapshot)
+      : undefined,
+    updateTaskStatus: candidate.updateTaskStatus
+      ? (sessionId: string, taskId: string, status) => candidate.updateTaskStatus!(sessionId, taskId, status)
+      : undefined,
+    prepareHandoff: candidate.prepareHandoff
+      ? (sessionId, fromModel, toModel, relevantFiles, expectedActions) =>
+          candidate.prepareHandoff!(sessionId, fromModel, toModel, relevantFiles, expectedActions)
+      : undefined,
+    createCheckpoint: candidate.createCheckpoint
+      ? async (sessionId: string, files: string[], options?: { tag?: string; notes?: string; auto?: boolean }) =>
+          candidate.createCheckpoint!(sessionId, files, options)
+      : undefined,
+  };
 }
 
 export const runtime = new RuntimeStateMachine();
