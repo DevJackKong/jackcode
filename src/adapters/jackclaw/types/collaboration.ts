@@ -24,6 +24,14 @@ export interface SubagentTask {
   timeout: number;
   /** Priority 0-1 */
   priority: number;
+  /** Task dependencies that must finish first */
+  dependencies?: string[];
+  /** Optional handoff preferences */
+  handoff?: {
+    allow?: boolean;
+    resumeToken?: string;
+    preferredNodeId?: string;
+  };
 }
 
 /**
@@ -73,13 +81,13 @@ export interface SubagentResult {
 /**
  * Subagent lifecycle status
  */
-export type SubagentStatus = 
-  | 'pending'    // Waiting to start
-  | 'running'    // Currently executing
-  | 'success'    // Completed successfully
-  | 'failure'    // Failed with errors
-  | 'timeout'    // Exceeded time limit
-  | 'cancelled'; // Manually cancelled
+export type SubagentStatus =
+  | 'pending'
+  | 'running'
+  | 'success'
+  | 'failure'
+  | 'timeout'
+  | 'cancelled';
 
 /**
  * Subagent output data variants
@@ -121,7 +129,13 @@ export interface SubagentMetrics {
   tokensUsed: number;
   /** Estimated cost (USD) */
   estimatedCost?: number;
+  /** Node that completed the task */
+  nodeId?: string;
+  /** Attempt counter */
+  attempt?: number;
 }
+
+export type CollaborationAdapterMetrics = SubagentMetrics;
 
 /**
  * Handle to track a spawned subagent
@@ -135,6 +149,12 @@ export interface SubagentHandle {
   status: SubagentStatus;
   /** Creation timestamp */
   createdAt: number;
+  /** Assigned node */
+  assignedNodeId?: string;
+  /** Task priority */
+  priority?: number;
+  /** Monotonic sequence number */
+  sequence?: number;
 }
 
 /**
@@ -149,6 +169,16 @@ export interface SubagentPoolConfig {
   maxRetries: number;
   /** Cost budget (USD) */
   costBudget?: number;
+  /** Node heartbeat timeout before suspect/offline */
+  nodeHeartbeatTimeoutMs?: number;
+  /** Timeout for deadlock detection / lock lease */
+  deadlockTimeoutMs?: number;
+  /** Message log retention */
+  messageHistoryLimit?: number;
+  /** Max concurrent tasks per node */
+  maxTasksPerNode?: number;
+  /** Whether work stealing is enabled */
+  workStealing?: boolean;
 }
 
 /**
@@ -164,6 +194,8 @@ export interface AggregatedResult {
     files: GeneratedFile[];
     analysis: string[];
     patches: Patch[];
+    verifications: boolean[];
+    metadata: Record<string, unknown>[];
   };
   /** Total metrics */
   totals: {
@@ -175,16 +207,131 @@ export interface AggregatedResult {
   failures: string[];
 }
 
+export type MessageOrderingMode = 'none' | 'per-channel' | 'global';
+export type NodeSelectionReason = 'preferred' | 'least-loaded' | 'fallback';
+
+export interface NodeAssignment {
+  nodeId: string;
+  capacity: number;
+  loadScore?: number;
+  labels?: string[];
+  status?: 'online' | 'suspect' | 'offline';
+  lastSeenAt?: number;
+}
+
+export interface CollaborationMessage {
+  id: string;
+  kind: 'direct' | 'broadcast';
+  fromNodeId: string;
+  recipients: string[];
+  payload: Record<string, unknown>;
+  timestamp: number;
+  channel: string;
+  ordering: MessageOrderingMode;
+  sequence: number;
+}
+
+export interface DirectMessageOptions {
+  channel?: string;
+  ordering?: MessageOrderingMode;
+}
+
+export interface CoordinationLock {
+  resourceId: string;
+  ownerNodeId: string;
+  acquiredAt: number;
+  expiresAt: number;
+}
+
+export interface NodeConsensusState {
+  taskId: string;
+  participants: string[];
+  approvals: string[];
+  rejectedBy: string[];
+  reached: boolean;
+  decidedAt: number;
+}
+
+export interface HandoffStateSnapshot {
+  taskId: string;
+  progress: SubagentStatus;
+  assignedNodeId: string;
+  attempts: number;
+  context: SubagentContext;
+  metadata: Record<string, unknown>;
+}
+
+export interface TaskHandoffRecord {
+  taskId: string;
+  fromNodeId: string;
+  toNodeId: string;
+  transferredAt: number;
+  reason: 'rebalancing' | 'node-failure' | 'manual' | 'work-steal';
+  stateSnapshot: HandoffStateSnapshot;
+  resumed: boolean;
+}
+
+export interface CollaborationNodeHealth {
+  nodeId: string;
+  status: 'online' | 'suspect' | 'offline';
+  loadScore: number;
+  capacity: number;
+  activeTasks: number;
+  assignedTasks: number;
+  lastHeartbeatAt: number;
+  averageLatencyMs: number;
+  tokensUsed: number;
+  handoffsIn: number;
+  handoffsOut: number;
+  stolenTasks: number;
+}
+
+export interface CollaborationMetricsSnapshot {
+  activeTasks: number;
+  queuedTasks: number;
+  completedTasks: number;
+  failedTasks: number;
+  cancelledTasks: number;
+  registeredNodes: number;
+  suspectNodes: number;
+  offlineNodes: number;
+  messagesSent: number;
+  handoffs: number;
+  averageTaskLatencyMs: number;
+}
+
+export interface CollaborationTaskRecord {
+  taskId: string;
+  status: SubagentStatus;
+  assignedNodeId: string;
+  priority: number;
+  createdAt: number;
+  startedAt?: number;
+  completedAt?: number;
+  attempts: number;
+  dependencies: string[];
+  handoffs: TaskHandoffRecord[];
+  consensus?: NodeConsensusState;
+}
+
 /**
  * Task handoff event
  */
 export interface TaskHandoffEvent {
   /** Event type */
-  type: 'spawn' | 'complete' | 'fail' | 'cancel';
+  type: 'spawn' | 'complete' | 'fail' | 'cancel' | 'handoff';
   /** Timestamp */
   timestamp: number;
   /** Task handle */
   handle: SubagentHandle;
   /** Result (if completed) */
   result?: SubagentResult;
+  /** Task ID */
+  taskId?: string;
+  /** Current node */
+  nodeId?: string;
+  /** Previous node */
+  fromNodeId?: string;
+  /** Handoff record */
+  handoff?: TaskHandoffRecord;
 }

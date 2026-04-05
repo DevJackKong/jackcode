@@ -3,7 +3,7 @@
  * Thread 15: Manages lifecycle of multiple OpenClaw subagents
  */
 
-import { JackClawCollaborationAdapter } from './task-adapter.js';
+import { JackClawCollaborationAdapter } from './collaboration.js';
 import type {
   SubagentTask,
   SubagentResult,
@@ -12,9 +12,6 @@ import type {
   TaskHandoffEvent,
 } from './types/collaboration.js';
 
-/**
- * Pool entry with task metadata
- */
 interface PoolEntry {
   handle?: SubagentHandle;
   task: SubagentTask;
@@ -23,11 +20,6 @@ interface PoolEntry {
   retries: number;
 }
 
-/**
- * Subagent Pool
- * Manages concurrent execution of multiple subagents with
- * queuing, load balancing, and result aggregation.
- */
 export class SubagentPool {
   private adapter: JackClawCollaborationAdapter;
   private config: SubagentPoolConfig;
@@ -44,10 +36,6 @@ export class SubagentPool {
     this.adapter = new JackClawCollaborationAdapter(this.config);
   }
 
-  /**
-   * Submit a task to the pool
-   * Returns immediately; task may be queued
-   */
   async submit(task: SubagentTask): Promise<SubagentResult> {
     if (this.entries.has(task.taskId)) {
       throw new Error(`Task ${task.taskId} is already submitted`);
@@ -71,16 +59,10 @@ export class SubagentPool {
     });
   }
 
-  /**
-   * Submit multiple tasks and wait for all
-   */
   async submitAll(tasks: SubagentTask[]): Promise<SubagentResult[]> {
     return Promise.all(tasks.map((task) => this.submit(task)));
   }
 
-  /**
-   * Submit multiple tasks and return results as they complete
-   */
   async *submitIterator(tasks: SubagentTask[]): AsyncGenerator<SubagentResult> {
     const pending = new Map<number, Promise<{ index: number; value: SubagentResult }>>();
 
@@ -95,9 +77,6 @@ export class SubagentPool {
     }
   }
 
-  /**
-   * Cancel all running and queued tasks
-   */
   async cancelAll(): Promise<void> {
     for (const taskId of this.queue) {
       const entry = this.entries.get(taskId);
@@ -112,18 +91,12 @@ export class SubagentPool {
     await Promise.all(active.map((handle) => this.adapter.cancel(handle)));
   }
 
-  /**
-   * Dispose of pool resources
-   */
   dispose(): void {
     this.queue = [];
     this.entries.clear();
     this.adapter.dispose();
   }
 
-  /**
-   * Get current pool statistics
-   */
   getStats(): {
     active: number;
     queued: number;
@@ -138,23 +111,17 @@ export class SubagentPool {
     };
   }
 
-  /**
-   * Subscribe to handoff events
-   */
   onHandoff(listener: (event: TaskHandoffEvent) => void): void {
     this.adapter.onHandoff(listener);
   }
 
-  /**
-   * Execute a pool entry
-   */
   private async execute(entry: PoolEntry): Promise<void> {
     try {
       const handle = await this.adapter.spawn(entry.task);
       entry.handle = handle;
 
       const result = await this.adapter.waitFor(handle);
-      if (result.status === 'failure' && entry.retries < this.config.maxRetries) {
+      if ((result.status === 'failure' || result.status === 'timeout') && entry.retries < this.config.maxRetries) {
         entry.retries += 1;
         this.queue.unshift(entry.task.taskId);
       } else {
@@ -169,9 +136,6 @@ export class SubagentPool {
     }
   }
 
-  /**
-   * Process queued tasks
-   */
   private processQueue(): void {
     while (
       this.queue.length > 0 &&
@@ -190,9 +154,6 @@ export class SubagentPool {
   }
 }
 
-/**
- * Create a new subagent pool
- */
 export function createSubagentPool(
   config?: Partial<SubagentPoolConfig>,
 ): SubagentPool {
