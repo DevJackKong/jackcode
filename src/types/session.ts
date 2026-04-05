@@ -10,6 +10,9 @@ import type {
   MemoryEntryType,
   SyncResult,
 } from './memory-adapter.js';
+import type { Patch } from './patch.js';
+import type { FileIndex } from './scanner.js';
+import type { RunResult } from './test-runner.js';
 
 // Session lifecycle states
 export type SessionState = 'created' | 'active' | 'paused' | 'error' | 'closed';
@@ -115,7 +118,7 @@ export interface ModelUsageTotals {
   byModel: Record<
     string,
     {
-      calls: number;
+      calls: 0 | number;
       tokensIn: number;
       tokensOut: number;
       totalTokens: number;
@@ -138,6 +141,49 @@ export interface SessionMemoryConfig {
   persistTypes?: MemoryEntryType[];
 }
 
+export interface RuntimeTaskSnapshot {
+  id: string;
+  state: string;
+  status: string;
+  intent: string;
+  priority?: string;
+  updatedAt?: number;
+}
+
+export interface RuntimeQueueSnapshot {
+  activeTaskId: string | null;
+  queue: RuntimeTaskSnapshot[];
+  activeTask: RuntimeTaskSnapshot | null;
+  lastSyncedAt: Date | null;
+}
+
+export interface SessionPatchRecord {
+  id: string;
+  file: string;
+  patch: Patch;
+  taskId: string | null;
+  version: number;
+  timestamp: Date;
+}
+
+export interface SessionTestResultRecord {
+  id: string;
+  taskId: string | null;
+  timestamp: Date;
+  result: RunResult;
+}
+
+export interface SessionRepoSnapshotRecord {
+  snapshot: FileIndex;
+  updatedAt: Date;
+}
+
+export interface SessionContextSelection {
+  fragments: ContextFragment[];
+  totalTokens: number;
+  truncated: boolean;
+}
+
 export interface Session {
   id: string;
   state: SessionState;
@@ -157,10 +203,20 @@ export interface Session {
   contextFragments: ContextFragment[];
   contextWindow: SessionContextWindow;
   lastMemorySyncAt: Date | null;
+  runtimeQueue: RuntimeQueueSnapshot;
+  patchHistory: SessionPatchRecord[];
+  fileVersions: Record<string, number>;
+  testResults: SessionTestResultRecord[];
+  repoSnapshot: SessionRepoSnapshotRecord | null;
   recoveryState: {
     recoveredFromCheckpointId: string | null;
     recoveredAt: Date | null;
   };
+  attachToRuntime?: (runtime: unknown) => void;
+  addPatch?: (file: string, patch: Patch) => SessionPatchRecord | null;
+  addTestResult?: (result: RunResult) => SessionTestResultRecord | null;
+  setRepoSnapshot?: (snapshot: FileIndex) => void;
+  selectContext?: (budget: number) => SessionContextSelection;
 }
 
 export interface SessionCreateOptions {
@@ -219,5 +275,10 @@ export interface SessionEvents {
   'context-compressed': { sessionId: string; result: ContextCompressionResult };
   'memory-synced': { sessionId: string; details: MemorySyncDetails };
   'handoff-prepared': { sessionId: string; payload: HandoffPayload };
+  'runtime-attached': { sessionId: string };
+  'runtime-updated': { sessionId: string; runtimeQueue: RuntimeQueueSnapshot };
+  'patch-added': { sessionId: string; patch: SessionPatchRecord };
+  'test-result-added': { sessionId: string; result: SessionTestResultRecord };
+  'repo-snapshot-updated': { sessionId: string; snapshot: SessionRepoSnapshotRecord };
   error: { sessionId?: string; error: Error };
 }
