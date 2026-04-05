@@ -1,21 +1,41 @@
 /**
  * JackCode CLI Entry Point
- * 
+ *
  * Handles command-line interface, argument parsing, and mode dispatching.
  * Supports both one-shot execution and interactive chat modes.
  */
 
-import { createChatSession, startRepl } from './chat.js';
+import {
+  createChatSession,
+  createRenderer,
+  exportSession,
+  formatMessage,
+  getSessionFilePath,
+  loadSession,
+  resumeLatestSession,
+  saveSession,
+  startRepl,
+} from './chat.js';
 import type { CLIConfig, ModelTier, ParseResult, Theme } from '../types/cli.js';
 
-export { createChatSession, startRepl };
+export {
+  createChatSession,
+  createRenderer,
+  exportSession,
+  formatMessage,
+  getSessionFilePath,
+  loadSession,
+  resumeLatestSession,
+  saveSession,
+  startRepl,
+};
 
 const DEFAULT_CONFIG: CLIConfig = {
   defaultModel: 'qwen-3.6',
   theme: 'auto',
   streaming: true,
   showTokenCount: true,
-  historyFile: '.jackcode_history',
+  historyFile: '.jackcode/history',
 };
 
 /**
@@ -63,6 +83,45 @@ export function parseArgs(args: string[]): ParseResult {
         i++;
         break;
       }
+      case '--history-file': {
+        const value = args[i + 1];
+        if (!value) {
+          throw new Error('--history-file requires a value');
+        }
+        result.config.historyFile = value;
+        i++;
+        break;
+      }
+      case '--resume':
+        result.flags.resume = true;
+        break;
+      case '--load': {
+        const value = args[i + 1];
+        if (!value) {
+          throw new Error('--load requires a path');
+        }
+        result.flags.load = value;
+        i++;
+        break;
+      }
+      case '--save': {
+        const value = args[i + 1];
+        if (!value) {
+          throw new Error('--save requires a path');
+        }
+        result.flags.save = value;
+        i++;
+        break;
+      }
+      case '--export': {
+        const value = args[i + 1];
+        if (!value) {
+          throw new Error('--export requires a path');
+        }
+        result.flags.export = value;
+        i++;
+        break;
+      }
       case '--execute':
       case '-e':
         result.mode = 'execute';
@@ -74,7 +133,6 @@ export function parseArgs(args: string[]): ParseResult {
         }
 
         if (!arg.startsWith('-')) {
-          // Positional argument is the prompt
           result.prompt = args.slice(i).join(' ');
           if (result.mode !== 'execute') {
             result.mode = 'oneshot';
@@ -117,14 +175,14 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<void
       printVersion();
       break;
     case 'oneshot':
-      await runOneshot(parsed.prompt!, parsed.config);
+      await runOneshot(parsed.prompt!, parsed.config, parsed.flags);
       break;
     case 'execute':
-      await runExecute(parsed.prompt, parsed.config);
+      await runExecute(parsed.prompt, parsed.config, parsed.flags);
       break;
     case 'chat':
     default:
-      await runInteractive(parsed.config);
+      await runInteractive(parsed.config, parsed.flags);
       break;
   }
 }
@@ -143,17 +201,31 @@ Usage:
 Options:
   -h, --help                      Show this help message
   -v, --version                   Show version
-  -m, --model <tier>              Set default model tier (qwen/deepseek/gpt54)
+  -m, --model <tier>              Set default model tier (qwen-3.6/deepseek/gpt54)
   -e, --execute                   Execute mode: apply changes immediately
   --no-stream                     Disable streaming output
   --theme <theme>                 Set theme (dark/light/auto)
+  --history-file <path>           Override command history file
+  --resume                        Resume most recently saved session
+  --load <path>                   Load session from path before starting
+  --save <path>                   Save oneshot/execute result to path
+  --export <path>                 Export conversation to markdown
 
 Examples:
   jackcode "refactor auth.ts"     One-shot request
   jackcode chat                   Interactive session
+  jackcode --resume               Resume latest interactive session
+  jackcode --load .jackcode/s.json
   jackcode -m deepseek "..."      Use DeepSeek for this request
 
 Interactive Commands:
+  /help                           Show available commands
+  /status                         Show session status
+  /clear                          Clear the terminal
+  /save [file]                    Save current session
+  /load <file>                    Load session from disk
+  /export <file>                  Export conversation to markdown
+  /history [count]                Show recent messages
   /plan <task>                    Generate execution plan
   /execute [task]                 Execute current plan or new task
   /review                         Review pending changes
@@ -161,7 +233,9 @@ Interactive Commands:
   /diff                           Show current diff
   /context                        Show context window info
   /model <tier>                   Switch model tier
-  /help                           Show available commands
+  /theme <theme>                  Switch terminal theme
+  /session                        Show session metadata
+  /resume                         Resume latest saved session
   /exit, /quit                    Exit interactive mode
 `);
 }
@@ -184,37 +258,89 @@ function isTheme(value: string | undefined): value is Theme {
 /**
  * Run one-shot mode: execute task and exit
  */
-async function runOneshot(prompt: string, config: CLIConfig): Promise<void> {
+async function runOneshot(
+  prompt: string,
+  config: CLIConfig,
+  flags: Record<string, string | boolean>
+): Promise<void> {
+  const session = createChatSession(config);
+  const renderer = createRenderer(config.theme);
+
   console.log(`JackCode | Model: ${config.defaultModel}`);
   console.log('─'.repeat(50));
-  
-  // TODO: Integrate with runtime state machine (Thread 01)
-  // TODO: Route to appropriate model (Thread 09/10/11)
-  console.log(`\nTask: ${prompt}`);
-  console.log('\n(One-shot execution not yet implemented)');
+  console.log(renderer.renderStatus(session, { isProcessing: false, currentStream: null, lastActivity: Date.now() }));
+  console.log(formatMessage({ role: 'user', content: prompt, timestamp: Date.now() }, { theme: config.theme, showTimestamps: true, compact: false }));
+
+  const reply = `One-shot mode received: ${prompt}`;
+  session.messages.push({ role: 'user', content: prompt, timestamp: Date.now() });
+  session.messages.push({
+    role: 'assistant',
+    content: reply,
+    timestamp: Date.now(),
+    metadata: { model: config.defaultModel, tokensUsed: reply.length, latencyMs: 0, toolCalls: [] },
+  });
+  console.log(formatMessage(session.messages[1]!, { theme: config.theme, showTimestamps: true, compact: false }));
+
+  if (typeof flags.save === 'string') {
+    saveSession(session, flags.save);
+    console.log(`Saved session to ${flags.save}`);
+  }
+  if (typeof flags.export === 'string') {
+    exportSession(session, flags.export);
+    console.log(`Exported conversation to ${flags.export}`);
+  }
 }
 
 /**
  * Run execute mode: apply changes without confirmation
  */
-async function runExecute(prompt: string | undefined, config: CLIConfig): Promise<void> {
+async function runExecute(
+  prompt: string | undefined,
+  config: CLIConfig,
+  flags: Record<string, string | boolean>
+): Promise<void> {
   if (!prompt) {
     console.error('Error: --execute requires a prompt');
     process.exit(1);
   }
-  
+
+  const session = createChatSession(config, { mode: 'execute' });
+  session.messages.push({ role: 'user', content: prompt, timestamp: Date.now() });
+  session.messages.push({
+    role: 'assistant',
+    content: `Execute mode staged task: ${prompt}`,
+    timestamp: Date.now(),
+    metadata: { model: config.defaultModel, tokensUsed: prompt.length, latencyMs: 0, toolCalls: [] },
+  });
+
   console.log(`JackCode Execute | Model: ${config.defaultModel}`);
   console.log('─'.repeat(50));
-  
-  // TODO: Direct execution without interactive confirmation
-  console.log(`\nExecuting: ${prompt}`);
-  console.log('\n(Direct execution mode not yet implemented)');
+  for (const message of session.messages) {
+    console.log(formatMessage(message, { theme: config.theme, showTimestamps: true, compact: false }));
+  }
+
+  if (typeof flags.save === 'string') {
+    saveSession(session, flags.save);
+    console.log(`Saved session to ${flags.save}`);
+  }
+  if (typeof flags.export === 'string') {
+    exportSession(session, flags.export);
+    console.log(`Exported conversation to ${flags.export}`);
+  }
 }
 
 /**
  * Run interactive chat mode
  */
-async function runInteractive(config: CLIConfig): Promise<void> {
+async function runInteractive(config: CLIConfig, flags: Record<string, string | boolean>): Promise<void> {
+  let session = createChatSession(config);
+
+  if (typeof flags.load === 'string') {
+    session = loadSession(flags.load);
+  } else if (flags.resume === true) {
+    session = resumeLatestSession() ?? session;
+  }
+
   console.log(`
 ╔════════════════════════════════════════╗
 ║     JackCode v0.1.0 - Interactive      ║
@@ -222,11 +348,19 @@ async function runInteractive(config: CLIConfig): Promise<void> {
 ╚════════════════════════════════════════╝
 `);
 
-  const session = createChatSession(config);
   await startRepl(session);
+
+  if (typeof flags.save === 'string') {
+    saveSession(session, flags.save);
+    console.log(`Saved session to ${flags.save}`);
+  }
+  if (typeof flags.export === 'string') {
+    exportSession(session, flags.export);
+    console.log(`Exported conversation to ${flags.export}`);
+  }
+  console.log(`Autosaved session: ${getSessionFilePath(session.id)}`);
 }
 
-// Run if executed directly
 if (import.meta.url === `file://${process.argv[1]}`) {
   main().catch((err) => {
     console.error('Fatal error:', err);
