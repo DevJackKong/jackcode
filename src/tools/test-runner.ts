@@ -127,10 +127,8 @@ function normalizeError(error: unknown): string {
 }
 
 export class BuildRunner {
-  private cache: CacheManager;
-
   constructor(cacheDir?: string) {
-    this.cache = new CacheManager(cacheDir);
+    void cacheDir;
   }
 
   async compile(options: BuildOptions = {}): Promise<RunResult> {
@@ -193,10 +191,8 @@ export class BuildRunner {
 }
 
 export class TestRunner {
-  private cache: CacheManager;
-
   constructor(cacheDir?: string) {
-    this.cache = new CacheManager(cacheDir);
+    void cacheDir;
   }
 
   async run(options: TestRunnerOptions = {}): Promise<RunResult> {

@@ -4,7 +4,6 @@
  */
 
 import type {
-  E2EFlowTest,
   IntegrationRegistryEntry,
   IntegrationTest,
   QAMatrix,
@@ -15,7 +14,6 @@ import type {
   SmokeTestConfig,
   TestPriority,
   TestResult,
-  TestStatus,
   ThreadId,
   ThreadPair,
   ThreadPairCoverage,
@@ -308,6 +306,7 @@ export class IntegrationQAEngine {
   private async runSingleTest(test: IntegrationTest): Promise<TestResult> {
     const startedAt = Date.now();
     const logs: string[] = [];
+    const stepResults: TestResult['stepResults'] = [];
 
     try {
       logs.push(`Starting test: ${test.name}`);
@@ -319,7 +318,6 @@ export class IntegrationQAEngine {
       }
 
       // Execute test steps
-      const stepResults = [];
       for (const step of test.steps) {
         const stepStart = Date.now();
         logs.push(`Step ${step.order}: ${step.action}`);
@@ -328,27 +326,34 @@ export class IntegrationQAEngine {
           await this.executeStep(step);
           stepResults.push({
             step: step.order,
-            passed: true,
+            passed: !step.expectError,
             durationMs: Date.now() - stepStart,
+            error: step.expectError ? 'Expected an error but step completed successfully' : undefined,
           });
+
+          if (step.expectError) {
+            throw new Error(`Step ${step.order} was expected to fail but succeeded`);
+          }
         } catch (error) {
+          const errorMessage = error instanceof Error ? error.message : String(error);
+          if (step.expectError) {
+            stepResults.push({
+              step: step.order,
+              passed: true,
+              durationMs: Date.now() - stepStart,
+            });
+            logs.push(`Expected error observed for step ${step.order}: ${errorMessage}`);
+            continue;
+          }
+
           stepResults.push({
             step: step.order,
             passed: false,
             durationMs: Date.now() - stepStart,
-            error: error instanceof Error ? error.message : String(error),
+            error: errorMessage,
           });
-
-          if (!step.expectError) {
-            throw error;
-          }
+          throw error;
         }
-      }
-
-      // Run teardown if defined
-      if (test.teardown) {
-        logs.push(`Running teardown: ${test.teardown}`);
-        await this.runTeardown(test.teardown);
       }
 
       const endedAt = Date.now();
@@ -362,10 +367,18 @@ export class IntegrationQAEngine {
         logs,
       };
 
-      this.testResults.set(test.id, result);
-      return result;
+      return await this.finalizeTestResult(test, result);
     } catch (error) {
-      return this.createErrorResult(test.id, error instanceof Error ? error.message : String(error), startedAt, logs);
+      return await this.finalizeTestResult(
+        test,
+        this.createErrorResult(
+          test.id,
+          error instanceof Error ? error.message : String(error),
+          startedAt,
+          logs,
+          stepResults
+        )
+      );
     }
   }
 
@@ -515,23 +528,45 @@ export class IntegrationQAEngine {
     testId: string,
     message: string,
     startedAt: number = Date.now(),
-    logs: string[] = []
+    logs: string[] = [],
+    stepResults: TestResult['stepResults'] = []
   ): TestResult {
     const endedAt = Date.now();
-    const result: TestResult = {
+    return {
       testId,
       status: 'failed',
       startedAt,
       endedAt,
       durationMs: endedAt - startedAt,
-      stepResults: [],
+      stepResults,
       error: {
         message,
         suggestion: 'Check thread registration and integration points',
       },
       logs: [...logs, `ERROR: ${message}`],
     };
-    this.testResults.set(testId, result);
+  }
+
+  /**
+   * Persist test results and run teardown safely.
+   */
+  private async finalizeTestResult(test: IntegrationTest, result: TestResult): Promise<TestResult> {
+    if (test.teardown) {
+      try {
+        result.logs.push(`Running teardown: ${test.teardown}`);
+        await this.runTeardown(test.teardown);
+      } catch (error) {
+        const teardownMessage = error instanceof Error ? error.message : String(error);
+        result.logs.push(`Teardown failed: ${teardownMessage}`);
+        result.status = 'failed';
+        result.error ??= {
+          message: teardownMessage,
+          suggestion: 'Investigate teardown cleanup for the integration test',
+        };
+      }
+    }
+
+    this.testResults.set(test.id, result);
     return result;
   }
 

@@ -27,8 +27,8 @@ import type {
   ErrorClassifier,
   RecoveryHook,
   CircuitBreakerEvent,
-  DEFAULT_RECOVERY_CONFIG,
 } from '../types/repairer.js';
+import { DEFAULT_RECOVERY_CONFIG } from '../types/repairer.js';
 
 /**
  * Retry Manager
@@ -62,8 +62,6 @@ export class RetryManager {
     const maxRetries = this.config.maxRetries;
 
     for (let attempt = 1; attempt <= maxRetries + 1; attempt++) {
-      const attemptStart = Date.now();
-
       try {
         // Check concurrent retry limit
         const activeCount = this.getActiveRetryCount();
@@ -223,7 +221,7 @@ export class RetryManager {
    * Get active retry count
    */
   private getActiveRetryCount(): number {
-    return Object.values(this.activeRetries).reduce((a, b) => a + b, 0);
+    return Array.from(this.activeRetries.values()).reduce((total, count) => total + count, 0);
   }
 
   /**
@@ -239,9 +237,12 @@ export class RetryManager {
    */
   private decrementActiveRetry(operationId: string): void {
     const current = this.activeRetries.get(operationId) || 0;
-    if (current > 0) {
-      this.activeRetries.set(operationId, current - 1);
+    if (current <= 1) {
+      this.activeRetries.delete(operationId);
+      return;
     }
+
+    this.activeRetries.set(operationId, current - 1);
   }
 
   /**
@@ -596,7 +597,7 @@ export class RecoveryEngine {
     // Check safety first
     const safetyCheck = this.safetyGuardian.checkLimits({
       taskId: context.taskId,
-      activeRetries: DEFAULT_RECOVERY_CONFIG.safety.maxConcurrentRetries,
+      activeRetries: context.attemptHistory.length,
     });
 
     if (!safetyCheck.passed) {
@@ -651,8 +652,8 @@ export class RecoveryEngine {
     return {
       success: true,
       action: 'retry',
-      newState: 'retrying',
-      message: `Transient failure detected, will retry. Remaining: ${context.remainingRetries - 1}`,
+      newState: 'repair',
+      message: `Transient failure detected, will retry. Remaining: ${Math.max(0, context.remainingRetries - 1)}`,
     };
   }
 
@@ -667,7 +668,7 @@ export class RecoveryEngine {
       return {
         success: true,
         action: 'rollback',
-        newState: 'rolling_back',
+        newState: 'repair',
         rollbackCheckpointId: context.lastCheckpointId,
         message: `Permanent failure, rolling back to checkpoint ${context.lastCheckpointId}`,
       };
@@ -684,7 +685,7 @@ export class RecoveryEngine {
     return {
       success: false,
       action: 'escalate',
-      newState: 'escalated',
+      newState: 'error',
       escalation,
       message: `Escalating to ${escalation.targetModel}: ${escalation.reason}`,
     };
