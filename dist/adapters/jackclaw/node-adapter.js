@@ -46,14 +46,14 @@ function sanitizeRecord(input, depth = 0) {
             continue;
         }
         if (Array.isArray(value)) {
-            output[key] = value.slice(0, 50).map((entry) => {
+            output[key] = value
+                .slice(0, 50)
+                .flatMap((entry) => {
                 if (typeof entry === 'string')
-                    return sanitizeString(entry, 500);
+                    return [sanitizeString(entry, 500)];
                 if (typeof entry === 'number' || typeof entry === 'boolean' || entry === null)
-                    return entry;
-                if (typeof entry === 'object')
-                    return sanitizeRecord(entry, depth + 1);
-                return String(entry);
+                    return [entry];
+                return [];
             });
             continue;
         }
@@ -87,7 +87,16 @@ export class NodeIdentityManager {
     constructor(seed) {
         this.identity = this.createIdentity(seed);
     }
-    loadOrCreate() {
+    async loadOrCreate(seed) {
+        if (seed) {
+            this.identity = this.createIdentity({
+                ...this.identity,
+                nodeId: seed.nodeId ?? this.identity.nodeId,
+                sharedSecret: seed.signingSecret ?? this.identity.sharedSecret,
+                displayName: seed.displayName ?? this.identity.displayName,
+                role: seed.role ?? this.identity.role,
+            });
+        }
         return { ...this.identity };
     }
     async registerWithHub(hubUrl) {
@@ -95,13 +104,13 @@ export class NodeIdentityManager {
             throw new Error('Hub URL is required for registration');
         }
     }
-    sign(payload) {
-        return createHmac('sha256', this.identity.sharedSecret).update(stableStringify(payload)).digest('hex');
+    sign(payload, signingSecret) {
+        return createHmac('sha256', signingSecret ?? this.identity.sharedSecret).update(stableStringify(payload)).digest('hex');
     }
-    verify(senderId, payload, signature) {
+    verify(senderId, payload, signature, signingSecret) {
         if (!senderId || !signature)
             return false;
-        const expected = this.sign(payload);
+        const expected = this.sign(payload, signingSecret);
         return signature === expected;
     }
     createIdentity(seed) {
@@ -141,13 +150,16 @@ export class JackClawNodeAdapter extends EventEmitter {
         this.fetchImpl = dependencies.fetchImpl ?? fetch;
         this.runtimeAdapter = dependencies.runtimeAdapter ?? new DefaultRuntimeAdapter();
         this.now = dependencies.now ?? (() => Date.now());
-        this.identityManager = new NodeIdentityManager({ nodeId: this.config.nodeId, displayName: this.config.nodeName, role: 'jackcode-node' });
+        this.identityManager = new NodeIdentityManager({ nodeId: this.config.nodeId, displayName: this.config.nodeName, role: 'jackcode-node', sharedSecret: this.config.signingSecret });
         this.transport = dependencies.transportFactory ? dependencies.transportFactory(this.config) : this.createNoopTransport();
         this.backoffMs = this.config.reconnectIntervalMs ?? DEFAULT_CONFIG.reconnectIntervalMs;
         this.bindTransport();
     }
     get nodeId() {
-        return this.identityManager.loadOrCreate().nodeId;
+        return this.getIdentitySync().nodeId;
+    }
+    get identity() {
+        return this.identityManager;
     }
     isConnected() {
         return this.connected;
@@ -157,9 +169,7 @@ export class JackClawNodeAdapter extends EventEmitter {
     }
     async start() {
         await this.transport.connect();
-        if (this.config.autoRegister) {
-            await this.register();
-        }
+        await this.register();
         this.startHeartbeat();
     }
     async stop() {
@@ -173,12 +183,12 @@ export class JackClawNodeAdapter extends EventEmitter {
             pending.reject(new Error('Adapter stopped'));
         }
         this.pendingRequests.clear();
-        await this.transport.close(1000, 'shutdown');
+        await this.transport.close(1000, 'graceful shutdown');
         this.connected = false;
         this.authenticated = false;
     }
     async register() {
-        const identity = this.identityManager.loadOrCreate();
+        const identity = this.getIdentitySync();
         const payload = {
             nodeId: identity.nodeId,
             nodeName: this.config.nodeName ?? 'JackCode Node',
@@ -252,24 +262,39 @@ export class JackClawNodeAdapter extends EventEmitter {
         }
     }
     async sendProgress(taskId, progress) {
-        await this.sendMessage('report', {
-            kind: 'progress',
+        const message = this.buildSignedMessage('report', {
+            type: 'progress',
             taskId,
             progress,
-        }, { awaitAck: false });
+        }, {});
+        await this.fetchImpl(this.config.hubUrl, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify(message),
+        });
     }
     async sendCompletion(taskId, result) {
-        await this.sendMessage('report', {
-            kind: 'completion',
+        const message = this.buildSignedMessage('report', {
+            type: 'completion',
             taskId,
             result,
-        }, { awaitAck: false });
+        }, {});
+        await this.fetchImpl(this.config.hubUrl, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify(message),
+        });
     }
     async sendDailyReport(report) {
-        await this.sendMessage('report', {
-            kind: 'daily_report',
+        const message = this.buildSignedMessage('report', {
+            type: 'daily_report',
             report,
-        }, { awaitAck: false });
+        }, {});
+        await this.fetchImpl(this.config.hubUrl, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify(message),
+        });
     }
     getHealthSnapshot() {
         return {
@@ -315,23 +340,27 @@ export class JackClawNodeAdapter extends EventEmitter {
             this.emit('warning', new Error('Discarded message with invalid signature'));
             return;
         }
+        if (message.type === 'broadcast') {
+            this.emit('broadcast', message.payload);
+        }
         if (message.type === 'auth_ok') {
             this.authenticated = true;
         }
         if (message.type === 'ping') {
-            await this.sendMessage('pong', { timestamp: this.now() }, { awaitAck: false, correlationId: message.id });
+            await this.sendMessage('pong', { timestamp: this.now() }, { awaitAck: false, replyTo: message.id });
             return;
         }
         if (message.type === 'health') {
-            await this.sendMessage('health_response', this.getHealthSnapshot(), { awaitAck: false, correlationId: message.id });
+            await this.sendMessage('health_response', this.getHealthSnapshot(), { awaitAck: false, replyTo: message.id });
             return;
         }
         if (message.type === 'task') {
-            void this.handleTask(message.payload).catch((error) => {
+            await this.handleTask(message.payload).catch((error) => {
                 this.emit('task_error', error);
+                throw error;
             });
         }
-        const pendingKey = message.correlationId ?? message.replyTo ?? message.id;
+        const pendingKey = message.replyTo ?? message.correlationId ?? message.id;
         const pending = this.pendingRequests.get(pendingKey);
         if (pending) {
             clearTimeout(pending.timeout);
@@ -341,11 +370,12 @@ export class JackClawNodeAdapter extends EventEmitter {
     }
     verifyMessage(message) {
         const { signature, ...unsigned } = message;
-        return this.identityManager.verify(message.from, unsigned, signature);
+        const sharedSecret = this.config.signingSecret;
+        return this.identityManager.verify(message.from, unsigned, signature, sharedSecret)
+            || this.identityManager.verify(message.from, message.payload, signature, sharedSecret);
     }
-    async sendMessage(type, payload, options = {}) {
-        this.enforceRateLimit();
-        const identity = this.identityManager.loadOrCreate();
+    buildSignedMessage(type, payload, options = {}) {
+        const identity = this.getIdentitySync();
         const message = {
             id: randomUUID(),
             from: identity.nodeId,
@@ -354,26 +384,40 @@ export class JackClawNodeAdapter extends EventEmitter {
             payload: sanitizeRecord(payload),
             timestamp: this.now(),
             correlationId: options.correlationId,
+            replyTo: options.replyTo,
         };
-        const signed = {
+        return {
             ...message,
             signature: this.identityManager.sign(message),
         };
+    }
+    async sendMessage(type, payload, options = {}) {
+        this.enforceRateLimit();
+        const signed = this.buildSignedMessage(type, payload, { correlationId: options.correlationId, replyTo: options.replyTo });
         const raw = JSON.stringify(signed);
         if (Buffer.byteLength(raw, 'utf8') > (this.config.maxPayloadBytes ?? DEFAULT_CONFIG.maxPayloadBytes)) {
             throw new Error('Payload exceeds configured size limit');
         }
         this.inflightRequests += 1;
         try {
-            await this.transport.send(raw);
-            if (!options.awaitAck)
+            if (!options.awaitAck) {
+                await this.transport.send(raw);
                 return;
-            return await new Promise((resolve, reject) => {
+            }
+            return await new Promise(async (resolve, reject) => {
                 const timeout = setTimeout(() => {
                     this.pendingRequests.delete(signed.id);
                     reject(new Error(`Request timed out for ${type}`));
                 }, this.config.requestTimeoutMs ?? DEFAULT_CONFIG.requestTimeoutMs);
                 this.pendingRequests.set(signed.id, { resolve, reject, timeout });
+                try {
+                    await this.transport.send(raw);
+                }
+                catch (error) {
+                    clearTimeout(timeout);
+                    this.pendingRequests.delete(signed.id);
+                    reject(error);
+                }
             });
         }
         finally {
@@ -420,6 +464,28 @@ export class JackClawNodeAdapter extends EventEmitter {
             return;
         clearInterval(this.heartbeatTimer);
         this.heartbeatTimer = null;
+    }
+    getIdentitySync() {
+        return this.identityManager['identity'];
+    }
+    async sendRequest(type, payload, options = {}) {
+        return this.sendMessage(type, payload, { awaitAck: options.awaitReply });
+    }
+    async handleRawMessage(raw) {
+        if (Buffer.byteLength(raw, 'utf8') > (this.config.maxPayloadBytes ?? DEFAULT_CONFIG.maxPayloadBytes)) {
+            throw new Error('Payload too large');
+        }
+        let parsed;
+        try {
+            parsed = JSON.parse(raw);
+        }
+        catch {
+            throw new Error('Invalid message payload');
+        }
+        if (!this.verifyMessage(parsed)) {
+            throw new Error('Invalid message signature');
+        }
+        await this.handleIncoming(raw);
     }
     computeLoadScore() {
         const maxConcurrent = this.config.maxConcurrentTasks ?? DEFAULT_CONFIG.maxConcurrentTasks;
@@ -481,5 +547,99 @@ export class JackClawNodeAdapter extends EventEmitter {
                 closeHandler?.(code, reason);
             },
         };
+    }
+}
+export class MessageRouter {
+    serialize(message) {
+        return JSON.stringify(message);
+    }
+    deserialize(raw) {
+        return JSON.parse(raw);
+    }
+}
+export class TaskReceiver {
+    identity;
+    handlers = [];
+    constructor(identity) {
+        this.identity = identity;
+    }
+    start(_port) { }
+    onTask(handler) {
+        this.handlers.push(handler);
+    }
+    async handleIncomingTask(message, signingSecret) {
+        const { signature, ...unsigned } = message;
+        if (!this.identity.verify(message.from, unsigned, signature, signingSecret)
+            && !this.identity.verify(message.from, message.payload, signature, signingSecret)) {
+            throw new Error('Invalid message signature');
+        }
+        const payload = sanitizeRecord(message.payload);
+        const handler = this.handlers[0];
+        if (!handler) {
+            throw new Error('No task handler registered');
+        }
+        return handler(payload);
+    }
+}
+export class TaskRouter {
+    runtimeAdapter;
+    constructor(runtimeAdapter) {
+        this.runtimeAdapter = runtimeAdapter;
+    }
+    async route(task, onProgress) {
+        const startedAt = Date.now();
+        const emit = async (state, message, percentComplete) => {
+            await onProgress?.({
+                taskId: task.taskId,
+                state,
+                message,
+                percentComplete,
+                timestamp: Date.now(),
+            });
+        };
+        await emit('plan', `Planning task: ${task.action}`, 10);
+        const runtimeTask = this.runtimeAdapter.createTask(task.action, {
+            id: task.taskId,
+            priority: task.priority,
+            timeoutMs: task.timeoutMs,
+        });
+        this.runtimeAdapter.setPlan(runtimeTask.id, {
+            steps: [{ id: `${task.taskId}-step-1`, description: task.action, targetFiles: [], dependencies: [] }],
+            estimatedTokens: 1_000,
+            targetModel: 'qwen',
+        });
+        await emit('execute', 'Executing task in JackCode runtime', 50);
+        const result = await this.runtimeAdapter.runTask(runtimeTask.id);
+        await emit('review', 'Reviewing runtime outputs', 85);
+        await emit('done', 'Task completed', 100);
+        return {
+            taskId: task.taskId,
+            status: result.errors.length > 0 ? 'failure' : 'success',
+            output: result.errors.length > 0 ? result.errors.map((error) => error.message).join('; ') : 'Task completed successfully',
+            artifacts: result.artifacts.map((artifact) => ({ type: artifact.type, path: artifact.path, content: artifact.content })),
+            error: result.errors[0]?.message,
+            durationMs: Date.now() - startedAt,
+            attempts: result.attempts,
+        };
+    }
+}
+export class RateLimiter {
+    limitPerMinute;
+    now;
+    timestamps = [];
+    constructor(limitPerMinute, now = () => Date.now()) {
+        this.limitPerMinute = limitPerMinute;
+        this.now = now;
+    }
+    consume() {
+        const current = this.now();
+        while (this.timestamps.length > 0 && current - this.timestamps[0] >= 60_000) {
+            this.timestamps.shift();
+        }
+        if (this.timestamps.length >= this.limitPerMinute) {
+            return false;
+        }
+        this.timestamps.push(current);
+        return true;
     }
 }

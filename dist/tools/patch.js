@@ -500,22 +500,28 @@ async function verifyPatchedFile(targetPath, content, config) {
     return base;
 }
 async function runTypeScriptSyntaxCheck(content, targetPath) {
-    const tempDir = join(process.cwd(), '.jackcode', 'syntax-check');
-    await ensureDir(tempDir);
-    const tempFile = join(tempDir, `${basename(targetPath).replace(/[^a-zA-Z0-9_.-]/g, '_')}.${randomUUID()}.ts`);
-    await fs.writeFile(tempFile, content, 'utf8');
     try {
-        const result = await runCommand('tsc', ['--noEmit', '--pretty', 'false', tempFile]);
+        const ts = await import('typescript');
+        const result = ts.transpileModule(content, {
+            fileName: basename(targetPath),
+            compilerOptions: {
+                target: ts.ScriptTarget.ES2022,
+                module: ts.ModuleKind.ESNext,
+                strict: false,
+                skipLibCheck: true,
+            },
+            reportDiagnostics: true,
+        });
+        const diagnostics = (result.diagnostics ?? [])
+            .filter((diagnostic) => diagnostic.category === ts.DiagnosticCategory.Error)
+            .map((diagnostic) => ts.flattenDiagnosticMessageText(diagnostic.messageText, '\n'));
         return {
-            valid: result.code === 0,
-            errors: result.code === 0 ? [] : [result.stderr || result.stdout || 'TypeScript syntax check failed'],
+            valid: diagnostics.length === 0,
+            errors: diagnostics,
         };
     }
     catch {
         return { valid: true, errors: [] };
-    }
-    finally {
-        await fs.rm(tempFile, { force: true });
     }
 }
 function runCommand(command, args) {
@@ -633,7 +639,7 @@ export async function applyPatch(plan, sessionOrOptions, maybeScanner) {
             const nextContent = joinLines(currentLines);
             const verification = await verifyPatchedFile(targetPath, nextContent, { ...DEFAULT_CONFIG, snapshotDir: dirname(patch.reversePatch.storagePath) });
             if (!verification.valid) {
-                throw Object.assign(new Error(`Verification failed: ${verification.errors.join('; ')}`), { failureType: 'conflict' });
+                throw Object.assign(new Error(`Verification failed: ${verification.errors.join('; ')}`), { failureType: (hadChecksumMismatch ? 'checksum_mismatch' : 'conflict') });
             }
             const backupPath = before.exists ? await createBackup(targetPath, before.content) : undefined;
             const reversePayload = {
@@ -887,7 +893,7 @@ export function getActiveSnapshotIds() {
 }
 export async function cleanupSnapshots(maxAgeDays) {
     const retentionMs = (maxAgeDays ?? DEFAULT_CONFIG.snapshotRetentionDays) * 24 * 60 * 60 * 1000;
-    const cutoff = retentionMs < 0 ? Number.POSITIVE_INFINITY : Date.now() - retentionMs;
+    const cutoff = retentionMs < 0 ? Date.now() + Math.abs(retentionMs) : Date.now() - retentionMs;
     const removed = [];
     for (const [id, snapshot] of activeSnapshots) {
         const historyEntry = patchHistory.find((entry) => entry.id === id);

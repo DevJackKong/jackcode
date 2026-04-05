@@ -133,7 +133,7 @@ export class QwenExecutorRouter {
         const userPrompt = request.userPrompt?.trim() || this.buildUserPrompt(request, trimmedContext, policyDecision);
         const messages = [{ role: 'system', content: systemPrompt }, { role: 'user', content: userPrompt }];
         const tools = (request.tools ?? []).filter((tool) => profile.supportsTools || tool.name.length === 0);
-        const inputTokens = estimateTokens(`${systemPrompt}\n${userPrompt}`);
+        const inputTokens = Math.min(profile.contextWindow - 1, estimateTokens(`${systemPrompt}\n${userPrompt}`));
         const maxOutputTokens = Math.max(256, request.maxOutputTokens ?? this.config.outputTokenReserve);
         return {
             model,
@@ -338,7 +338,7 @@ export class QwenExecutorRouter {
             if (used >= promptBudget)
                 break;
         }
-        return `${kept.join('\n\n')}\n\n[... unrelated implementation details omitted for Qwen budget ...]`;
+        return `${kept.join('\n\n')}\n\n[... context trimmed for Qwen token budget ...]`;
     }
     scoreContextBlock(block, index, ops) {
         const text = block.toLowerCase();
@@ -397,7 +397,7 @@ export class QwenExecutorRouter {
         const response = await this.executeWithRetry(prepared, request, span);
         const latency = Date.now() - startedAt;
         const operation = request.operations[0];
-        const completed = { ...operation, success: true, diff: response.content, latencyMs: latency };
+        const completed = { ...operation, success: true, diff: response.content ?? '', latencyMs: latency };
         return {
             taskId: request.taskId,
             success: true,
@@ -429,7 +429,7 @@ export class QwenExecutorRouter {
                 totalLatency += latencyMs;
                 totalTokens += response.tokensUsed ?? 0;
                 retryCount += Number(response.metadata?.retryCount ?? 0);
-                return { ...operation, success: true, diff: response.content, latencyMs };
+                return { ...operation, success: true, diff: response.content ?? '', latencyMs };
             }));
             completed.push(...chunkResults);
         }
