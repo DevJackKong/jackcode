@@ -5,10 +5,10 @@ import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
 
-import { applyPatch, buildPatchFromRequest, rollbackPatch } from '../../src/tools/patch.ts';
-import { BuildTestLoopOrchestrator, type LoopRunResult, type RunResult } from '../../src/tools/test-runner.ts';
-import { RecoveryEngine } from '../../src/core/recovery.ts';
-import type { ChangeRequest, Patch } from '../../src/types/patch.ts';
+import { applyPatch, buildPatchFromRequest, rollbackPatch } from '../../src/tools/patch.js';
+import { BuildTestLoopOrchestrator, type LoopRunResult, type RunResult } from '../../src/tools/test-runner.js';
+import { RecoveryEngine } from '../../src/core/recovery.js';
+import type { ChangeRequest, Patch } from '../../src/types/patch.js';
 
 const execFileAsync = promisify(execFile);
 const FIXTURE_ROOT = path.resolve(process.cwd(), 'tests/e2e/fixtures/sample-project');

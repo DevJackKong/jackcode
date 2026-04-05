@@ -20,7 +20,7 @@ export {
   RollbackManager,
   recoveryEngine,
   createRecoveryEngine,
-} from './recovery.ts';
+} from './recovery.js';
 import type {
   ChangeSet,
   CodeLocation,
@@ -35,9 +35,9 @@ import type {
   VerificationReport,
   VerificationResult,
   VerifierHookRegistration,
-} from '../types/reviewer.ts';
-import { DEFAULT_VERIFIER_CONFIG } from '../types/reviewer.ts';
-import type { Patch, Hunk } from '../types/patch.ts';
+} from '../types/reviewer.js';
+import { DEFAULT_VERIFIER_CONFIG } from '../types/reviewer.js';
+import type { Patch, Hunk } from '../types/patch.js';
 
 export interface GPT54ModelClient {
   verify(prompt: string, options: { model: string; maxTokens: number; temperature: number; timeoutMs: number }): Promise<string>;
@@ -188,7 +188,12 @@ export class GPT54VerifierRepairer {
   async assessQuality(changes: ChangeSet[]): Promise<QualityReport> {
     const stats = this.computeChangeStats(changes);
     const stylePenalty = Math.min(0.35, stats.longLineRatio * 0.4 + stats.consoleCount * 0.03 + stats.todoCount * 0.04);
-    const consistencyPenalty = Math.min(0.35, stats.mixedIndentation ? 0.15 : 0 + stats.semicolonVariance ? 0.1 : 0 + stats.namingAnomalies * 0.05);
+    const consistencyPenalty = Math.min(
+      0.35,
+      (stats.mixedIndentation ? 0.15 : 0)
+      + (stats.semicolonVariance ? 0.1 : 0)
+      + stats.namingAnomalies * 0.05,
+    );
     const documentationPenalty = stats.exportedSymbolCount > 0 && stats.commentCoverage < 0.05 ? 0.15 : 0;
 
     const dimensionScores: Record<VerificationDimension, number> = {

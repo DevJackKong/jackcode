@@ -2,10 +2,10 @@
  * Runtime state machine integration example.
  */
 
-import { RuntimeStateMachine } from './runtime.ts';
-import { sessionManager } from './session.ts';
-import { qwenRouter } from '../model/router.ts';
-import { recoveryEngine } from './repairer.ts';
+import { RuntimeStateMachine } from './runtime.js';
+import { sessionManager } from './session.js';
+import { qwenRouter } from '../model/router.js';
+import { recoveryEngine } from './repairer.js';
 
 async function main(): Promise<void> {
   const session = sessionManager.createSession({

@@ -13,6 +13,7 @@ import { mkdirSync, readFileSync, writeFileSync, existsSync, readdirSync, statSy
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import os from 'node:os';
 import readline from 'node:readline';
+import type { Interface as ReadlineInterface } from 'node:readline';
 import { stdin as input, stdout as output } from 'node:process';
 import type {
   ChatMessage,
@@ -666,7 +667,7 @@ export async function startRepl(session: ChatSession, options: StartReplOptions 
     historySize: 200,
     removeHistoryDuplicates: true,
     completer: createCompleter(commands.keys()),
-  });
+  }) as ReadlineInterface & { history: string[] };
 
   try {
     const historyPath = resolve(cwd, session.config.historyFile);

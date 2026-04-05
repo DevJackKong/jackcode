@@ -16,7 +16,7 @@ import {
   parseCoverageFromText,
   type CommandExecutor,
   type CommandSpec,
-} from './test-runner.ts';
+} from './test-runner.js';
 
 function createProject(structure: Record<string, string>): string {
   const root = mkdtempSync(join(tmpdir(), 'jackcode-thread-04-'));

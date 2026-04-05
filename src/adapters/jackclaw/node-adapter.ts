@@ -7,7 +7,7 @@ import { createHash, createHmac, randomUUID } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import process from 'node:process';
 
-import { runtime, type Artifact, type ExecutionPlan } from '../../core/runtime.ts';
+import { runtime, type Artifact, type ExecutionPlan } from '../../core/runtime.js';
 
 export type JackClawMessageType =
   | 'auth'
@@ -540,7 +540,7 @@ export class ReportSender {
   }
 
   async sendProgress(taskId: string, progress: ProgressUpdate): Promise<void> {
-    await this.send('report', { type: 'progress', taskId, ...progress });
+    await this.send('report', { ...progress, type: 'progress', taskId });
   }
 
   async sendCompletion(taskId: string, result: TaskResult): Promise<void> {

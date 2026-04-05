@@ -16,12 +16,13 @@ import {
 import { basename, dirname, extname, join, resolve } from 'node:path';
 import { promisify } from 'node:util';
 
-import type { SessionManager } from '../core/session.ts';
-import type { RuntimeStateMachine, TaskContext } from '../core/runtime.ts';
-import type { RepoScanner } from '../core/scanner.ts';
-import type { ImpactAnalyzer } from '../repo/impact-analyzer.ts';
-import type { Patch, PatchPlan } from '../types/patch.ts';
-import type { ChangeDescriptor } from '../types/impact-analyzer.ts';
+import type { SessionManager } from '../core/session.js';
+import type { FileIndex } from '../types/scanner.js';
+import type { RuntimeStateMachine, TaskContext } from '../core/runtime.js';
+import type { RepoScanner } from '../core/scanner.js';
+import type { ImpactAnalyzer } from '../repo/impact-analyzer.js';
+import type { Patch, PatchPlan } from '../types/patch.js';
+import type { ChangeDescriptor } from '../types/impact-analyzer.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -97,9 +98,20 @@ export interface TestCompletionEvent {
 
 export interface TestRunnerIntegrations {
   runtime?: RuntimeStateMachine;
-  session?: SessionManager;
-  scanner?: RepoScanner;
-  impactAnalyzer?: ImpactAnalyzer;
+  session?: {
+    addTaskNote(sessionId: string, taskId: string, note: string): boolean | null;
+    recordTestResult?(sessionId: string, result: {
+      success: boolean;
+      durationMs: number;
+      classification?: FailureClassification;
+      coverage?: CoverageReport;
+      errors: string[];
+    }): boolean | null;
+  };
+  scanner?: { getIndex(): { files: Map<string, { path: string; isTest?: boolean }> } | FileIndex | null };
+  impactAnalyzer?: {
+    analyze(...args: unknown[]): Promise<{ affectedTests?: Array<{ path: string }> }>;
+  };
   sessionId?: string;
   taskId?: string;
 }
@@ -837,7 +849,7 @@ export class TestRunner {
     changedFiles: string[] | undefined,
     trigger: TestCompletionEvent['trigger']
   ): void {
-    this.integrations.session?.recordTestResult(this.integrations.sessionId ?? '', {
+    this.integrations.session?.recordTestResult?.(this.integrations.sessionId ?? '', {
       success: result.success,
       durationMs: result.durationMs,
       classification: result.classification,
@@ -917,13 +929,16 @@ export class TestRunner {
       scope: 'file',
     }));
     const report = await this.integrations.impactAnalyzer.analyze(changes);
-    return report.affectedTests.map((test) => test.path);
+    return (report.affectedTests ?? []).map((test) => test.path);
   }
 
   private discoverTestFiles(): string[] {
     const scanner = this.integrations.scanner;
     if (scanner?.getIndex()) {
-      return Array.from(scanner.getIndex()!.files.values())
+      const index = scanner.getIndex();
+      const fileValues = index?.files ? [...index.files.values()] : [];
+      const values = fileValues as Array<{ path: string; isTest?: boolean }>;
+      return values
         .filter((entry) => Boolean((entry as FileSystemEntryWithFlags).isTest))
         .map((entry) => entry.path)
         .sort();

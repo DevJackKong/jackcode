@@ -371,7 +371,7 @@ test('runtime scans repo and stores scanner snapshot for session', async () => {
       scanner,
       session: {
         updateTaskStatus: () => true,
-        setScannerSnapshot: (_sessionId, snapshot) => {
+        setScannerSnapshot: (_sessionId: string, snapshot: unknown) => {
           snapshotRoot = (snapshot as { rootDir?: string })?.rootDir ?? null;
           return true;
         },

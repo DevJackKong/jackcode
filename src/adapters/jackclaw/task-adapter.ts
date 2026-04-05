@@ -107,7 +107,7 @@ export class JackClawCollaborationAdapter {
     }
 
     if (TERMINAL_STATUSES.has(current.status)) {
-      const result = this.buildResult(current, current.taskId, current.status);
+      const result = this.buildResult(current, current.taskId, current.status as 'success' | 'failure' | 'timeout' | 'cancelled');
       this.completedResults.set(current.id, result);
       return result;
     }
@@ -172,6 +172,8 @@ export class JackClawCollaborationAdapter {
       files: [],
       analysis: [],
       patches: [],
+      verifications: [],
+      metadata: [],
     };
 
     for (const result of results) {
@@ -183,6 +185,12 @@ export class JackClawCollaborationAdapter {
       }
       if (result.outputs.patch) {
         combined.patches.push(result.outputs.patch as Patch);
+      }
+      if (typeof result.outputs.verification === 'boolean') {
+        combined.verifications.push(result.outputs.verification);
+      }
+      if (result.outputs.metadata) {
+        combined.metadata.push(result.outputs.metadata);
       }
     }
 

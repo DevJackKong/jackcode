@@ -6,7 +6,7 @@
 
 import { createHash } from 'node:crypto';
 
-import { telemetry, telemetryMetrics } from '../core/telemetry.ts';
+import { telemetry, telemetryMetrics } from '../core/telemetry.js';
 import type {
   CompletedOperation,
   EscalationReason,
@@ -16,9 +16,9 @@ import type {
   RouterConfig,
   RouterMetrics,
   RoutePriority,
-} from './types.ts';
-import { DEFAULT_ROUTER_CONFIG } from './types.ts';
-import type { RoutingDecision } from './types/policy.ts';
+} from './types.js';
+import { DEFAULT_ROUTER_CONFIG } from './types.js';
+import type { RoutingDecision } from './types/policy.js';
 
 export type QwenModelId = 'qwen-3.6' | 'qwen-coder' | 'qwen-3.6-fast';
 export type QwenErrorType =

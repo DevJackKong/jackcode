@@ -82,7 +82,7 @@ test('supports hierarchical tasks, goal tree, checkpoints, and restore', async (
   const restoredSession = manager.getSession(session.id);
   const restoredTask = restoredSession?.tasks.find((task) => task.id === taskA!.id);
   assert.ok(restoredTask);
-  assert.equal(restoredTask?.notes.includes('Post-checkpoint note'), false);
+  assert.equal(restoredTask?.notes?.includes('Post-checkpoint note') ?? false, false);
   assert.equal(restoredSession?.recoveryState.recoveredFromCheckpointId, checkpoint?.id);
 
   const goals = manager.getGoalHierarchy(session.id);
@@ -199,4 +199,24 @@ test('tracks model usage totals and per-model performance metrics', () => {
   assert.equal(totals.byModel.qwen.averageLatencyMs, 300);
   assert.equal(totals.byModel.qwen.successRate, 0.5);
   assert.equal(totals.byModel['gpt-5.4'].totalTokens, 420);
+});
+
+
+test('stores scanner snapshot and changed files in session', () => {
+  const manager = new SessionManager();
+  const session = manager.createSession({ rootGoal: 'Track repo changes' });
+
+  const snapshot = {
+    rootDir: '/tmp/repo',
+    files: new Map(),
+    directories: new Map(),
+    languages: new Map(),
+    generatedAt: Date.now(),
+  };
+
+  assert.equal(manager.setScannerSnapshot(session.id, snapshot as never), true);
+  assert.equal(manager.getScannerSnapshot(session.id)?.rootDir, '/tmp/repo');
+
+  assert.equal(manager.recordFileChanges(session.id, [{ path: 'src/a.js', type: 'modified' }]), true);
+  assert.deepEqual(manager.getChangedFiles(session.id), [{ path: 'src/a.js', type: 'modified' }]);
 });

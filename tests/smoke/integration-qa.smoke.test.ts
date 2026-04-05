@@ -4,8 +4,8 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { InMemoryMockServer, IntegrationQAEngine } from '../../src/core/integration-qa.ts';
-import type { IntegrationRegistryEntry } from '../../src/types/integration-qa.ts';
+import { InMemoryMockServer, IntegrationQAEngine } from '../../src/core/integration-qa.js';
+import type { IntegrationRegistryEntry } from '../../src/types/integration-qa.js';
 
 function createTempDir(prefix: string): string {
   return mkdtempSync(path.join(os.tmpdir(), prefix));

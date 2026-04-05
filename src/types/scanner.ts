@@ -271,3 +271,23 @@ export interface IgnoreConfig {
   /** Whether negation patterns are enabled */
   allowNegation: boolean;
 }
+
+/** Scan error */
+export interface ScanError {
+  /** File or directory path */
+  path: string;
+  /** Error message */
+  message: string;
+  /** Error code */
+  code?: string;
+}
+
+/** Ignore pattern configuration */
+export interface IgnoreConfig {
+  /** Patterns from .gitignore files */
+  gitignore: string[];
+  /** Custom ignore patterns */
+  custom: string[];
+  /** Whether negation patterns are enabled */
+  allowNegation: boolean;
+}

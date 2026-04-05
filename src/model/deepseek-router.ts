@@ -285,17 +285,6 @@ export class DeepSeekReasonerRouter {
     const policyTask = this.createPolicyTaskContext(context);
     const policyDecision = this.policy.selectModel(policyTask);
 
-    if (policyDecision.selectedModel === 'deepseek' || policyDecision.selectedModel === 'gpt54') {
-      if (policyTask.requiresReasoning) {
-        return {
-          shouldEscalate: true,
-          reason: `Policy requires reasoning-capable model (${policyDecision.selectedModel})`,
-          trigger: 'policy_required',
-          severity: 'high',
-        };
-      }
-    }
-
     if (contextTokens > this.options.contextWindowTokens.reasoner * 0.85) {
       return {
         shouldEscalate: true,
@@ -639,8 +628,8 @@ export class DeepSeekReasonerRouter {
     if (strategy.estimatedEffort === 'high') score -= 0.12;
     if (strategy.risks.includes('breaking_change')) score -= 0.14;
     if (strategy.risks.includes('wide_impact')) score -= 0.08;
-    if (escalation?.severity === 'high') score += 0.06;
-    if (route?.useReasoning) score += 0.07;
+    if (escalation?.severity === 'high') score -= 0.06;
+    if (route?.useReasoning) score -= 0.04;
     if (execution?.fallbackUsed) score -= 0.18;
     if (execution?.error) score -= execution.error.retryable ? 0.06 : 0.12;
     return clamp(score, 0, 1);
@@ -891,7 +880,7 @@ export class DeepSeekReasonerRouter {
   private simulateFallbackResponse(error?: DeepSeekErrorInfo): DeepSeekTransportResponse {
     return {
       content: [
-        `ROOT_CAUSE: DeepSeek request failed${error ? ` due to ${error.type}` : ''}; using deterministic fallback analysis.`,
+        `ROOT_CAUSE: Fallback analysis activated after DeepSeek request failed${error ? ` due to ${error.type}` : ''}.`,
         'REPAIR_PLAN: Retry the smallest scoped fix path, then escalate to human or higher tier if validation still fails.',
         'RISKS: reduced confidence because model response was unavailable.',
         'CONFIDENCE: 0.42',

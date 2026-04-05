@@ -1,8 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { ModelPolicyEngine } from './policy.ts';
-import type { TaskContext } from './types/policy.ts';
+import { ModelPolicyEngine } from './policy.js';
+import type { TaskContext } from './types/policy.js';
 
 function createTask(overrides: Partial<TaskContext> = {}): TaskContext {
   return {
@@ -135,6 +135,9 @@ test('tracks cost totals and produces breakdown, dashboard, trends, and exports'
 test('enforces per-task, session, daily, weekly, and monthly budgets', () => {
   const engine = new ModelPolicyEngine({
     policy: {
+      defaultModel: 'qwen',
+      complexityThresholds: { low: 1000, medium: 10000, high: 50000 },
+      escalationChain: ['qwen', 'deepseek', 'gpt54'],
       costLimits: {
         perTask: 0.05,
         perSession: 0.06,
@@ -165,6 +168,9 @@ test('enforces per-task, session, daily, weekly, and monthly budgets', () => {
 test('downgrades model when budget pressure prevents expensive route', () => {
   const engine = new ModelPolicyEngine({
     policy: {
+      defaultModel: 'qwen',
+      complexityThresholds: { low: 1000, medium: 10000, high: 50000 },
+      escalationChain: ['qwen', 'deepseek', 'gpt54'],
       costLimits: {
         perTask: 0.02,
         perSession: 1,
@@ -192,6 +198,9 @@ test('downgrades model when budget pressure prevents expensive route', () => {
 test('allocates and refunds per-task budgets', () => {
   const engine = new ModelPolicyEngine({
     policy: {
+      defaultModel: 'qwen',
+      complexityThresholds: { low: 1000, medium: 10000, high: 50000 },
+      escalationChain: ['qwen', 'deepseek', 'gpt54'],
       costLimits: {
         perTask: 0.05,
         perSession: 1,
@@ -275,6 +284,9 @@ test('adds and removes custom rules for routing', () => {
 test('generates warning alerts when budget utilization crosses thresholds', () => {
   const engine = new ModelPolicyEngine({
     policy: {
+      defaultModel: 'qwen',
+      complexityThresholds: { low: 1000, medium: 10000, high: 50000 },
+      escalationChain: ['qwen', 'deepseek', 'gpt54'],
       costLimits: {
         perTask: 1,
         perSession: 1,

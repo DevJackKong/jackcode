@@ -6,10 +6,10 @@ import {
   type DeepSeekStreamChunk,
   type DeepSeekToolDefinition,
   type DeepSeekTransport,
-} from './deepseek-router.ts';
-import { ModelPolicyEngine } from './policy.ts';
-import type { RepairContext } from './types/reasoning.ts';
-import type { CompressedContext } from '../types/context.ts';
+} from './deepseek-router.js';
+import { ModelPolicyEngine } from './policy.js';
+import type { RepairContext } from './types/reasoning.js';
+import type { CompressedContext } from '../types/context.js';
 
 function compressedContext(content: string, tokens = Math.ceil(content.length / 4)): CompressedContext {
   return {
@@ -105,7 +105,7 @@ test('assessEscalation detects dependency and repeated-failure triggers', () => 
         {
           timestamp: Date.now(),
           state: 'executing',
-          message: 'Cannot find module ../shared/util from src/feature.ts',
+          message: 'Cannot find module ../shared/util from src/feature.js',
           recoverable: true,
           classification: 'validation',
         },
@@ -279,7 +279,7 @@ test('analyzeFailure integrates policy, routing, execution, and repair strategy'
         {
           timestamp: Date.now(),
           state: 'executing',
-          message: 'Cannot find module ./shared/index from src/feature.ts',
+          message: 'Cannot find module ./shared/index from src/feature.js',
           recoverable: true,
           classification: 'validation',
         },

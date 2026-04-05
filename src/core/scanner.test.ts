@@ -5,7 +5,7 @@ import { execFileSync } from 'child_process';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { DependencyParser, LanguageDetector, RepoScanner } from './scanner.ts';
+import { DependencyParser, LanguageDetector, RepoScanner } from './scanner.js';
 
 function makeTempRepo(name: string): string {
   const root = join(tmpdir(), `jackcode-scanner-${name}-${Date.now()}-${Math.random().toString(16).slice(2)}`);
@@ -49,9 +49,9 @@ test('RepoScanner scans repo, detects frameworks, dependencies, and import graph
       dependencies: { react: '^18.2.0', express: '^4.19.0' },
       devDependencies: { vitest: '^2.0.0' },
     }, null, 2));
-    write(root, 'src/index.ts', "import { helper } from './util';\nimport React from 'react';\nexport const value = helper();\n");
+    write(root, 'src/index.js', "import { helper } from './util';\nimport React from 'react';\nexport const value = helper();\n");
     write(root, 'src/util.ts', 'export const helper = () => 42;\n');
-    write(root, 'src/index.test.ts', 'import { value } from "./index";\nconsole.log(value);\n');
+    write(root, 'src/index.test.js', 'import { value } from "./index";\nconsole.log(value);\n');
     write(root, 'vite.config.ts', 'export default {};\n');
     write(root, 'ignored.txt', 'ignore me');
 
@@ -63,14 +63,14 @@ test('RepoScanner scans repo, detects frameworks, dependencies, and import graph
     assert.equal(result.index?.files.has('ignored.txt'), false);
     assert.equal(result.index?.files.has('src/index.ts'), true);
 
-    const indexFile = scanner.getFile('src/index.ts') as Record<string, unknown>;
+    const indexFile = scanner.getFile('src/index.ts') as unknown as Record<string, unknown>;
     assert.equal(indexFile.language, 'typescript');
     assert.deepEqual(indexFile.frameworks, ['react']);
 
-    const testFile = scanner.getFile('src/index.test.ts') as Record<string, unknown>;
+    const testFile = scanner.getFile('src/index.test.ts') as unknown as Record<string, unknown>;
     assert.equal(testFile.isTest, true);
 
-    const configFile = scanner.getFile('vite.config.ts') as Record<string, unknown>;
+    const configFile = scanner.getFile('vite.config.ts') as unknown as Record<string, unknown>;
     assert.equal(configFile.isConfig, true);
 
     const frameworks = scanner.getFrameworks();
@@ -78,7 +78,7 @@ test('RepoScanner scans repo, detects frameworks, dependencies, and import graph
     assert.ok(frameworks.includes('react'));
     assert.ok(frameworks.includes('vitest'));
 
-    const dependencies = scanner.getDependencies() as Array<Record<string, unknown>>;
+    const dependencies = scanner.getDependencies() as unknown as Array<Record<string, unknown>>;
     assert.ok(dependencies.some((dep) => dep.name === 'react'));
     assert.ok(dependencies.some((dep) => dep.name === 'vitest'));
 
@@ -96,8 +96,8 @@ test('RepoScanner scans repo, detects frameworks, dependencies, and import graph
 test('RepoScanner supports incremental scans and circular dependency detection', async () => {
   const root = makeTempRepo('incremental');
   try {
-    write(root, 'src/a.ts', "import { b } from './b';\nexport const a = b;\n");
-    write(root, 'src/b.ts', "import { a } from './a';\nexport const b = a;\n");
+    write(root, 'src/a.js', "import { b } from './b';\nexport const a = b;\n");
+    write(root, 'src/b.js', "import { a } from './a';\nexport const b = a;\n");
 
     const scanner = new RepoScanner({ rootDir: root });
     await scanner.scan();

@@ -167,6 +167,9 @@ export class ImpactAnalyzer implements IImpactAnalyzer {
       const dependentNode = this.dependencyGraph.get(normalizedDependentPath);
       const isTestFile = this.isTestFile(normalizedDependentPath);
       const usedSymbols = this.findUsedSymbols(node, dependentNode);
+      if (!this.options.includeTypeDependencies && dependentNode && usedSymbols.length === 0) {
+        continue;
+      }
       const circularDependency = visited.has(normalizedDependentPath);
       const category = this.classifyCategory(dependentNode, isTestFile, usedSymbols);
 
@@ -872,8 +875,11 @@ export class ImpactAnalyzer implements IImpactAnalyzer {
       );
       const nameMatches = candidateBase.includes(sourceFileName);
       const coversRipple = node.imports.some((imp) => symbolRippleMap.has(this.resolveImportPath(imp.source, node.path)));
+      const referencesDependent = Array.from(symbolRippleMap.keys()).some((ripplePath) =>
+        node.imports.some((imp) => this.resolveImportPath(imp.source, node.path) === ripplePath)
+      );
 
-      if (nameMatches || directlyImportsSource || coversRipple) {
+      if (nameMatches || directlyImportsSource || coversRipple || referencesDependent) {
         tests.add(normalizedCandidate);
       }
     }

@@ -12,7 +12,7 @@ import {
   SafetyGuardian,
   TimeoutRecoveryError,
   type RollbackPlan,
-} from './recovery.ts';
+} from './recovery.js';
 
 test('RetryManager retries transient failures with eventual success', async () => {
   let attempts = 0;

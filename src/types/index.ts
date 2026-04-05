@@ -5,7 +5,7 @@
 export * from './cli.js';
 export * from './context.js';
 export * from './impact-analyzer.js';
-export * from './integration-qa.js';
+export type { E2EFlowTest } from './integration-qa.js';
 export * from './memory-adapter.js';
 export * from './patch.js';
 export * from './repairer.js';

@@ -4,3 +4,4 @@
  */
 
 export { ImpactAnalyzer, createImpactAnalyzer } from './impact-analyzer.js';
+export { SymbolIndex, buildSymbolIndex } from './symbol-index.js';

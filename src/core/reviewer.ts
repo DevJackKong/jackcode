@@ -3,4 +3,4 @@ export {
   gpt54Verifier,
   createGPT54Verifier,
   type GPT54ModelClient,
-} from './repairer.ts';
+} from './repairer.js';

@@ -1,10 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { GPT54VerifierRepairer } from './repairer.ts';
-import { RetryManager, RecoveryEngine } from './recovery.ts';
-import type { ReviewContext } from '../types/reviewer.ts';
-import type { Patch } from '../types/patch.ts';
+import { GPT54VerifierRepairer } from './repairer.js';
+import { RetryManager, RecoveryEngine } from './recovery.js';
+import type { ReviewContext } from '../types/reviewer.js';
+import type { Patch } from '../types/patch.js';
 
 function patch(targetPath: string): Patch {
   return {

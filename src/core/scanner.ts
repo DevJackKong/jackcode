@@ -831,7 +831,7 @@ export class RepoScanner {
         if (cached.dependencies) runtime.dependencies.push(...cached.dependencies);
         if (cached.dependencies && cached.dependencies.length > 0) runtime.dependencyManifests.push(relativePath);
         if (cached.imports) runtime.importGraph.set(relativePath, cached.imports);
-        for (const framework of ((cached.entry as Record<string, unknown>).frameworks as string[] | undefined) || []) {
+        for (const framework of ((cached.entry as unknown as Record<string, unknown>).frameworks as string[] | undefined) || []) {
           runtime.frameworks.add(framework);
         }
         runtime.benchmark.cacheHits++;
@@ -854,8 +854,9 @@ export class RepoScanner {
       const imports = isText ? extractImports(language, content) : [];
       const gitStatus = await this.getFileGitStatus(relativePath);
 
+      const canonicalRelativePath = relativePath.replace(/\.(?:js|jsx)$/, '.ts');
       const fileEntry = {
-        path: relativePath,
+        path: canonicalRelativePath,
         absolutePath,
         name: basename(relativePath),
         extension: extname(relativePath).toLowerCase().slice(1),
@@ -874,10 +875,10 @@ export class RepoScanner {
         imports,
       } as FileEntry & Record<string, unknown>;
 
-      runtime.files.set(relativePath, fileEntry as FileEntry);
+      runtime.files.set(canonicalRelativePath, fileEntry as FileEntry);
       this.mergeLanguageStats(runtime.languages, fileEntry as FileEntry);
       for (const framework of frameworks) runtime.frameworks.add(framework);
-      runtime.importGraph.set(relativePath, imports);
+      runtime.importGraph.set(canonicalRelativePath, imports);
 
       const deps = await this.extractManifestDependencies(relativePath, absolutePath, content, language);
       if (deps.length > 0) {
@@ -885,14 +886,14 @@ export class RepoScanner {
         runtime.dependencyManifests.push(relativePath);
       }
 
-      const previous = this.index?.files.get(relativePath);
+      const previous = this.index?.files.get(canonicalRelativePath) ?? this.index?.files.get(relativePath);
       if (!previous) {
         runtime.changedFiles.push({ path: relativePath, type: 'added', currentHash: contentHash });
       } else if (previous.contentHash !== contentHash) {
         runtime.changedFiles.push({ path: relativePath, type: 'modified', previousHash: previous.contentHash, currentHash: contentHash });
       }
 
-      this.fileCache.set(relativePath, {
+      this.fileCache.set(canonicalRelativePath, {
         statKey,
         entry: fileEntry as FileEntry,
         content: isText ? content : undefined,
@@ -1112,7 +1113,11 @@ export class RepoScanner {
   }
 
   getFile(pathValue: string): FileEntry | undefined {
-    return this.index?.files.get(toPosixPath(pathValue));
+    if (!this.index) return undefined;
+    const normalized = toPosixPath(pathValue);
+    return this.index.files.get(normalized)
+      ?? this.index.files.get(normalized.replace(/\.(?:js|jsx)$/, '.ts'))
+      ?? this.index.files.get(normalized.replace(/\.(?:ts|tsx)$/, '.js'));
   }
 
   getFilesByLanguage(language: string): FileEntry[] {
@@ -1319,6 +1324,45 @@ export class RepoScanner {
 
   getBenchmark(): RepoBenchmark | null {
     return this.lastBenchmark ? { ...this.lastBenchmark } : null;
+  }
+
+  async getGitStatus(): Promise<{ branch: string; modified: string[]; staged: string[]; untracked: string[]; conflicts: string[]; hasChanges: boolean }> {
+    const gitInfo = await this.getGitInfo();
+    return {
+      branch: gitInfo?.currentBranch ?? '',
+      modified: [...(gitInfo?.modifiedFiles ?? [])],
+      staged: [...(gitInfo?.stagedFiles ?? [])],
+      untracked: [...(gitInfo?.untrackedFiles ?? [])],
+      conflicts: [...(gitInfo?.conflictFiles ?? [])],
+      hasChanges: Boolean(gitInfo && ((gitInfo.modifiedFiles?.length ?? 0) + (gitInfo.stagedFiles?.length ?? 0) + (gitInfo.untrackedFiles?.length ?? 0) + (gitInfo.conflictFiles?.length ?? 0) > 0)),
+    };
+  }
+
+  async stashChanges(message = 'jackcode temporary stash'): Promise<boolean> {
+    const before = await this.getGitStatus();
+    if (!before.hasChanges) return true;
+    const output = await this.runGit(['stash', 'push', '-u', '-m', message]);
+    return output !== null;
+  }
+
+  async restoreStash(): Promise<boolean> {
+    const list = await this.runGit(['stash', 'list']);
+    if (list == null || !list.trim()) return false;
+    const output = await this.runGit(['stash', 'pop']);
+    return output !== null;
+  }
+
+  getTestFiles(pathValue: string): string[] {
+    if (!this.index) return [];
+    const normalized = toPosixPath(pathValue).replace(/\.(?:js|jsx)$/, '.ts');
+    const base = normalized.replace(/\.[^.]+$/, '');
+    const candidates = new Set<string>([
+      `${base}.test.ts`,
+      `${base}.spec.ts`,
+      `${base}.test.js`,
+      `${base}.spec.js`,
+    ]);
+    return Array.from(candidates).filter((candidate) => this.getFile(candidate)).sort();
   }
 }
 

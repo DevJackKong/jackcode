@@ -8,21 +8,22 @@ import { EventEmitter } from 'node:events';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 
-import type { Session, SessionManager } from './session.js';
+import type { Session } from '../types/session.js';
+import type { SessionManager } from './session.js';
 import type { RecoveryEngine } from './repairer.js';
-import { RepoScanner } from './scanner.ts';
+import { RepoScanner } from './scanner.js';
 import type { FileChange, FileIndex, ScanResult, ScannerConfig } from '../types/scanner.js';
 import type { QwenRouteRequest, QwenRouteResult, RoutePriority } from '../model/types.js';
 import type { HandoffPayload } from '../types/session.js';
 import type { ChangeRequest, Patch, PatchPlan, PatchResult, RollbackResult } from '../types/patch.js';
-import type { LoopRunResult, RunResult as BuildRunResult } from '../tools/test-runner.ts';
+import type { LoopRunResult, RunResult as BuildRunResult } from '../tools/test-runner.js';
 import {
   applyPatch as defaultApplyPatch,
   buildPatchFromRequest as defaultBuildPatchFromRequest,
   rollbackPatch as defaultRollbackPatch,
   validatePatch as defaultValidatePatch,
-} from '../tools/patch.ts';
-import { BuildTestLoopOrchestrator } from '../tools/test-runner.ts';
+} from '../tools/patch.js';
+import { BuildTestLoopOrchestrator } from '../tools/test-runner.js';
 import type {
   ClassifiedFailure,
   RecoveryResult,

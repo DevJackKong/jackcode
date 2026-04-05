@@ -219,7 +219,8 @@ export class JackClawCollaborationAdapter {
     }
 
     if (TERMINAL_STATUSES.has(current.status)) {
-      return this.completedResults.get(handle.id) ?? this.buildResult(current, current.taskId, current.status);
+      return this.completedResults.get(handle.id)
+        ?? this.buildResult(current, current.taskId, current.status as 'success' | 'failure' | 'timeout' | 'cancelled');
     }
 
     return new Promise((resolve, reject) => {
@@ -1128,7 +1129,7 @@ export class JackClawCollaborationAdapter {
   private toNodeHealth(node: NodeRuntimeState): CollaborationNodeHealth {
     return {
       nodeId: node.assignment.nodeId,
-      status: node.assignment.status,
+      status: node.assignment.status ?? 'offline',
       loadScore: node.assignment.loadScore ?? 0,
       capacity: node.assignment.capacity,
       activeTasks: node.activeTaskIds.size,

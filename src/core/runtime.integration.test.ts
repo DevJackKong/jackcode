@@ -4,11 +4,11 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 
-import { RuntimeStateMachine, type ExecutionPlan, type TaskContext } from './runtime.ts';
-import { SessionManager } from './session.ts';
-import type { Patch, PatchPlan, PatchResult, RollbackResult } from '../types/patch.ts';
-import type { FileChange, FileIndex, ScanResult } from '../types/scanner.ts';
-import type { LoopRunResult } from '../tools/test-runner.ts';
+import { RuntimeStateMachine, type ExecutionPlan, type TaskContext } from './runtime.js';
+import { SessionManager } from './session.js';
+import type { Patch, PatchPlan, PatchResult, RollbackResult } from '../types/patch.js';
+import type { FileChange, FileIndex, ScanResult } from '../types/scanner.js';
+import type { LoopRunResult } from '../tools/test-runner.js';
 
 const TMP_DIR = mkdtempSync(path.join(os.tmpdir(), 'jackcode-runtime-integration-'));
 
@@ -178,7 +178,7 @@ test('integrates session, patch, build/test, and repo scanner across full lifecy
 
   const result = await runtime.runTask(task.id);
   const session = runtime.getSession(task.id);
-  const runtimeSessionTask = session?.tasks.find((entry) => entry.metadata.runtimeTaskId === task.id);
+  const runtimeSessionTask = session?.tasks.find((entry: { metadata: Record<string, unknown> }) => entry.metadata.runtimeTaskId === task.id);
 
   assert.equal(result.state, 'completed');
   assert.equal(result.status, 'completed');
@@ -297,7 +297,7 @@ test('rolls back and blocks task when build/test fails after patch application',
   assert.equal(result.state, 'error');
   assert.ok(rollbackCalls >= 1);
   const session = runtime.getSession(task.id);
-  const runtimeSessionTask = session?.tasks.find((entry) => entry.metadata.runtimeTaskId === task.id);
+  const runtimeSessionTask = session?.tasks.find((entry: { metadata: Record<string, unknown> }) => entry.metadata.runtimeTaskId === task.id);
   assert.equal(runtimeSessionTask?.status, 'blocked');
 });
 

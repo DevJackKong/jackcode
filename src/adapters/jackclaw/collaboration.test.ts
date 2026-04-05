@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import {
   JackClawCollaborationAdapter,
   type SubagentTask,
-} from './collaboration.ts';
+} from './collaboration.js';
 
 function createTask(taskId: string, priority = 0.5, overrides: Partial<SubagentTask> = {}): SubagentTask {
   return {

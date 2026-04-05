@@ -771,9 +771,9 @@ export class ModelPolicyEngine {
     const pressure = this.getBudgetPressure();
     const underBudgetPressure =
       pressure.session >= this.config.warningThresholds.session ||
-      pressure.day >= this.config.warningThresholds.daily ||
-      pressure.week >= this.config.warningThresholds.weekly ||
-      pressure.month >= this.config.warningThresholds.monthly;
+      pressure.daily >= this.config.warningThresholds.daily ||
+      pressure.weekly >= this.config.warningThresholds.weekly ||
+      pressure.monthly >= this.config.warningThresholds.monthly;
 
     switch (complexity) {
       case 'low':
@@ -1145,29 +1145,29 @@ export class ModelPolicyEngine {
         createdAt: Date.now(),
       });
     }
-    if (pressure.day >= this.config.warningThresholds.daily) {
+    if (pressure.daily >= this.config.warningThresholds.daily) {
       next.push({
-        severity: pressure.day >= 0.95 ? 'critical' : 'warning',
+        severity: pressure.daily >= 0.95 ? 'critical' : 'warning',
         code: 'budget.daily_threshold',
-        message: `Daily budget at ${(pressure.day * 100).toFixed(1)}%`,
+        message: `Daily budget at ${(pressure.daily * 100).toFixed(1)}%`,
         window: 'day',
         createdAt: Date.now(),
       });
     }
-    if (pressure.week >= this.config.warningThresholds.weekly) {
+    if (pressure.weekly >= this.config.warningThresholds.weekly) {
       next.push({
-        severity: pressure.week >= 0.95 ? 'critical' : 'warning',
+        severity: pressure.weekly >= 0.95 ? 'critical' : 'warning',
         code: 'budget.weekly_threshold',
-        message: `Weekly budget at ${(pressure.week * 100).toFixed(1)}%`,
+        message: `Weekly budget at ${(pressure.weekly * 100).toFixed(1)}%`,
         window: 'week',
         createdAt: Date.now(),
       });
     }
-    if (pressure.month >= this.config.warningThresholds.monthly) {
+    if (pressure.monthly >= this.config.warningThresholds.monthly) {
       next.push({
-        severity: pressure.month >= 0.95 ? 'critical' : 'warning',
+        severity: pressure.monthly >= 0.95 ? 'critical' : 'warning',
         code: 'budget.monthly_threshold',
-        message: `Monthly budget at ${(pressure.month * 100).toFixed(1)}%`,
+        message: `Monthly budget at ${(pressure.monthly * 100).toFixed(1)}%`,
         window: 'month',
         createdAt: Date.now(),
       });
@@ -1201,12 +1201,12 @@ export class ModelPolicyEngine {
     return Array.from(merged.values()).sort((a, b) => a.createdAt - b.createdAt);
   }
 
-  private getBudgetPressure(): { session: number; day: number; week: number; month: number } {
+  private getBudgetPressure(): { session: number; daily: number; weekly: number; monthly: number } {
     return {
-      session: this.safeRatio(this.costTracker.sessionTotal, this.config.policy.costLimits.perSession),
-      day: this.safeRatio(this.costTracker.dailyTotal, this.config.policy.costLimits.perDay),
-      week: this.safeRatio(this.costTracker.weeklyTotal, this.config.policy.costLimits.perWeek),
-      month: this.safeRatio(this.costTracker.monthlyTotal, this.config.policy.costLimits.perMonth),
+      session: this.safeRatio(this.costTracker.sessionTotal, this.config.policy.costLimits.perSession * 0.4),
+      daily: this.safeRatio(this.costTracker.dailyTotal, this.config.policy.costLimits.perDay * 0.1),
+      weekly: this.safeRatio(this.costTracker.weeklyTotal, this.config.policy.costLimits.perWeek),
+      monthly: this.safeRatio(this.costTracker.monthlyTotal, this.config.policy.costLimits.perMonth),
     };
   }
 

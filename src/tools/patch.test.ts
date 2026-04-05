@@ -14,7 +14,7 @@ import {
   summarizeDiff,
   validatePatch,
   cleanupSnapshots,
-} from './patch.ts';
+} from './patch.js';
 
 function makeTempDir(): string {
   return mkdtempSync(join(tmpdir(), 'jackcode-patch-'));

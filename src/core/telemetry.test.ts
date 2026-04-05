@@ -12,7 +12,7 @@ import {
   TraceVisualizer,
   Tracer,
   type LogRecord,
-} from './telemetry.ts';
+} from './telemetry.js';
 
 function createClock(start = 1000) {
   let current = start;

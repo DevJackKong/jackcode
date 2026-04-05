@@ -33,6 +33,8 @@ export interface PatchPlan {
   patches: Patch[];
   /** Estimated impact summary */
   impact: ImpactSummary;
+  /** Optional dependency graph between patch ids */
+  dependencies?: Record<string, string[]>;
 }
 
 /** Individual patch unit */
@@ -166,12 +168,87 @@ export interface PatchEngineConfig {
 
 /** Patch history entry */
 export interface PatchHistoryEntry {
-  /** Patch/plan ID */
   id: string;
   /** Timestamp */
   timestamp: number;
   /** Action type */
-  action: 'planned' | 'applied' | 'rolled_back';
+  action: 'planned' | 'applied' | 'rolled_back' | 'failed' | 'verified';
   /** Related session ID */
   sessionId?: string;
+}
+
+export interface PatchContextFragment {
+  id: string;
+  type: 'code' | 'system';
+  content: string;
+  source?: string;
+  timestamp: number;
+  metadata: {
+    accessCount: number;
+    lastAccess: number;
+    priority: number;
+    tags: string[];
+  };
+}
+
+export interface PatchVerificationResult {
+  success: boolean;
+  stage: 'build' | 'test' | 'build-test';
+  output: string;
+  errors: string[];
+}
+
+export interface PatchLifecycleEvent {
+  type:
+    | 'patch:started'
+    | 'patch:applied'
+    | 'patch:failed'
+    | 'patch:verified'
+    | 'patch:rolled-back'
+    | 'patch:cancelled';
+  patchId?: string;
+  planId?: string;
+  timestamp: number;
+  detail?: Record<string, unknown>;
+}
+
+export interface PatchRuntimeAdapter {
+  emit?(event: string, payload: Record<string, unknown>): void;
+  isCancellationRequested?(): boolean;
+}
+
+export interface PatchSessionAdapter {
+  addContextFragment?(sessionId: string, fragment: PatchContextFragment, taskId?: string): boolean;
+  getSession?(sessionId: string): { currentTask?: { id: string | null } | null } | undefined;
+}
+
+export interface PatchScannerAdapter {
+  getIndex?(): { files: Map<string, { path: string; absolutePath: string }> } | null;
+  searchFiles?(pattern: string): Array<{ path: string; absolutePath: string }>;
+  scanIncremental?(changes: Array<{ path: string; type: 'added' | 'modified' | 'deleted' }>): Promise<unknown>;
+  refresh?(): Promise<unknown>;
+}
+
+export interface PatchSymbolIndexAdapter {
+  updateFile?(filePath: string): Promise<void>;
+  removeFile?(filePath: string): void;
+}
+
+export interface PatchBuildAdapter {
+  build?(): Promise<{ success: boolean; output: string; errors: string[] }>;
+  test?(): Promise<{ success: boolean; output: string; errors: string[] }>;
+  run?(options?: Record<string, unknown>): Promise<{ success: boolean; output: string; errors: string[] }>;
+}
+
+export interface PatchApplyOptions {
+  sessionId?: string;
+  runtime?: PatchRuntimeAdapter;
+  session?: PatchSessionAdapter;
+  scanner?: PatchScannerAdapter;
+  symbolIndex?: PatchSymbolIndexAdapter;
+  build?: PatchBuildAdapter;
+  autoVerify?: boolean;
+  taskId?: string;
+  onPatchApplied?(patch: Patch): void | Promise<void>;
+  onPatchFailed?(failed: FailedPatch): void | Promise<void>;
 }

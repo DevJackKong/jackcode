@@ -8,11 +8,11 @@ import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
-import { ContextCompressor, estimateTokens } from '../repo/context-compressor.ts';
-import type { ContextFragment } from '../types/context.ts';
-import type { Patch } from '../types/patch.ts';
-import type { FileIndex } from '../types/scanner.ts';
-import type { RunResult } from '../types/test-runner.ts';
+import { ContextCompressor, estimateTokens } from '../repo/context-compressor.js';
+import type { ContextFragment } from '../types/context.js';
+import type { Patch } from '../types/patch.js';
+import type { FileIndex } from '../types/scanner.js';
+import type { RunResult } from '../types/test-runner.js';
 import type {
   Checkpoint,
   CheckpointCreateOptions,
@@ -39,8 +39,8 @@ import type {
   TaskContext,
   TaskCreateOptions,
   TaskStatus,
-} from '../types/session.ts';
-import type { JackClawMemoryAdapter, MemoryEntryType, SyncResult } from '../types/memory-adapter.ts';
+} from '../types/session.js';
+import type { JackClawMemoryAdapter, MemoryEntryType, SyncResult } from '../types/memory-adapter.js';
 
 type EventHandler<T> = (payload: T) => void;
 
@@ -247,7 +247,7 @@ export interface SessionManagerOptions {
 
 export class SessionManager {
   private sessions = new Map<string, Session>();
-  private events = new EventEmitter<SessionEvents>();
+  private events = new EventEmitter();
   private persistence: Required<SessionPersistenceConfig>;
   private memoryAdapter?: JackClawMemoryAdapter;
   private compressor = new ContextCompressor();
@@ -261,7 +261,7 @@ export class SessionManager {
   }
 
   on<K extends keyof SessionEvents>(event: K, handler: (payload: SessionEvents[K]) => void): void {
-    this.events.on(event, handler);
+    this.events.on(event, handler as (...args: unknown[]) => void);
   }
 
   createSession(options: SessionCreateOptions): Session {
@@ -397,7 +397,7 @@ export class SessionManager {
     if (session.repoSnapshot) {
       const cloned = this.cloneFileIndex(session.repoSnapshot.snapshot);
       cloned.generatedAt = Date.now();
-      const existing = cloned.files.get(normalizedFile) as Record<string, unknown> | undefined;
+      const existing = cloned.files.get(normalizedFile);
       if (existing) {
         cloned.files.set(normalizedFile, {
           ...existing,
@@ -608,6 +608,7 @@ export class SessionManager {
 
     this.events.emit('task-fail', { sessionId, task: this.cloneTask(task), error });
     if (error) {
+      task.notes ??= [];
       task.notes.push(`FAILURE: ${error}`);
       this.touchSession(session, 'task-failed');
     }
@@ -649,6 +650,7 @@ export class SessionManager {
     const task = session.tasks.find((candidate) => candidate.id === taskId);
     if (!task) return false;
 
+    task.notes ??= [];
     task.notes.push(note.trim());
     task.updatedAt = new Date();
     this.touchSession(session, 'task-note-added');
@@ -666,6 +668,7 @@ export class SessionManager {
 
     const targetTask = taskId ? session.tasks.find((candidate) => candidate.id === taskId) : session.currentTask;
     if (targetTask) {
+      targetTask.contextFragments ??= [];
       targetTask.contextFragments.push(normalizedFragment);
       targetTask.updatedAt = new Date();
       this.events.emit('task-update', { sessionId, task: this.cloneTask(targetTask) });
@@ -697,6 +700,37 @@ export class SessionManager {
     return session ? this.cloneContextWindow(session.contextWindow) : null;
   }
 
+  getScannerSnapshot(sessionId: string): FileIndex | null {
+    const session = this.sessions.get(sessionId);
+    return session?.repoSnapshot ? this.cloneFileIndex(session.repoSnapshot.snapshot) : null;
+  }
+
+  setScannerSnapshot(sessionId: string, snapshot: FileIndex): boolean {
+    return this.setRepoSnapshot(sessionId, snapshot);
+  }
+
+  recordFileChanges(sessionId: string, changes: Array<{ path: string; type: string }>): boolean {
+    const session = this.sessions.get(sessionId);
+    if (!session) return false;
+    const existing = Array.isArray(session.metadata.changedFiles) ? session.metadata.changedFiles as Array<{ path: string; type: string }> : [];
+    const merged = new Map<string, { path: string; type: string }>();
+    for (const change of existing) merged.set(`${change.path}:${change.type}`, { ...change });
+    for (const change of changes) {
+      if (!change?.path || !change?.type) continue;
+      merged.set(`${change.path}:${change.type}`, { path: change.path, type: change.type });
+    }
+    session.metadata.changedFiles = Array.from(merged.values());
+    this.touchSession(session, 'changed-files-recorded');
+    return true;
+  }
+
+  getChangedFiles(sessionId: string): Array<{ path: string; type: string }> {
+    const session = this.sessions.get(sessionId);
+    if (!session) return [];
+    const changes = Array.isArray(session.metadata.changedFiles) ? session.metadata.changedFiles as Array<{ path: string; type: string }> : [];
+    return changes.map((change) => ({ ...change }));
+  }
+
   shouldCompressContext(sessionId: string): boolean {
     const session = this.sessions.get(sessionId);
     if (!session) return false;
@@ -720,7 +754,7 @@ export class SessionManager {
     session.contextWindow.lastCompressedAt = new Date(compressed.compressedAt);
 
     const result: ContextCompressionResult = {
-      triggered: beforeTokens > compressed.stats.finalTokens,
+      triggered: beforeTokens > compressed.stats.finalTokens || beforeTokens > (targetBudget ?? Math.floor(session.contextWindow.maxTokens * session.contextWindow.warningThreshold)),
       beforeTokens,
       afterTokens: compressed.stats.finalTokens,
       compressedContext: compressed,
@@ -1002,7 +1036,7 @@ export class SessionManager {
 
     if (types.includes('learning')) {
       for (const task of session.tasks) {
-        for (const note of task.notes) {
+        for (const note of task.notes ?? []) {
           fragments.push({
             id: randomUUID(),
             type: 'doc',
@@ -1045,7 +1079,7 @@ export class SessionManager {
         fragments.push({
           id: randomUUID(),
           type: 'error',
-          content: task.notes.at(-1) ?? `Task failed: ${task.goal}`,
+          content: task.notes?.at(-1) ?? `Task failed: ${task.goal}`,
           source: `task:${task.id}`,
           timestamp: now,
           metadata: { accessCount: 0, lastAccess: now, priority: 1, tags: [...sharedTags, 'error'] },
@@ -1059,7 +1093,7 @@ export class SessionManager {
   private extractDecisions(session: Session): Array<{ timestamp: Date; decision: string; reason: string }> {
     const decisions: Array<{ timestamp: Date; decision: string; reason: string }> = [];
     for (const task of session.tasks) {
-      for (const note of task.notes) {
+      for (const note of task.notes ?? []) {
         if (note.toLowerCase().startsWith('decision:')) {
           const content = note.slice('decision:'.length).trim();
           const [decision, ...reasonParts] = content.split('|');
@@ -1256,8 +1290,8 @@ export class SessionManager {
       updatedAt: task.updatedAt.toISOString(),
       completedAt: task.completedAt?.toISOString() ?? null,
       metadata: structuredClone(task.metadata),
-      notes: [...task.notes],
-      contextFragments: task.contextFragments.map((fragment) => this.serializeFragment(fragment)),
+      notes: [...(task.notes ?? [])],
+      contextFragments: (task.contextFragments ?? []).map((fragment) => this.serializeFragment(fragment)),
     };
   }
 

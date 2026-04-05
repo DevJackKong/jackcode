@@ -24,6 +24,11 @@ import type {
   PatchHistoryEntry,
   LineRange,
   ReversePatch,
+  PatchApplyOptions,
+  PatchBuildAdapter,
+  PatchVerificationResult,
+  PatchLifecycleEvent,
+  PatchContextFragment,
 } from '../types/patch.js';
 
 type RiskLevel = 'low' | 'medium' | 'high' | 'critical';
@@ -34,6 +39,7 @@ interface FileState {
   exists: boolean;
   content: string;
   lines: string[];
+  isBinary?: boolean;
   mode?: number;
 }
 
@@ -81,6 +87,8 @@ const MAX_FUZZ_OFFSET = 8;
 const LARGE_FILE_LINE_THRESHOLD = 5000;
 const patchHistory: PatchHistoryEntry[] = [];
 const activeSnapshots = new Map<string, ReversePatch>();
+const patchContexts = new Map<string, PatchContextFragment[]>();
+const patchDependencyGraph = new Map<string, string[]>();
 
 function generateId(prefix: string): string {
   return `${prefix}_${Date.now()}_${randomUUID().slice(0, 8)}`;
@@ -92,6 +100,78 @@ function computeChecksum(content: string): string {
 
 function normalizePath(input: string): string {
   return isAbsolute(input) ? input : resolve(input);
+}
+
+function emitLifecycleEvent(events: PatchLifecycleEvent[], type: PatchLifecycleEvent['type'], detail?: Record<string, unknown>, ids?: { patchId?: string; planId?: string }): void {
+  events.push({ type, detail, timestamp: Date.now(), patchId: ids?.patchId, planId: ids?.planId });
+}
+
+function makeContextFragment(patch: Patch): PatchContextFragment {
+  return {
+    id: `patch-context-${patch.id}`,
+    type: 'code',
+    content: generateUnifiedDiff(patch),
+    source: patch.targetPath,
+    timestamp: Date.now(),
+    metadata: {
+      accessCount: 0,
+      lastAccess: Date.now(),
+      priority: 5,
+      tags: ['patch', 'diff'],
+    },
+  };
+}
+
+async function verifyWithBuildAdapters(
+  patches: Patch[],
+  options: { build?: PatchBuildAdapter; autoVerify?: boolean }
+): Promise<PatchVerificationResult | null> {
+  if (options.autoVerify === false || !options.build) return null;
+
+  const outputs: string[] = [];
+  const errors: string[] = [];
+
+  if (typeof options.build.run === 'function') {
+    const result = await options.build.run({ patches: patches.map((patch) => patch.id) });
+    if (result.output) outputs.push(result.output);
+    if (result.errors?.length) errors.push(...result.errors);
+    return {
+      success: result.success,
+      stage: 'build-test',
+      output: outputs.join('\n'),
+      errors,
+    };
+  }
+
+  let stage: PatchVerificationResult['stage'] = 'build-test';
+  let success = true;
+
+  if (typeof options.build.build === 'function') {
+    const buildResult = await options.build.build();
+    if (buildResult.output) outputs.push(buildResult.output);
+    if (buildResult.errors?.length) errors.push(...buildResult.errors);
+    if (!buildResult.success) {
+      success = false;
+      stage = 'build';
+    }
+  }
+
+  if (success && typeof options.build.test === 'function') {
+    const testResult = await options.build.test();
+    if (testResult.output) outputs.push(testResult.output);
+    if (testResult.errors?.length) errors.push(...testResult.errors);
+    if (!testResult.success) {
+      success = false;
+      stage = typeof options.build.build === 'function' ? 'build-test' : 'test';
+    }
+  }
+
+  return {
+    success,
+    stage,
+    output: outputs.join('\n'),
+    errors,
+  };
 }
 
 function splitLines(content: string): string[] {
@@ -660,19 +740,41 @@ export function planPatches(
 
 export async function applyPatch(
   plan: PatchPlan,
-  sessionId?: string,
-): Promise<PatchResult> {
+  sessionOrOptions?: string | PatchApplyOptions,
+  maybeScanner?: { scanIncremental?(changes: Array<{ path: string; type: 'added' | 'modified' | 'deleted' }>): Promise<unknown> }
+): Promise<PatchResult & { verification?: PatchVerificationResult; events?: PatchLifecycleEvent[] }> {
   const applied: Patch[] = [];
   const failed: FailedPatch[] = [];
   const rollbackQueue: Patch[] = [];
+  const events: PatchLifecycleEvent[] = [];
+
+  const options: PatchApplyOptions = typeof sessionOrOptions === 'string'
+    ? { sessionId: sessionOrOptions, scanner: maybeScanner }
+    : (sessionOrOptions ?? {});
 
   const sortedPatches = [...plan.patches].sort((a, b) => a.targetPath.localeCompare(b.targetPath));
+  emitLifecycleEvent(events, 'patch:started', { patchCount: sortedPatches.length }, { planId: plan.id });
+  options.runtime?.emit?.('patch:started', { planId: plan.id, patchCount: sortedPatches.length });
+
+  if (options.runtime?.isCancellationRequested?.()) {
+    emitLifecycleEvent(events, 'patch:cancelled', { reason: 'runtime cancellation requested' }, { planId: plan.id });
+    return {
+      success: false,
+      applied: [],
+      canRollback: false,
+      events,
+    };
+  }
 
   for (const patch of sortedPatches) {
     const targetPath = normalizePath(patch.targetPath);
     let lockPath: string | undefined;
 
     try {
+      if (options.runtime?.isCancellationRequested?.()) {
+        throw Object.assign(new Error('Patch application cancelled'), { failureType: 'io_error' satisfies FailureType, cancelled: true });
+      }
+
       const before = await readFileState(targetPath);
       if (before.isBinary || toMetadata(patch).binary) {
         throw new Error('Binary file patching is not supported');
@@ -700,7 +802,10 @@ export async function applyPatch(
       const nextContent = joinLines(currentLines);
       const verification = await verifyPatchedFile(targetPath, nextContent, DEFAULT_CONFIG);
       if (!verification.valid) {
-        throw Object.assign(new Error(`Verification failed: ${verification.errors.join('; ')}`), { failureType: 'conflict' satisfies FailureType });
+        throw Object.assign(
+          new Error(`Verification failed: ${verification.errors.join('; ')}`),
+          { failureType: (hadChecksumMismatch ? 'checksum_mismatch' : 'conflict') satisfies FailureType }
+        );
       }
 
       const backupPath = before.exists ? await createBackup(targetPath, before.content) : undefined;
@@ -722,6 +827,9 @@ export async function applyPatch(
       activeSnapshots.set(patch.id, patch.reversePatch);
       applied.push(patch);
       rollbackQueue.push(patch);
+      patchDependencyGraph.set(patch.id, [...(plan.dependencies?.[patch.id] ?? [])]);
+      const fragment = makeContextFragment(patch);
+      patchContexts.set(patch.id, [fragment]);
 
       const metadata = toMetadata(patch);
       setMetadata(patch, {
@@ -734,19 +842,43 @@ export async function applyPatch(
         id: patch.id,
         timestamp: Date.now(),
         action: 'applied',
-        sessionId,
+        sessionId: options.sessionId,
       });
+
+      emitLifecycleEvent(events, 'patch:applied', { targetPath }, { planId: plan.id, patchId: patch.id });
+      options.runtime?.emit?.('patch:applied', { planId: plan.id, patchId: patch.id, targetPath });
+      options.session?.addContextFragment?.(options.sessionId ?? '', fragment, options.taskId);
+      await options.scanner?.scanIncremental?.([{ path: targetPath, type: 'modified' }]);
+      await options.symbolIndex?.updateFile?.(targetPath);
+      await options.onPatchApplied?.(patch);
 
       void backupPath;
     } catch (error) {
+      if ((error as { cancelled?: boolean }).cancelled) {
+        emitLifecycleEvent(events, 'patch:cancelled', { patchId: patch.id }, { planId: plan.id, patchId: patch.id });
+        return {
+          success: false,
+          applied: [],
+          canRollback: false,
+          events,
+        };
+      }
+
       const failureType = ((error as { failureType?: FailureType }).failureType ?? classifyFailure(error));
-      failed.push({
+      const failedPatch = {
         patch,
         error: error instanceof Error ? error.message : String(error),
         failureType,
-      });
+      };
+      failed.push(failedPatch);
+      emitLifecycleEvent(events, 'patch:failed', { error: failedPatch.error }, { planId: plan.id, patchId: patch.id });
+      options.runtime?.emit?.('patch:failed', { planId: plan.id, patchId: patch.id, error: failedPatch.error });
+      await options.onPatchFailed?.(failedPatch);
 
       await rollbackAppliedPatches(rollbackQueue);
+      if (rollbackQueue.length > 0) {
+        emitLifecycleEvent(events, 'patch:rolled-back', { rolledBack: rollbackQueue.map((item) => item.id) }, { planId: plan.id });
+      }
       break;
     } finally {
       if (lockPath) {
@@ -755,11 +887,36 @@ export async function applyPatch(
     }
   }
 
+  const verification = await verifyWithBuildAdapters(applied, options);
+  if (verification) {
+    if (!verification.success) {
+      await rollbackAppliedPatches(rollbackQueue);
+      if (rollbackQueue.length > 0) {
+        emitLifecycleEvent(events, 'patch:rolled-back', { rolledBack: rollbackQueue.map((item) => item.id), verificationFailed: true }, { planId: plan.id });
+      }
+      options.runtime?.emit?.('patch:verified', { planId: plan.id, success: false, stage: verification.stage });
+      return {
+        success: false,
+        applied: [],
+        failed: failed.length > 0 ? failed : undefined,
+        canRollback: false,
+        verification,
+        events,
+      };
+    }
+
+    emitLifecycleEvent(events, 'patch:verified', { success: true, stage: verification.stage }, { planId: plan.id });
+    options.runtime?.emit?.('patch:verified', { planId: plan.id, success: true, stage: verification.stage });
+    patchHistory.push({ id: plan.id, timestamp: Date.now(), action: 'verified', sessionId: options.sessionId });
+  }
+
   return {
     success: failed.length === 0,
     applied: failed.length === 0 ? applied : [],
     failed: failed.length > 0 ? failed : undefined,
     canRollback: failed.length === 0 && applied.length > 0,
+    verification: verification ?? undefined,
+    events,
   };
 }
 

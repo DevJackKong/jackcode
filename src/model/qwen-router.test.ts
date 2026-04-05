@@ -1,9 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { createQwenRouter, type QwenPreparedRequest } from './qwen-router.ts';
-import type { QwenRouteRequest } from './types.ts';
-import type { CompressedContext } from '../types/context.ts';
+import { createQwenRouter, type QwenPreparedRequest } from './qwen-router.js';
+import type { QwenRouteRequest } from './types.js';
+import type { CompressedContext } from '../types/context.js';
 
 function createContext(content: string, finalTokens = Math.ceil(content.length / 4)): CompressedContext {
   return {

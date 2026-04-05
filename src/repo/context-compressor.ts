@@ -458,26 +458,26 @@ export class ContextCompressor {
       return { ...fragment, tokenCount: currentTokens };
     }
 
-    let processed = { ...fragment, tokenCount: currentTokens };
+    let processed: ContextFragment & { tokenCount: number } = { ...fragment, tokenCount: currentTokens };
 
     if (this.strategy.level >= 1) {
-      processed = this.semanticDeduplicate(processed);
+      processed = this.semanticDeduplicate(processed) as ContextFragment & { tokenCount: number };
     }
 
     if (this.strategy.level >= 1 && processed.type === 'chat') {
-      processed = this.summarizeFragment(processed, 8);
+      processed = this.summarizeFragment(processed, 8) as ContextFragment & { tokenCount: number };
     }
 
     if (this.strategy.level >= 1 && (processed.type === 'code' || processed.type === 'doc')) {
-      processed = this.smartFilterFragment(processed, this.strategy.level);
+      processed = this.smartFilterFragment(processed, this.strategy.level) as ContextFragment & { tokenCount: number };
     }
 
     if (this.strategy.level >= 2 && processed.type !== 'system' && processed.type !== 'error') {
-      processed = this.summarizeFragment(processed, processed.type === 'code' ? 12 : 10);
+      processed = this.summarizeFragment(processed, processed.type === 'code' ? 12 : 10) as ContextFragment & { tokenCount: number };
     }
 
     if (this.strategy.level >= 3) {
-      processed = this.elideFragment(processed);
+      processed = this.elideFragment(processed) as ContextFragment & { tokenCount: number };
     }
 
     const processedTokens = processed.tokenCount ?? estimateTokens(processed.content);
@@ -636,7 +636,7 @@ export class ContextCompressor {
 
   protected calculateFileImportance(fragment: ContextFragment): number {
     let score = fragment.type === 'code' ? 0.45 : fragment.type === 'symbol' ? 0.55 : 0.35;
-    const path = (('relativePath' in fragment ? fragment.relativePath : fragment.source) ?? '').toLowerCase();
+    const path = String(('relativePath' in fragment ? fragment.relativePath : fragment.source) ?? '').toLowerCase();
 
     for (const hint of IMPORTANT_PATH_HINTS) {
       if (path.includes(hint)) score += 0.08;
@@ -646,8 +646,13 @@ export class ContextCompressor {
     }
 
     if ('definedSymbols' in fragment) {
-      score += Math.min(0.2, fragment.definedSymbols.length * 0.03);
-      if (fragment.language === 'typescript' || fragment.language === 'tsx') {
+      const symbolFragment = fragment as ContextFragment & {
+        definedSymbols: string[];
+        referencedSymbols?: string[];
+        language?: string;
+      };
+      score += Math.min(0.2, symbolFragment.definedSymbols.length * 0.03);
+      if (symbolFragment.language === 'typescript' || symbolFragment.language === 'tsx') {
         score += 0.08;
       }
     }
@@ -665,8 +670,12 @@ export class ContextCompressor {
 
     const symbols = new Set<string>();
     if ('definedSymbols' in fragment) {
-      for (const symbol of fragment.definedSymbols) symbols.add(symbol.toLowerCase());
-      for (const symbol of fragment.referencedSymbols) symbols.add(symbol.toLowerCase());
+      const symbolFragment = fragment as ContextFragment & {
+        definedSymbols: string[];
+        referencedSymbols?: string[];
+      };
+      for (const symbol of symbolFragment.definedSymbols) symbols.add(symbol.toLowerCase());
+      for (const symbol of symbolFragment.referencedSymbols ?? []) symbols.add(symbol.toLowerCase());
     } else {
       for (const token of this.tokenize(fragment.content)) symbols.add(token);
     }
@@ -689,7 +698,7 @@ export class ContextCompressor {
 
   protected calculateRecencyWeight(fragment: ContextFragment, now: number): number {
     const timestamps = [fragment.timestamp, fragment.metadata.lastAccess];
-    if ('modifiedAt' in fragment) timestamps.push(fragment.modifiedAt);
+    if ('modifiedAt' in fragment) timestamps.push((fragment as ContextFragment & { modifiedAt: number }).modifiedAt);
     const freshest = Math.max(...timestamps.filter((value) => Number.isFinite(value)));
     const ageHours = Math.max(0, (now - freshest) / (1000 * 60 * 60));
     return Math.exp(-ageHours / 24);
@@ -699,8 +708,8 @@ export class ContextCompressor {
     if (queryTerms.length === 0) return 0.5;
 
     const haystack = [fragment.content, fragment.source ?? ''];
-    if ('relativePath' in fragment) haystack.push(fragment.relativePath);
-    if ('definedSymbols' in fragment) haystack.push(fragment.definedSymbols.join(' '));
+    if ('relativePath' in fragment) haystack.push(String((fragment as ContextFragment & { relativePath: string }).relativePath));
+    if ('definedSymbols' in fragment) haystack.push((fragment as ContextFragment & { definedSymbols: string[] }).definedSymbols.join(' '));
     const text = haystack.join(' ').toLowerCase();
 
     let matches = 0;

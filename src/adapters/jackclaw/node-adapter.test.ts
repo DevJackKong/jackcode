@@ -12,7 +12,7 @@ import {
   type JackClawMessage,
   type NodeTransport,
   type RuntimeAdapter,
-} from './node-adapter.ts';
+} from './node-adapter.js';
 
 class MockTransport implements NodeTransport {
   public sent: string[] = [];
@@ -209,6 +209,7 @@ test('MessageRouter serializes/deserializes and request correlation resolves rep
 
   await adapter.handleRawMessage(new MessageRouter().serialize(reply));
   const resolved = await replyPromise;
+  assert.ok(resolved);
   assert.equal(resolved.type, 'pong');
   assert.deepEqual(resolved.payload, { ok: true });
 });

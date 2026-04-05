@@ -25,8 +25,8 @@ import type {
   ErrorClassifier,
   RecoveryHook,
   CircuitBreakerEvent,
-} from '../types/repairer.ts';
-import { DEFAULT_RECOVERY_CONFIG } from '../types/repairer.ts';
+} from '../types/repairer.js';
+import { DEFAULT_RECOVERY_CONFIG } from '../types/repairer.js';
 
 export type ErrorSeverity = 'low' | 'medium' | 'high' | 'critical';
 

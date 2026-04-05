@@ -37,8 +37,8 @@ export interface TaskContext {
   updatedAt: Date;
   completedAt?: Date | null;
   metadata: Record<string, unknown>;
-  notes: string[];
-  contextFragments: ContextFragment[];
+  notes?: string[];
+  contextFragments?: ContextFragment[];
 }
 
 export interface GoalNode {

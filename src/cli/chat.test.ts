@@ -24,7 +24,7 @@ import {
   renderProgress,
   resumeLatestSession,
   saveSession,
-} from './chat.ts';
+} from './chat.js';
 import type { CLIConfig, SlashCommand } from '../types/cli.js';
 
 const TEST_CONFIG: CLIConfig = {

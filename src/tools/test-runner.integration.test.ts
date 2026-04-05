@@ -4,7 +4,7 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { BuildTestLoopOrchestrator, TestRunner, type CommandExecutor, type CommandSpec } from './test-runner.ts';
+import { BuildTestLoopOrchestrator, TestRunner, type CommandExecutor, type CommandSpec } from './test-runner.js';
 
 function createProject(structure: Record<string, string>): string {
   const root = mkdtempSync(join(tmpdir(), 'jackcode-thread-04-int-'));
@@ -66,7 +66,7 @@ test('stores build/test results in session and exposes coverage trend', async ()
   const root = createProject({
     'package.json': JSON.stringify({ devDependencies: { vitest: '^1.0.0' } }),
     'src/foo.ts': 'export const foo = 1;\n',
-    'src/foo.test.ts': 'import test from "node:test"; test("x",()=>{});\n',
+    'src/foo.test.js': 'import test from "node:test"; test("x",()=>{});\n',
     'node_modules/.bin/vitest': '',
   });
 
@@ -99,7 +99,7 @@ test('build to test report workflow runs through orchestrator with affected test
   const root = createProject({
     'package.json': JSON.stringify({ devDependencies: { vitest: '^1.0.0' } }),
     'src/runtime.ts': 'export const runtime = true;\n',
-    'src/runtime.integration.test.ts': 'import test from "node:test"; test("x",()=>{});\n',
+    'src/runtime.integration.test.js': 'import test from "node:test"; test("x",()=>{});\n',
     'node_modules/.bin/vitest': '',
     'node_modules/.bin/tsc': '',
     'tsconfig.json': JSON.stringify({ compilerOptions: { target: 'ES2022' } }),
