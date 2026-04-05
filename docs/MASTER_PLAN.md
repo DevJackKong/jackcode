@@ -5,7 +5,7 @@ Build JackCode as an independent coding-agent framework with native JackClaw com
 
 ## Model roles
 - Qwen 3.6: primary executor
-- DeepSeek: escalation reasoner
+- GPT-5.4: verifier / repairer
 - GPT-5.4: verifier / repairer
 
 ## Parallel thread map
@@ -18,7 +18,7 @@ Build JackCode as an independent coding-agent framework with native JackClaw com
 7. impact-analyzer
 8. context-compressor
 9. qwen-executor-router
-10. deepseek-reasoner-router
+10. legacy-reasoner-router (historical, removed)
 11. gpt54-verifier-repairer
 12. model-policy-cost-control
 13. jackclaw-node-adapter

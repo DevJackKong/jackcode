@@ -12,7 +12,7 @@ import type { ClassifiedFailure, RecoveryResult } from '../types/repairer.js';
 const TMP_DIR = mkdtempSync(path.join(os.tmpdir(), 'jackcode-runtime-tests-'));
 mkdirSync(TMP_DIR, { recursive: true });
 
-function createPlan(targetModel: 'qwen' | 'deepseek' | 'gpt54' = 'qwen'): ExecutionPlan {
+function createPlan(targetModel: 'qwen' | 'gpt54' = 'qwen'): ExecutionPlan {
   return {
     estimatedTokens: 1200,
     targetModel,

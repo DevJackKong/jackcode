@@ -36,13 +36,13 @@ npm run test:integration -- --flow happy-path
 | TP-02-2 | Model selection | Task with plan | Correct model tier selected |
 | TP-02-3 | Result handling | Qwen returns result | State transitions to review |
 
-### TP-03: Runtime → DeepSeek Router (Thread 01 ↔ Thread 10)
+### TP-03: Runtime → Legacy Repair Path (Thread 01 ↔ Thread 10)
 **Purpose**: Verify repair escalation
 
 | Test ID | Scenario | Steps | Expected |
 |---------|----------|-------|----------|
-| TP-03-1 | Repair escalation | Execute fails | Routed to DeepSeek handler |
-| TP-03-2 | Repair success | DeepSeek returns fix | State returns to execute |
+| TP-03-1 | Repair escalation | Execute fails | Routed to legacy repair handler |
+| TP-03-2 | Repair success | Legacy repair plan returns fix | State returns to execute |
 | TP-03-3 | Max attempts | 3 repair attempts | State transitions to error |
 
 ### TP-04: Runtime → GPT-5.4 Verifier (Thread 01 ↔ Thread 11)
@@ -126,7 +126,7 @@ npm run test:integration -- --flow happy-path
 | Step | Action | Verification |
 |------|--------|--------------|
 | 1 | Execute task | Build fails |
-| 2 | Transition to repair | Routed to DeepSeek |
+| 2 | Transition to repair | Routed to legacy repair path |
 | 3 | Apply repair | Fix applied, state=execute |
 | 4 | Re-execute | Success, state=review |
 | 5 | Complete review | State=done |

@@ -7,7 +7,7 @@ Session context management for JackCode - handles state persistence, task tracki
 - Session lifecycle management (create, suspend, resume, close)
 - Task context stack (current task, parent tasks, root goal)
 - Checkpoint system for recovery and rollback
-- Handoff state between models (Qwen → DeepSeek → GPT-5.4)
+- Handoff state between models (Qwen → GPT-5.4)
 - Memory integration with JackClaw
 
 ## Design Decisions

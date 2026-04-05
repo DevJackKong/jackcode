@@ -515,8 +515,8 @@ export class ImpactAnalyzer implements IImpactAnalyzer {
     symbolImpacts: SymbolImpact[]
   ): ImpactReport['summary'] {
     const files = Array.from(impactedFiles.values());
-    const directImpacts = files.filter((f) => f.category === 'direct').length;
-    const transitiveImpacts = files.filter((f) => f.category === 'transitive' || f.category === 'type-only').length;
+    const directImpacts = files.filter((f) => f.category === 'direct' && f.distance === 0).length;
+    const transitiveImpacts = files.filter((f) => (f.category === 'transitive' || f.category === 'type-only') && !this.isTestFile(f.path)).length;
     const testFilesImpacted = new Set([
       ...files.filter((f) => f.category === 'test').map((f) => f.path),
       ...affectedTests.map((f) => f.path),
@@ -853,15 +853,6 @@ export class ImpactAnalyzer implements IImpactAnalyzer {
     const sourceBase = normalizedSourcePath.replace(/\.[^.]+$/, '');
     const sourceFileName = sourceBase.split('/').pop() ?? sourceBase;
     const tests = new Set<string>();
-    const symbolRippleMap = new Map<string, Set<string>>();
-
-    for (const symbolImpact of symbolImpacts) {
-      for (const ripplePath of symbolImpact.rippleFiles) {
-        const set = symbolRippleMap.get(ripplePath) ?? new Set<string>();
-        set.add(symbolImpact.symbolName);
-        symbolRippleMap.set(ripplePath, set);
-      }
-    }
 
     for (const [candidatePath, node] of this.dependencyGraph.entries()) {
       if (!this.isTestFile(candidatePath)) {
@@ -870,16 +861,47 @@ export class ImpactAnalyzer implements IImpactAnalyzer {
 
       const normalizedCandidate = this.normalizePath(candidatePath);
       const candidateBase = normalizedCandidate.replace(/\.[^.]+$/, '');
-      const directlyImportsSource = node.imports.some(
-        (imp) => this.resolveImportPath(imp.source, node.path) === normalizedSourcePath
-      );
-      const nameMatches = candidateBase.includes(sourceFileName);
-      const coversRipple = node.imports.some((imp) => symbolRippleMap.has(this.resolveImportPath(imp.source, node.path)));
-      const referencesDependent = Array.from(symbolRippleMap.keys()).some((ripplePath) =>
-        node.imports.some((imp) => this.resolveImportPath(imp.source, node.path) === ripplePath)
+      const directlyImportsSource = node.imports.some((imp) => {
+        const resolvedImport = this.resolveImportPath(imp.source, node.path);
+        return resolvedImport === normalizedSourcePath || this.pathsEquivalent(resolvedImport, normalizedSourcePath);
+      });
+      const candidateFileName = normalizedCandidate.split('/').pop()?.replace(/\.[^.]+$/, '') ?? normalizedCandidate;
+      const normalizeCoverageName = (value: string): string => value
+        .replace(/\.[^.]+$/g, '')
+        .replace(/\.(test|spec|integration|e2e)$/gi, '')
+        .replace(/[-_](test|spec|integration|e2e)$/gi, '')
+        .replace(/[-_]/g, '')
+        .replace(/\./g, '');
+      const candidateNormalizedName = normalizeCoverageName(candidateFileName);
+      const sourceNormalizedName = normalizeCoverageName(sourceFileName);
+      const sourcePathSegments = sourceBase
+        .toLowerCase()
+        .split('/')
+        .map((segment) => normalizeCoverageName(segment))
+        .filter(Boolean);
+      const sourceLastSegment = sourcePathSegments[sourcePathSegments.length - 1] ?? sourceNormalizedName;
+      const sourcePenultimateSegment = sourcePathSegments[sourcePathSegments.length - 2] ?? '';
+      const segmentMatches = [sourceLastSegment, sourcePenultimateSegment]
+        .filter(Boolean)
+        .some((segment) => candidateNormalizedName.includes(segment));
+      const nameMatches = candidateBase.includes(sourceFileName)
+        || sourceBase.includes(candidateFileName)
+        || candidateNormalizedName === sourceNormalizedName
+        || candidateNormalizedName.includes(sourceNormalizedName)
+        || sourceNormalizedName.includes(candidateNormalizedName)
+        || segmentMatches;
+
+      if (nameMatches || directlyImportsSource) {
+        tests.add(normalizedCandidate);
+        continue;
+      }
+
+      const isDirectSymbolConsumer = symbolImpacts.some((symbolImpact) =>
+        symbolImpact.exportedFrom === normalizedSourcePath
+        && symbolImpact.references.some((reference) => this.pathsEquivalent(reference.filePath, normalizedCandidate))
       );
 
-      if (nameMatches || directlyImportsSource || coversRipple || referencesDependent) {
+      if (isDirectSymbolConsumer) {
         tests.add(normalizedCandidate);
       }
     }
@@ -1052,20 +1074,45 @@ export class ImpactAnalyzer implements IImpactAnalyzer {
   }
 
   private sortImpactedFiles(files: ImpactedFile[]): ImpactedFile[] {
-    return files.sort(
-      (a, b) =>
-        this.severityRank(a.severity) - this.severityRank(b.severity) ||
-        (b.riskScore ?? 0) - (a.riskScore ?? 0) ||
-        a.distance - b.distance ||
-        a.path.localeCompare(b.path)
-    );
+    return files.sort((a, b) => {
+      const aIsTest = this.isTestFile(a.path);
+      const bIsTest = this.isTestFile(b.path);
+      if (aIsTest !== bIsTest) return aIsTest ? 1 : -1;
+
+      if (aIsTest && bIsTest) {
+        const scopeDelta = this.scopeRank(b.scope ?? 'unit') - this.scopeRank(a.scope ?? 'unit');
+        if (scopeDelta !== 0) return scopeDelta;
+
+        const severityDelta = this.severityRank(a.severity) - this.severityRank(b.severity);
+        if (severityDelta !== 0) return severityDelta;
+
+        const distanceDelta = a.distance - b.distance;
+        if (distanceDelta !== 0) return distanceDelta;
+
+        return a.path.localeCompare(b.path);
+      }
+
+      const distanceDelta = a.distance - b.distance;
+      if (distanceDelta !== 0) return distanceDelta;
+
+      const scopeDelta = this.scopeRank(b.scope ?? 'unit') - this.scopeRank(a.scope ?? 'unit');
+      if (scopeDelta !== 0) return scopeDelta;
+
+      const severityDelta = this.severityRank(a.severity) - this.severityRank(b.severity);
+      if (severityDelta !== 0) return severityDelta;
+
+      const riskDelta = (b.riskScore ?? 0) - (a.riskScore ?? 0);
+      if (riskDelta !== 0) return riskDelta;
+
+      return a.path.localeCompare(b.path);
+    });
   }
 
   private sortTests(tests: AffectedTest[]): AffectedTest[] {
     return [...tests].sort(
       (a, b) =>
-        this.testPriorityRank(a.priority) - this.testPriorityRank(b.priority) ||
         this.scopeRank(b.scope) - this.scopeRank(a.scope) ||
+        this.testPriorityRank(a.priority) - this.testPriorityRank(b.priority) ||
         (b.estimatedImpact ?? 0) - (a.estimatedImpact ?? 0) ||
         a.path.localeCompare(b.path)
     );
@@ -1104,6 +1151,11 @@ export class ImpactAnalyzer implements IImpactAnalyzer {
 
   private shouldExclude(filePath: string): boolean {
     return this.options.excludePatterns.some((pattern) => this.matchPattern(filePath, pattern));
+  }
+
+  private pathsEquivalent(a: string, b: string): boolean {
+    const normalizeWithoutExtension = (value: string): string => this.normalizePath(value).replace(/\.[^.]+$/, '');
+    return normalizeWithoutExtension(a) === normalizeWithoutExtension(b);
   }
 
   private referencePriority(reference: SymbolUsageReference): number {

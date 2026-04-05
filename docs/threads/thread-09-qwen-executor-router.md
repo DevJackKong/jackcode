@@ -8,7 +8,7 @@ Primary executor model router for JackCode. Distributes execution tasks to Qwen 
 2. **Load Balancing**: Distribute concurrent requests across available Qwen instances
 3. **Request Batching**: Group compatible tasks for efficient batch processing
 4. **Result Aggregation**: Collect and merge partial results from parallel executions
-5. **Fallback Handling**: Escalate to DeepSeek reasoner on complex failures
+5. **Fallback Handling**: Escalate complex failures to GPT-5.4 review/recovery
 
 ## Design Decisions
 
@@ -73,7 +73,7 @@ interface ExecutionMetrics {
 ## Integration Notes
 - Consumes from **runtime state machine** (Thread 01) - specifically `execute` state
 - Receives compressed context from **context-compressor** (Thread 08)
-- Escalates complex repairs to **deepseek-reasoner-router** (Thread 10)
+- Escalates complex repairs to the legacy Thread 10 notes (historical) and active GPT-5.4 recovery path
 - Outputs to **review** state for **gpt54-verifier-repairer** (Thread 11)
 
 ## File Structure

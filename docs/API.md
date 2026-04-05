@@ -316,7 +316,7 @@ Source: `src/types/cli.ts`
 ### Model and mode types
 
 ```ts
-type ModelTier = 'qwen-3.6' | 'deepseek' | 'gpt54';
+type ModelTier = 'qwen-3.6' | 'gpt54';
 type CLIMode = 'chat' | 'oneshot' | 'execute' | 'help' | 'version';
 type Theme = 'dark' | 'light' | 'auto';
 type SessionMode = 'plan' | 'execute' | 'review' | 'idle';

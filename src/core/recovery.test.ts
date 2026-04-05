@@ -164,7 +164,7 @@ test('RecoveryEngine escalates when no checkpoint exists', async () => {
 
   assert.equal(result.action, 'escalate');
   assert.equal(result.newState, 'error');
-  assert.equal(result.escalation?.targetModel, 'deepseek-reasoner');
+  assert.equal(result.escalation?.targetModel, 'gpt54');
 });
 
 test('RecoveryEngine halts on repeated loop signature', async () => {

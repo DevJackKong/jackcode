@@ -89,7 +89,7 @@ type FailureCategory =
 ### `RecoveryEngine`
 - `attemptRecovery(context: RecoveryContext): Promise<RecoveryResult>` - Attempt recovery
 - `rollbackToCheckpoint(sessionId: string, checkpointId: string): Promise<boolean>` - Restore state
-- `escalateToReasoner(context: EscalationContext): Promise<void>` - Escalate to DeepSeek
+- `escalateToReasoner(context: EscalationContext): Promise<void>` - Escalate to GPT-5.4 review/recovery
 
 ### `SafetyGuardian`
 - `checkLimits(context: ExecutionContext): SafetyCheck` - Validate safety constraints
@@ -101,7 +101,7 @@ type FailureCategory =
 - **Input from**: Thread 04 (Build-Test Loop) for build/test failures
 - **Input from**: Thread 11 (Verifier) for verification failures
 - **Output to**: Thread 01 (Runtime) for state transitions
-- **Output to**: Thread 10 (DeepSeek Reasoner) for escalations
+- **Output to**: Thread 10 (legacy reasoner, historical only) for archived escalation notes
 - **Uses**: Thread 02 (Session) for checkpoint restoration
 - **Uses**: Thread 03 (Patch Engine) for rollback operations
 

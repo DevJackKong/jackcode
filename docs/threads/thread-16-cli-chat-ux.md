@@ -63,7 +63,7 @@ Provides the command-line interface and interactive chat experience for JackCode
 | `/undo` | Revert last change | `/undo` |
 | `/diff` | Show diff of pending changes | `/diff` |
 | `/context` | Show current context window | `/context` |
-| `/model` | Switch model tier | `/model deepseek` |
+| `/model` | Switch model tier | `/model gpt-5.4` |
 | `/session` | Show session info | `/session` |
 | `/help` | Show available commands | `/help` |
 | `/exit` | Quit interactive mode | `/exit` or `/quit` |

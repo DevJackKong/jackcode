@@ -37,7 +37,7 @@ Trace (root)
 │   │   ├── Span: patch.apply
 │   │   └── Span: test.run
 │   ├── Span: task.repair
-│   │   └── Span: model.deepseek.route
+│   │   └── Span: model.gpt54.recovery
 │   └── Span: task.review
 │       └── Span: model.gpt54.verify
 └── Span: session.close

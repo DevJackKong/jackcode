@@ -59,7 +59,7 @@ interface ExecutionPlan {
 
 - Thread 02 (session-context): Reads/writes session state
 - Thread 09 (qwen-executor-router): Receives execute state tasks
-- Thread 10 (deepseek-reasoner-router): Receives repair state escalations
+- Thread 10 (legacy reasoner notes): historical reference for removed escalation path
 - Thread 11 (gpt54-verifier-repairer): Receives review state tasks
 
 ## Files

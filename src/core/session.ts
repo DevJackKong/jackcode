@@ -674,11 +674,7 @@ export class SessionManager {
       this.events.emit('task-update', { sessionId, task: this.cloneTask(targetTask) });
     }
 
-    if (this.shouldCompressContext(sessionId)) {
-      this.compressContext(sessionId);
-    } else {
-      this.touchSession(session, 'context-fragment-added');
-    }
+    this.touchSession(session, 'context-fragment-added');
     return true;
   }
 
@@ -753,12 +749,60 @@ export class SessionManager {
     session.contextWindow.currentTokens = compressed.stats.finalTokens;
     session.contextWindow.lastCompressedAt = new Date(compressed.compressedAt);
 
+    const enforcedBudget = targetBudget ?? Math.floor(session.contextWindow.maxTokens * session.contextWindow.warningThreshold);
+    let finalFragments = compressed.fragments.map((fragment) => this.normalizeFragment(fragment));
+    let finalTokens = compressed.stats.finalTokens;
+
+    if (finalTokens > enforcedBudget) {
+      const trimmed: ContextFragment[] = [];
+      let remaining = enforcedBudget;
+      for (const fragment of finalFragments) {
+        if (remaining <= 0) break;
+        const fragmentTokens = fragment.tokenCount ?? estimateTokens(fragment.content);
+        if (fragmentTokens <= remaining) {
+          trimmed.push(fragment);
+          remaining -= fragmentTokens;
+          continue;
+        }
+
+        const sliced = this.normalizeFragment({
+          ...fragment,
+          content: fragment.content.slice(0, Math.max(1, remaining * 4)),
+          metadata: {
+            ...fragment.metadata,
+            tags: Array.from(new Set([...(fragment.metadata.tags ?? []), 'truncated'])),
+          },
+        });
+        if (sliced.tokenCount && sliced.tokenCount <= remaining) {
+          trimmed.push(sliced);
+          remaining -= sliced.tokenCount;
+        }
+        break;
+      }
+      finalFragments = trimmed;
+      finalTokens = this.calculateTokens(finalFragments);
+    }
+
+    session.contextFragments = finalFragments;
+    session.contextWindow.currentTokens = finalTokens;
+    session.contextWindow.lastCompressedAt = new Date(compressed.compressedAt);
+
     const result: ContextCompressionResult = {
-      triggered: beforeTokens > compressed.stats.finalTokens || beforeTokens > (targetBudget ?? Math.floor(session.contextWindow.maxTokens * session.contextWindow.warningThreshold)),
+      triggered: beforeTokens > finalTokens || beforeTokens > enforcedBudget,
       beforeTokens,
-      afterTokens: compressed.stats.finalTokens,
-      compressedContext: compressed,
-      droppedFragments: compressed.stats.fragmentsDropped,
+      afterTokens: finalTokens,
+      compressedContext: {
+        ...compressed,
+        fragments: finalFragments,
+        stats: {
+          ...compressed.stats,
+          finalTokens,
+          savedTokens: Math.max(0, beforeTokens - finalTokens),
+          ratio: beforeTokens > 0 ? finalTokens / beforeTokens : 0,
+          fragmentsDropped: Math.max(0, session.contextFragments.length - finalFragments.length),
+        },
+      },
+      droppedFragments: Math.max(0, compressed.fragments.length - finalFragments.length),
     };
 
     this.touchSession(session, 'context-compressed');

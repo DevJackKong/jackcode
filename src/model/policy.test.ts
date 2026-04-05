@@ -58,11 +58,11 @@ test('supports manual override handling when model can satisfy task', () => {
       taskType: 'debug',
       estimatedTokens: 6000,
       requiresReasoning: true,
-      overrideModel: 'deepseek',
+      overrideModel: 'gpt54',
     })
   );
 
-  assert.equal(decision.selectedModel, 'deepseek');
+  assert.equal(decision.selectedModel, 'gpt54');
   assert.equal(decision.overrideApplied, true);
   assert.equal(decision.mode, 'overridden');
   assert.ok(decision.alerts?.some((alert) => alert.code === 'policy.override'));
@@ -109,7 +109,7 @@ test('tracks cost totals and produces breakdown, dashboard, trends, and exports'
     taskType: 'simple_edit',
   });
   engine.trackUsage('task-b', {
-    model: 'deepseek',
+    model: 'gpt54',
     inputTokens: 1500,
     outputTokens: 600,
     latencyMs: 2500,
@@ -123,7 +123,7 @@ test('tracks cost totals and produces breakdown, dashboard, trends, and exports'
   assert.equal(report.summary.totalTasks, 2);
   assert.ok(report.summary.totalCost > 0);
   assert.equal(report.byModel.qwen.count, 1);
-  assert.equal(report.byModel.deepseek.count, 1);
+  assert.equal(report.byModel.gpt54.count, 1);
   assert.ok(report.dashboard.totals.totalTokens > 0);
   assert.ok(report.breakdown.byTaskType.simple_edit.cost > 0);
   assert.ok(report.breakdown.bySession['session-1'].count === 2);
@@ -136,10 +136,8 @@ test('enforces per-task, session, daily, weekly, and monthly budgets', () => {
   const engine = new ModelPolicyEngine({
     policy: {
       defaultModel: 'qwen',
-      escalationModel: 'deepseek',
-      verificationModel: 'gpt54',
+      auditorModel: 'gpt54',
       complexityThresholds: { low: 1000, medium: 10000, high: 50000 },
-      escalationChain: ['qwen', 'deepseek', 'gpt54'],
       escalationRules: {
         qwenConfidenceThreshold: 0.7,
         fileCountThreshold: 5,
@@ -178,10 +176,8 @@ test('downgrades model when budget pressure prevents expensive route', () => {
   const engine = new ModelPolicyEngine({
     policy: {
       defaultModel: 'qwen',
-      escalationModel: 'deepseek',
-      verificationModel: 'gpt54',
+      auditorModel: 'gpt54',
       complexityThresholds: { low: 1000, medium: 10000, high: 50000 },
-      escalationChain: ['qwen', 'deepseek', 'gpt54'],
       escalationRules: {
         qwenConfidenceThreshold: 0.7,
         fileCountThreshold: 5,
@@ -217,10 +213,8 @@ test('allocates and refunds per-task budgets', () => {
   const engine = new ModelPolicyEngine({
     policy: {
       defaultModel: 'qwen',
-      escalationModel: 'deepseek',
-      verificationModel: 'gpt54',
+      auditorModel: 'gpt54',
       complexityThresholds: { low: 1000, medium: 10000, high: 50000 },
-      escalationChain: ['qwen', 'deepseek', 'gpt54'],
       escalationRules: {
         qwenConfidenceThreshold: 0.7,
         fileCountThreshold: 5,
@@ -312,10 +306,8 @@ test('generates warning alerts when budget utilization crosses thresholds', () =
   const engine = new ModelPolicyEngine({
     policy: {
       defaultModel: 'qwen',
-      escalationModel: 'deepseek',
-      verificationModel: 'gpt54',
+      auditorModel: 'gpt54',
       complexityThresholds: { low: 1000, medium: 10000, high: 50000 },
-      escalationChain: ['qwen', 'deepseek', 'gpt54'],
       escalationRules: {
         qwenConfidenceThreshold: 0.7,
         fileCountThreshold: 5,

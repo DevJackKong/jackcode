@@ -1,6 +1,6 @@
 /**
- * Thread 10: DeepSeek Reasoner Router Types
- * Type definitions for escalation reasoning hooks
+ * Thread 10: Legacy Reasoner Router Types
+ * Type definitions for escalation reasoning hooks in the current two-model architecture.
  */
 
 import type { Artifact, ErrorLog } from '../../core/runtime.js';
@@ -117,11 +117,11 @@ export interface AlternativeApproach {
 }
 
 /**
- * DeepSeek router configuration
+ * Reasoner router configuration
  */
-export interface DeepSeekConfig {
+export interface ReasonerConfig {
   /** Model to use */
-  model: 'deepseek-reasoner' | 'deepseek-chat';
+  model: 'qwen' | 'gpt54';
   /** Maximum tokens for reasoning */
   maxReasoningTokens: number;
   /** Sampling temperature */

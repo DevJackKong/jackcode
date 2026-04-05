@@ -57,7 +57,7 @@ Validates release readiness against criteria:
 |------------|-----------|---------------|----------|
 | 01 (Runtime) | 02 (Session) | State persistence | P0 |
 | 01 (Runtime) | 09 (Qwen) | Execute routing | P0 |
-| 01 (Runtime) | 10 (DeepSeek) | Repair escalation | P0 |
+| 01 (Runtime) | 10 (Legacy repair notes) | Historical escalation mapping | P0 |
 | 01 (Runtime) | 11 (GPT-5.4) | Review routing | P0 |
 | 03 (Patch) | 04 (Build-Test) | Post-patch validation | P0 |
 | 04 (Build-Test) | 11 (GPT-5.4) | Test result delivery | P0 |

@@ -134,7 +134,7 @@ export interface ScoredFragment extends ContextFragment {
 /**
  * Model-specific context formats
  */
-export type ModelFormat = 'qwen' | 'deepseek' | 'gpt';
+export type ModelFormat = 'qwen' | 'gpt';
 
 /**
  * Token budget configuration per model

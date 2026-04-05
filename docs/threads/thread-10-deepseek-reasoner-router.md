@@ -1,7 +1,7 @@
-# Thread 10: DeepSeek Reasoner Router
+# Thread 10: Legacy Reasoner Router (Historical)
 
 ## Purpose
-Escalation reasoning engine for failed executions. DeepSeek-R1 specializes in deep reasoning for complex problem analysis, making it ideal for diagnosing build/test failures and generating repair strategies.
+Historical design note for a removed reasoning router. The current architecture uses Qwen for implementation and GPT-5.4 for verification/recovery, so this thread is retained only for archival context.
 
 ## Responsibilities
 1. **Failure Analysis**: Deep reasoning on why execution failed (syntax errors, test failures, dependency issues)
@@ -41,7 +41,7 @@ type ReasoningHook = (
 
 ## API
 
-### `DeepSeekReasonerRouter`
+### `LegacyReasonerRouter`
 - `analyzeFailure(context: RepairContext): Promise<ReasoningResult>` - Main reasoning entry point
 - `generateRepairStrategy(analysis: FailureAnalysis): RepairStrategy` - Create repair plan
 - `scoreConfidence(strategy: RepairStrategy): number` - Calculate confidence score
@@ -68,20 +68,20 @@ type ReasoningHook = (
 ```
 src/model/
   providers/
-    deepseek.ts           # Main router implementation
+    legacy-reasoner.ts    # Legacy compatibility shim only
   types/
     reasoning.ts          # Reasoning-specific types
 ```
 
 ## Dependencies
-- DeepSeek API (R1 reasoning model)
+- No active external reasoner dependency
 - Context from context-compressor (Thread 08)
 - Error logs from runtime (Thread 01)
 
 ## Configuration
 ```typescript
-interface DeepSeekConfig {
-  model: 'deepseek-reasoner' | 'deepseek-chat';
+interface ReasonerConfig {
+  model: 'qwen' | 'gpt54';
   maxReasoningTokens: number;
   temperature: number;  // Lower for deterministic reasoning
   timeoutMs: number;

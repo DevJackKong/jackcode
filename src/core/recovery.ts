@@ -809,7 +809,7 @@ export class RecoveryEngine {
 
   async escalateToReasoner(context: { taskId: string; reason: string; targetModel?: string }): Promise<EscalationInfo> {
     return {
-      targetModel: context.targetModel ?? 'deepseek-reasoner',
+      targetModel: context.targetModel ?? 'gpt54',
       reason: context.reason,
       contextSummary: `Task ${context.taskId} escalated for advanced recovery analysis`,
       escalatedAt: Date.now(),

@@ -469,11 +469,18 @@ export class JackClawMemoryAdapter {
       const entry = this.decodeStoredEntry(stored);
       if (query.types?.length && !query.types.includes(entry.type)) continue;
       if (requestedTags.length > 0 && !requestedTags.every((tag) => entry.metadata.tags.includes(tag))) continue;
-      if (typeof query.since === 'number' && entry.timestamp < query.since) continue;
-      if (typeof query.until === 'number' && entry.timestamp > query.until) continue;
+      const storedTimestamp = entry.timestamp;
+      const updatedTimestamp = entry.metadata.updatedAt ?? entry.timestamp;
+      const lowerBoundTimestamp = query.query?.trim() || (query.tags?.length ?? 0) > 0
+        ? storedTimestamp
+        : updatedTimestamp;
+      if (typeof query.since === 'number' && lowerBoundTimestamp < query.since) continue;
+      if (typeof query.until === 'number' && storedTimestamp > query.until) continue;
       if (typeof query.minPriority === 'number' && entry.metadata.priority < query.minPriority) continue;
 
       const breakdown = this.scoreEntry(entry, queryText, requestedTags);
+      const textFiltered = queryText.length === 0 || breakdown.semantic > 0;
+      if (!textFiltered) continue;
       candidates.push({
         entry,
         score: breakdown.semantic * 0.45 + breakdown.tags * 0.2 + breakdown.recency * 0.15 + breakdown.priority * 0.2,

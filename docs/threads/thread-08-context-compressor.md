@@ -8,7 +8,7 @@ Manage context packing, compression, and serialization for efficient storage and
 2. **Token Budgeting**: Enforce model-specific token limits with configurable safety margins
 3. **Compression Strategies**: Multi-tier compression (summarization, truncation, semantic deduplication)
 4. **Relevance Scoring**: Rank context fragments by importance using recency, frequency, and semantic similarity
-5. **Format Adaptation**: Output contexts optimized for Qwen 3.6, DeepSeek, and GPT-5.4 formats
+5. **Format Adaptation**: Output contexts optimized for Qwen 3.6 and GPT-5.4 formats
 
 ## Design Decisions
 
@@ -42,7 +42,7 @@ Raw Context → Tokenize → Budget Check → Relevance Score → Compress → F
 
 ## Integration Notes
 - Consumes output from **repo-scanner** (Thread 05) and **session-context** (Thread 02)
-- Feeds into **qwen-executor-router** (Thread 09) and **deepseek-reasoner-router** (Thread 10)
+- Feeds into **qwen-executor-router** (Thread 09) and GPT-5.4 review/recovery flows; Thread 10 is historical
 - Works with **memory** module for persistence
 
 ## File Structure

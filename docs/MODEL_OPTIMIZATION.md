@@ -9,7 +9,7 @@ JackCode is optimized around two models only:
 
 ## Why this is simpler
 
-- No DeepSeek escalation path
+- No legacy reasoner escalation path
 - No reasoning-router handoff overhead
 - One default development model for all coding tasks
 - One audit model for final verification

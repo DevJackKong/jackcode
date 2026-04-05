@@ -266,7 +266,7 @@ test('compressForModel honors model-specific budgets and emits telemetry snapsho
   ]);
 
   const result = compressor.compressWithOptions(packed, {
-    model: 'deepseek',
+    model: 'gpt',
     level: 3,
     reservedOutputTokens: 56000,
     promptOverheadTokens: 500,
@@ -274,9 +274,9 @@ test('compressForModel honors model-specific budgets and emits telemetry snapsho
   });
 
   const telemetry = compressor.getLastTelemetry();
-  assert.ok(result.stats.finalTokens <= createBudgetPlan('deepseek', { reservedOutputTokens: 56000, promptOverheadTokens: 500 }).inputBudget);
+  assert.ok(result.stats.finalTokens <= createBudgetPlan('gpt', { reservedOutputTokens: 56000, promptOverheadTokens: 500 }).inputBudget);
   assert.ok(telemetry);
-  assert.equal(telemetry?.model, 'deepseek');
+  assert.equal(telemetry?.model, 'gpt');
   assert.equal(telemetry?.fragmentsIn, packed.fragments.length);
 });
 

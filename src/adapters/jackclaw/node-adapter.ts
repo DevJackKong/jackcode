@@ -75,7 +75,7 @@ export interface DailyReport {
   totalDurationMs: number;
   tokenUsage: {
     qwen: number;
-    deepseek: number;
+    gpt54: number;
     gpt54: number;
   };
 }

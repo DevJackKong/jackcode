@@ -26,7 +26,7 @@ import type { HandoffPayload, Session } from '../types/session.js';
 import { RelevanceScorer } from './relevance-scorer.js';
 import { telemetry, telemetryMetrics } from '../core/telemetry.js';
 
-export type SupportedModel = 'qwen' | 'deepseek' | 'gpt';
+export type SupportedModel = 'qwen' | 'gpt';
 
 export interface CompressionTelemetry {
   traceId?: string;
@@ -116,7 +116,6 @@ const DEFAULT_STRATEGIES: Record<CompressionLevel, CompressionStrategy> = {
 
 const MODEL_BUDGETS: Record<SupportedModel, ModelBudget> = {
   qwen: { model: 'qwen', maxTokens: 128000, safetyMargin: 0.1, effectiveBudget: 115200 },
-  deepseek: { model: 'deepseek', maxTokens: 64000, safetyMargin: 0.1, effectiveBudget: 57600 },
   gpt: { model: 'gpt', maxTokens: 128000, safetyMargin: 0.15, effectiveBudget: 108800 },
 };
 

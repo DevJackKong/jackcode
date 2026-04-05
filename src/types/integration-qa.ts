@@ -359,7 +359,7 @@ export const STANDARD_RELEASE_CRITERIA: Record<ReleaseCriteriaLevel, ReleaseCrit
 export const P0_THREAD_PAIRS: ThreadPair[] = [
   { from: 'thread-01', to: 'thread-02' }, // Runtime → Session
   { from: 'thread-01', to: 'thread-09' }, // Runtime → Qwen
-  { from: 'thread-01', to: 'thread-10' }, // Runtime → DeepSeek
+  { from: 'thread-01', to: 'thread-10' }, // Runtime → legacy repair path
   { from: 'thread-01', to: 'thread-11' }, // Runtime → GPT-5.4
   { from: 'thread-03', to: 'thread-04' }, // Patch → Build-Test
   { from: 'thread-04', to: 'thread-11' }, // Build-Test → GPT-5.4

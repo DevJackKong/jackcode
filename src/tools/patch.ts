@@ -474,7 +474,7 @@ function validatePatchContent(filePath: string, content: string, syntaxAware: bo
   try {
     if (lower.endsWith('.json')) {
       JSON.parse(content);
-    } else if (lower.endsWith('.js') || lower.endsWith('.mjs') || lower.endsWith('.cjs')) {
+    } else if (lower.endsWith('.cjs')) {
       // eslint-disable-next-line no-new-func
       new Function(content);
     }
@@ -786,11 +786,15 @@ export async function applyPatch(
 
       lockPath = await createLock(targetPath);
       let currentLines = [...before.lines];
+      let appliedWithFuzz = false;
 
       for (const hunk of patch.hunks) {
         try {
           const result = applyHunk(currentLines, hunk);
           currentLines = result.lines;
+          if (result.fuzz > 0) {
+            appliedWithFuzz = true;
+          }
         } catch (error) {
           throw Object.assign(
             new Error(error instanceof Error ? error.message : String(error)),
@@ -799,12 +803,16 @@ export async function applyPatch(
         }
       }
 
+      if (hadChecksumMismatch && !appliedWithFuzz) {
+        throw Object.assign(new Error('Checksum mismatch before apply'), { failureType: 'checksum_mismatch' satisfies FailureType });
+      }
+
       const nextContent = joinLines(currentLines);
-      const verification = await verifyPatchedFile(targetPath, nextContent, DEFAULT_CONFIG);
+      const verification = await verifyPatchedFile(targetPath, nextContent, { ...DEFAULT_CONFIG, snapshotDir: dirname(patch.reversePatch.storagePath) });
       if (!verification.valid) {
         throw Object.assign(
           new Error(`Verification failed: ${verification.errors.join('; ')}`),
-          { failureType: (hadChecksumMismatch ? 'checksum_mismatch' : 'conflict') satisfies FailureType }
+          { failureType: 'conflict' satisfies FailureType }
         );
       }
 
@@ -876,15 +884,23 @@ export async function applyPatch(
       await options.onPatchFailed?.(failedPatch);
 
       await rollbackAppliedPatches(rollbackQueue);
-      if (rollbackQueue.length > 0) {
-        emitLifecycleEvent(events, 'patch:rolled-back', { rolledBack: rollbackQueue.map((item) => item.id) }, { planId: plan.id });
-      }
+      emitLifecycleEvent(events, 'patch:rolled-back', { rolledBack: rollbackQueue.map((item) => item.id), failureType }, { planId: plan.id, patchId: patch.id });
       break;
     } finally {
       if (lockPath) {
         await releaseLock(lockPath);
       }
     }
+  }
+
+  if (failed.length > 0) {
+    return {
+      success: false,
+      applied: [],
+      failed,
+      canRollback: false,
+      events,
+    };
   }
 
   const verification = await verifyWithBuildAdapters(applied, options);
@@ -1079,12 +1095,12 @@ export function getActiveSnapshotIds(): string[] {
 
 export async function cleanupSnapshots(maxAgeDays?: number): Promise<string[]> {
   const retentionMs = (maxAgeDays ?? DEFAULT_CONFIG.snapshotRetentionDays) * 24 * 60 * 60 * 1000;
-  const cutoff = Date.now() - retentionMs;
+  const cutoff = retentionMs < 0 ? Number.POSITIVE_INFINITY : Date.now() - retentionMs;
   const removed: string[] = [];
 
   for (const [id, snapshot] of activeSnapshots) {
     const historyEntry = patchHistory.find((entry) => entry.id === id);
-    if (historyEntry && historyEntry.timestamp < cutoff) {
+    if (historyEntry && historyEntry.timestamp <= cutoff) {
       activeSnapshots.delete(id);
       await fs.rm(normalizePath(snapshot.storagePath), { force: true });
       removed.push(id);

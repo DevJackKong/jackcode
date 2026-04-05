@@ -1,7 +1,7 @@
 # Thread 12: Model Policy & Cost Control
 
 ## Purpose
-Central policy engine for model selection, routing rules, and cost management. Determines which model (Qwen/DeepSeek/GPT-5.4) to invoke based on task characteristics, enforces budget constraints, and optimizes cost-performance tradeoffs.
+Central policy engine for model selection, routing rules, and cost management. Determines which model (Qwen/GPT-5.4) to invoke based on task characteristics, enforces budget constraints, and optimizes cost-performance tradeoffs.
 
 ## Responsibilities
 1. **Model Selection Policy**: Decide which model handles each task type based on complexity, urgency, and accuracy requirements
@@ -16,7 +16,6 @@ Central policy engine for model selection, routing rules, and cost management. D
 | Model | Strengths | Cost/T1K | Best For | Max Context |
 |-------|-----------|----------|----------|-------------|
 | Qwen 3.6 | Fast execution, coding | $0.002 | Standard edits, batch ops | 128K |
-| DeepSeek | Deep reasoning, analysis | $0.005 | Complex failures, debugging | 64K |
 | GPT-5.4 | High accuracy, verification | $0.03 | Final review, critical fixes | 256K |
 
 ### Routing Decision Flow
@@ -55,7 +54,7 @@ Classify Task ──→ Estimate Complexity ──→ Check Budget ──→ Sel
 
 ```typescript
 interface ModelPolicy {
-  defaultModel: 'qwen' | 'deepseek' | 'gpt54';
+  defaultModel: 'qwen' | 'gpt54';
   complexityThresholds: {
     low: number;     // Simple edits
     medium: number;  // Multi-file changes
@@ -66,7 +65,7 @@ interface ModelPolicy {
     perSession: number;
     perDay: number;
   };
-  escalationChain: ['qwen', 'deepseek', 'gpt54'];
+  escalationChain: ['qwen', 'gpt54'];
 }
 
 interface RoutingDecision {
@@ -118,7 +117,7 @@ interface TaskCost {
 ## Integration Notes
 - Consumes task context from **runtime state machine** (Thread 01)
 - Routes to **qwen-executor-router** (Thread 09) for standard tasks
-- Escalates via **deepseek-reasoner-router** (Thread 10) for failures
+- Escalates via the GPT-5.4 recovery path for failures; Thread 10 is historical only
 - Final verification via **gpt54-verifier-repairer** (Thread 11, planned)
 - Reports costs to session manager for budgeting
 

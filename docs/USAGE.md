@@ -7,7 +7,7 @@ JackCode now uses a simple two-model architecture:
 - **Qwen 3.6** for all development work
 - **GPT-5.4** for audit and final verification
 
-DeepSeek has been removed.
+The legacy reasoner path has been removed.
 
 ## CLI
 

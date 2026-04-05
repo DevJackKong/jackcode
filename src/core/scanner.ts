@@ -855,12 +855,15 @@ export class RepoScanner {
       const gitStatus = await this.getFileGitStatus(relativePath);
 
       const canonicalRelativePath = relativePath.replace(/\.(?:js|jsx)$/, '.ts');
+      const effectiveLanguage = canonicalRelativePath !== relativePath && language === 'javascript'
+        ? 'typescript'
+        : language;
       const fileEntry = {
         path: canonicalRelativePath,
         absolutePath,
         name: basename(relativePath),
-        extension: extname(relativePath).toLowerCase().slice(1),
-        language,
+        extension: extname(canonicalRelativePath).toLowerCase().slice(1),
+        language: effectiveLanguage,
         size: stats.size,
         modifiedAt: stats.mtimeMs,
         createdAt: stats.ctimeMs,
@@ -1060,7 +1063,7 @@ export class RepoScanner {
       for (const line of status.split('\n')) {
         if (!line.trim()) continue;
         const code = line.slice(0, 2);
-        const file = line.slice(3).trim();
+        const file = line.slice(2).trim();
         if (code === '??') untrackedFiles.push(file);
         else if (code.includes('U')) conflictFiles.push(file);
         else {
@@ -1341,7 +1344,11 @@ export class RepoScanner {
   async stashChanges(message = 'jackcode temporary stash'): Promise<boolean> {
     const before = await this.getGitStatus();
     if (!before.hasChanges) return true;
-    const output = await this.runGit(['stash', 'push', '-u', '-m', message]);
+
+    const hasTrackedChanges = before.modified.length > 0 || before.staged.length > 0 || before.conflicts.length > 0;
+    const output = hasTrackedChanges
+      ? await this.runGit(['stash', 'push', '-u', '-m', message])
+      : await this.runGit(['stash', 'push', '-u', '-m', message, '--', '.']);
     return output !== null;
   }
 
@@ -1349,7 +1356,9 @@ export class RepoScanner {
     const list = await this.runGit(['stash', 'list']);
     if (list == null || !list.trim()) return false;
     const output = await this.runGit(['stash', 'pop']);
-    return output !== null;
+    if (output === null) return false;
+    await this.scan({ force: true });
+    return true;
   }
 
   getTestFiles(pathValue: string): string[] {
