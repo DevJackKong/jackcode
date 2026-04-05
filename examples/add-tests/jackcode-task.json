@@ -1,0 +1,5 @@
+{
+  "intent": "Add tests for utility helpers and edge cases",
+  "files": ["src/utils.ts"],
+  "model": "qwen-3.6"
+}

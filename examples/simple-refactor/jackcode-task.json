@@ -1,0 +1,5 @@
+{
+  "intent": "Refactor calculator to use proper error handling",
+  "files": ["src/calculator.ts"],
+  "model": "qwen-3.6"
+}

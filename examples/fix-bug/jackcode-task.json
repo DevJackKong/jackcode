@@ -1,0 +1,5 @@
+{
+  "intent": "Fix the bug in the example module and make the code safer",
+  "files": ["src/buggy.ts"],
+  "model": "qwen-3.6"
+}
