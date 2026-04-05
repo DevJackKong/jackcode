@@ -33,12 +33,12 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/DevJackKong/JackCode.git"
+    "url": "git+https://github.com/JackClaw/jackcode.git"
   },
   "bugs": {
-    "url": "https://github.com/DevJackKong/JackCode/issues"
+    "url": "https://github.com/JackClaw/jackcode/issues"
   },
-  "homepage": "https://github.com/DevJackKong/JackCode#readme",
+  "homepage": "https://github.com/JackClaw/jackcode#readme",
   "devDependencies": {
     "@types/node": "^22.15.3",
     "@typescript-eslint/eslint-plugin": "^8.30.1",

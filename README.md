@@ -23,7 +23,7 @@ npm install -g jackcode
 ### From source
 
 ```bash
-git clone https://github.com/DevJackKong/JackCode.git
+git clone https://github.com/JackClaw/jackcode.git
 cd JackCode
 npm install
 npm run build
