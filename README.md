@@ -1,5 +1,11 @@
 # JackCode 🤖
 
+![Release Status](https://img.shields.io/badge/release-blocked-critical)
+![Typecheck](https://img.shields.io/badge/typecheck-failing-red)
+![Unit Tests](https://img.shields.io/badge/unit_tests-134%2F152_passing-orange)
+![Integration Tests](https://img.shields.io/badge/integration_tests-11%2F21_passing-orange)
+![E2E Tests](https://img.shields.io/badge/e2e-2%2F7_passing-red)
+
 > 一个独立的 AI 编程助手框架，原生兼容 JackClaw
 
 JackCode 是一个模块化的 AI 驱动代码开发框架，它将复杂的编程任务分解为 20 个专业化的协作模块，实现从代码理解到自动修复的完整工作流。
@@ -79,10 +85,14 @@ jackcode --resume               # 恢复上次会话
 
 ## 🛠️ 开发状态
 
-- ✅ 所有 20 个线程已完成实现
-- ✅ 每个模块都有单元测试
-- ✅ 核心 bug 已修复
-- 🔄 等待完整集成测试
+- ⚠️ 当前分支仍存在大量未完成改动，尚未达到可发布状态
+- ❌ `npm run typecheck` 未通过（存在大量 TypeScript 类型错误）
+- ⚠️ `npm test`：152 项中 134 项通过，18 项失败
+- ⚠️ `npm run test:integration`：21 项中 11 项通过，10 项失败
+- ❌ `npm run test:e2e`：7 项中 2 项通过，5 项失败
+- 🔄 需要先修复类型系统、Patch 引擎、Scanner/Session 接口漂移与 E2E 验证问题
+
+更多细节见：[PROJECT_STATUS.md](./PROJECT_STATUS.md)
 
 ---
 
