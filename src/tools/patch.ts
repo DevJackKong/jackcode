@@ -8,22 +8,23 @@ import { constants as fsConstants, promises as fs } from 'node:fs';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { spawn } from 'node:child_process';
 
-import {
-  type ChangeRequest,
-  type PatchPlan,
-  type Patch,
-  type Hunk,
-  type PatchResult,
-  type RollbackResult,
-  type DiffSummary,
-  type FileSummary,
-  type DiffStats,
-  type FailedPatch,
-  type PatchEngineConfig,
-  type PatchHistoryEntry,
-  type LineRange,
-  type ReversePatch,
-} from '../types/patch.ts';
+import type { ContextFragment } from '../types/context.js';
+import type {
+  ChangeRequest,
+  PatchPlan,
+  Patch,
+  Hunk,
+  PatchResult,
+  RollbackResult,
+  DiffSummary,
+  FileSummary,
+  DiffStats,
+  FailedPatch,
+  PatchEngineConfig,
+  PatchHistoryEntry,
+  LineRange,
+  ReversePatch,
+} from '../types/patch.js';
 
 type RiskLevel = 'low' | 'medium' | 'high' | 'critical';
 type ChangeType = 'added' | 'modified' | 'deleted';
@@ -33,7 +34,6 @@ interface FileState {
   exists: boolean;
   content: string;
   lines: string[];
-  isBinary: boolean;
   mode?: number;
 }
 
@@ -1053,4 +1053,20 @@ export async function buildPatchFromRequest(
 
   const afterContent = applyChangeRequestToContent(before, request);
   return createPatchFromStates(request, before, afterContent, mergedConfig);
+}
+
+export async function verifyWithBuild(
+  patch: Patch,
+  build: PatchBuildAdapter,
+): Promise<PatchVerificationResult> {
+  const verification = await verifyWithBuildAdapters([patch], { build, autoVerify: true });
+  return verification ?? { success: true, stage: 'build-test', output: '', errors: [] };
+}
+
+export function getContextFragment(patch: Patch): PatchContextFragment {
+  return patchContexts.get(patch.id)?.[0] ?? makeContextFragment(patch);
+}
+
+export function getPatchDependencies(patchId: string): string[] {
+  return [...(patchDependencyGraph.get(patchId) ?? [])];
 }
