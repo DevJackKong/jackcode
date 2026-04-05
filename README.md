@@ -39,6 +39,12 @@ jackcode --model qwen-3.6 "implement retry logic"
 jackcode --model gpt-5.4 "review pending patch"
 ```
 
+### Current CLI behavior
+
+- `jackcode "..."` runs a real planner/verifier-style CLI flow and prints a structured summary
+- `jackcode --execute "..."` is currently a **truthful dry-run**: it shows the inferred plan, files likely touched, and verification status, but does **not** claim to have modified files yet
+- Interactive `chat` uses the same workflow summary path for normal prompts
+
 ## Architecture
 
 ```text

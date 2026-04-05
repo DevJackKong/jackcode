@@ -300,10 +300,12 @@ export function renderError(error: Error | string, theme: Theme = 'auto'): strin
 }
 
 export function renderStatusLine(session: ChatSession, state: ChatState, theme: Theme = 'auto'): string {
+  const auditModel = 'gpt-5.4 audit';
   const segments = [
     `Session ${session.id}`,
     `Mode ${session.mode}`,
-    `Model ${session.config.defaultModel}`,
+    `Planner ${session.config.defaultModel}`,
+    `Verifier ${auditModel}`,
     `Messages ${session.messages.length}`,
     `Pending ${session.pendingChanges.length}`,
     state.isProcessing ? 'Busy' : 'Idle',
@@ -405,7 +407,7 @@ export function createSlashCommands(customCommands: SlashCommand[] = []): Map<st
     description: 'Show current session status',
     usage: '/status',
     handler: async (_args, session) => {
-      addMessage(session, 'system', `Session ${session.id}\nMode: ${session.mode}\nMessages: ${session.messages.length}\nPending changes: ${session.pendingChanges.length}\nModel: ${session.config.defaultModel}`);
+      addMessage(session, 'system', `Session ${session.id}\nMode: ${session.mode}\nMessages: ${session.messages.length}\nPending changes: ${session.pendingChanges.length}\nPlanner model: ${session.config.defaultModel}\nVerifier model: gpt-5.4 audit`);
     },
   });
 
@@ -701,6 +703,7 @@ export async function startRepl(session: ChatSession, options: StartReplOptions 
   };
 
   writeLine(`${colorize('JackCode', 'cyan', session.config.theme)} ${colorize('interactive chat', 'gray', session.config.theme)}`);
+  writeLine(colorize(`Planner: ${session.config.defaultModel} | Verifier: gpt-5.4 audit`, 'gray', session.config.theme));
   writeLine(renderer.renderStatus(session, state));
   writeLine(colorize('Type /help for commands. End a line with \\ for multi-line input.', 'gray', session.config.theme));
 
@@ -805,7 +808,7 @@ export async function startRepl(session: ChatSession, options: StartReplOptions 
 
         state.isProcessing = true;
         state.currentStream = new AbortController();
-        writeLine(renderer.renderProgress('Thinking'));
+        writeLine(renderer.renderProgress(session.mode === 'execute' ? 'Running workflow' : 'Planning workflow'));
 
         const response = await options.onUserMessage?.(rawInput, session);
         const assistantText = typeof response === 'string'
