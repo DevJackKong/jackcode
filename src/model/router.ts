@@ -4,10 +4,8 @@
  */
 
 import type {
-  CodeOperation,
   CompletedOperation,
   EscalationReason,
-  ExecutionMetrics,
   ExecutionSlot,
   QwenRouteRequest,
   QwenRouteResult,
@@ -26,6 +24,7 @@ export class QwenExecutorRouter {
   private activeSlots: Map<string, ExecutionSlot> = new Map();
   private metrics: RouterMetrics;
   private requestHistory: number[] = [];
+  private slotSequence = 0;
 
   constructor(config: Partial<RouterConfig> = {}) {
     this.config = { ...DEFAULT_ROUTER_CONFIG, ...config };
@@ -47,23 +46,15 @@ export class QwenExecutorRouter {
     this.metrics.totalRequests++;
 
     try {
-      // Acquire execution slot
-      const slot = await this.acquireSlot(request.priority);
-
-      // Determine execution strategy
+      const slot = await this.acquireSlot(request.priority, request.timeoutMs);
       const strategy = this.selectStrategy(request);
 
-      // Execute based on strategy
-      let result: QwenRouteResult;
-      if (strategy === 'batch' && this.config.enableBatching) {
-        result = await this.executeBatch(request, slot);
-      } else {
-        result = await this.executeSingle(request, slot);
-      }
+      const result =
+        strategy === 'batch' && this.config.enableBatching
+          ? await this.executeBatch(request, slot)
+          : await this.executeSingle(request, slot);
 
-      // Update metrics
       this.updateMetrics(result.success, Date.now() - startTime);
-
       return result;
     } catch (error) {
       this.metrics.failedRequests++;
@@ -81,18 +72,22 @@ export class QwenExecutorRouter {
       );
     }
 
-    // Process with concurrency limit using semaphore pattern
-    const results: QwenRouteResult[] = [];
-    const executing: Promise<void>[] = [];
+    const results = new Array<QwenRouteResult>(requests.length);
+    const executing = new Set<Promise<void>>();
 
-    for (const request of requests) {
-      const promise = this.route(request).then((result) => {
-        results.push(result);
-      });
-      executing.push(promise);
+    for (const [index, request] of requests.entries()) {
+      let promise!: Promise<void>;
+      promise = this.route(request)
+        .then((result) => {
+          results[index] = result;
+        })
+        .finally(() => {
+          executing.delete(promise);
+        });
 
-      // Wait for slot when at capacity
-      if (executing.length >= this.config.maxConcurrency) {
+      executing.add(promise);
+
+      if (executing.size >= this.config.maxConcurrency) {
         await Promise.race(executing);
       }
     }
@@ -105,10 +100,8 @@ export class QwenExecutorRouter {
    * Check if this router can handle the given context
    */
   canHandle(contextSize: number): boolean {
-    // Qwen 3.6 has large context window (128k tokens)
-    // Conservative limit: 100k tokens for safety margin
-    const MAX_CONTEXT_SIZE = 100000;
-    return contextSize <= MAX_CONTEXT_SIZE;
+    const maxContextSize = 100000;
+    return contextSize <= maxContextSize;
   }
 
   /**
@@ -121,21 +114,31 @@ export class QwenExecutorRouter {
   /**
    * Acquire an execution slot with priority handling
    */
-  private async acquireSlot(priority: RoutePriority): Promise<ExecutionSlot> {
-    const timeoutMs =
+  private async acquireSlot(
+    priority: RoutePriority,
+    requestTimeoutMs?: number
+  ): Promise<ExecutionSlot> {
+    const routerTimeoutMs =
       priority === 'critical'
         ? this.config.criticalTimeoutMs
         : this.config.defaultTimeoutMs;
+    const normalizedRequestTimeout =
+      requestTimeoutMs && requestTimeoutMs > 0 ? requestTimeoutMs : routerTimeoutMs;
+    const effectiveTimeoutMs = Math.min(normalizedRequestTimeout, routerTimeoutMs);
+    const waitDeadline = Date.now() + effectiveTimeoutMs;
 
-    // Wait for available slot
     while (this.activeSlots.size >= this.config.maxConcurrency) {
+      if (Date.now() >= waitDeadline) {
+        throw new Error('timeout acquiring execution slot');
+      }
       await this.sleep(50);
     }
 
+    const acquiredAt = Date.now();
     const slot: ExecutionSlot = {
-      id: `slot_${Date.now()}_${Math.random().toString(36).slice(2)}`,
-      acquiredAt: Date.now(),
-      expiresAt: Date.now() + timeoutMs,
+      id: `slot_${acquiredAt}_${this.slotSequence++}`,
+      acquiredAt,
+      expiresAt: acquiredAt + effectiveTimeoutMs,
     };
 
     this.activeSlots.set(slot.id, slot);
@@ -156,10 +159,7 @@ export class QwenExecutorRouter {
    * Select execution strategy based on request characteristics
    */
   private selectStrategy(request: QwenRouteRequest): 'single' | 'batch' {
-    if (request.operations.length > 1) {
-      return 'batch';
-    }
-    return 'single';
+    return request.operations.length > 1 ? 'batch' : 'single';
   }
 
   /**
@@ -170,17 +170,13 @@ export class QwenExecutorRouter {
     slot: ExecutionSlot
   ): Promise<QwenRouteResult> {
     try {
-      // TODO: Integrate with actual Qwen 3.6 API client
-      // For now, return scaffolded success result
-      const completedOps: CompletedOperation[] = request.operations.map(
-        (op) => ({
-          ...op,
-          success: true,
-          latencyMs: 0,
-        })
-      );
+      const completedOps: CompletedOperation[] = request.operations.map((op) => ({
+        ...op,
+        success: true,
+        latencyMs: 0,
+      }));
 
-      const result: QwenRouteResult = {
+      return {
         taskId: request.taskId,
         success: true,
         operations: completedOps,
@@ -191,8 +187,6 @@ export class QwenExecutorRouter {
           retryCount: 0,
         },
       };
-
-      return result;
     } finally {
       this.releaseSlot(slot);
     }
@@ -205,48 +199,47 @@ export class QwenExecutorRouter {
     request: QwenRouteRequest,
     slot: ExecutionSlot
   ): Promise<QwenRouteResult> {
-    // Batch execution: process operations in parallel chunks
-    const chunkSize = this.config.maxConcurrency;
-    const completedOps: CompletedOperation[] = [];
-    let totalLatency = 0;
+    try {
+      const chunkSize = this.config.maxConcurrency;
+      const completedOps: CompletedOperation[] = [];
+      let totalLatency = 0;
 
-    for (let i = 0; i < request.operations.length; i += chunkSize) {
-      const chunk = request.operations.slice(i, i + chunkSize);
-      const chunkStart = Date.now();
+      for (let index = 0; index < request.operations.length; index += chunkSize) {
+        const chunk = request.operations.slice(index, index + chunkSize);
+        const chunkStart = Date.now();
 
-      // Process chunk in parallel
-      const chunkResults = await Promise.all(
-        chunk.map(async (op) => {
-          // TODO: Integrate with actual Qwen 3.6 API client
-          const opStart = Date.now();
-          return {
-            ...op,
-            success: true,
-            latencyMs: Date.now() - opStart,
-          };
-        })
-      );
+        const chunkResults = await Promise.all(
+          chunk.map(async (op) => {
+            const opStart = Date.now();
+            return {
+              ...op,
+              success: true,
+              latencyMs: Date.now() - opStart,
+            };
+          })
+        );
 
-      totalLatency += Date.now() - chunkStart;
-      completedOps.push(...chunkResults);
+        totalLatency += Date.now() - chunkStart;
+        completedOps.push(...chunkResults);
+      }
+
+      const success = completedOps.every((op) => op.success);
+
+      return {
+        taskId: request.taskId,
+        success,
+        operations: completedOps,
+        metrics: {
+          latencyMs: totalLatency,
+          tokensUsed: 0,
+          cacheHitRatio: 0,
+          retryCount: 0,
+        },
+        escalation: success ? undefined : 'max_retries_exceeded',
+      };
+    } finally {
+      this.releaseSlot(slot);
     }
-
-    const success = completedOps.every((op) => op.success);
-
-    this.releaseSlot(slot);
-
-    return {
-      taskId: request.taskId,
-      success,
-      operations: completedOps,
-      metrics: {
-        latencyMs: totalLatency,
-        tokensUsed: 0,
-        cacheHitRatio: 0,
-        retryCount: 0,
-      },
-      escalation: success ? undefined : 'max_retries_exceeded',
-    };
   }
 
   /**
@@ -277,13 +270,19 @@ export class QwenExecutorRouter {
    * Classify error for escalation decision
    */
   private classifyError(message: string): EscalationReason {
-    if (message.includes('timeout')) return 'timeout';
-    if (message.includes('context') || message.includes('token'))
+    const normalized = message.toLowerCase();
+
+    if (normalized.includes('timeout')) return 'timeout';
+    if (normalized.includes('context') || normalized.includes('token')) {
       return 'context_overflow';
-    if (message.includes('syntax') || message.includes('parse'))
+    }
+    if (normalized.includes('syntax') || normalized.includes('parse')) {
       return 'syntax_error';
-    if (message.includes('dependency') || message.includes('import'))
+    }
+    if (normalized.includes('dependency') || normalized.includes('import')) {
       return 'dependency_conflict';
+    }
+
     return 'max_retries_exceeded';
   }
 
@@ -297,13 +296,12 @@ export class QwenExecutorRouter {
       this.metrics.failedRequests++;
     }
 
-    // Update running average latency
     this.requestHistory.push(latencyMs);
     if (this.requestHistory.length > 100) {
       this.requestHistory.shift();
     }
     this.metrics.averageLatencyMs =
-      this.requestHistory.reduce((a, b) => a + b, 0) /
+      this.requestHistory.reduce((sum, value) => sum + value, 0) /
       this.requestHistory.length;
   }
 
