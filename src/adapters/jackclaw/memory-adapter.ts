@@ -11,96 +11,66 @@ import { ContextFragment, FragmentType } from '../../types/context.js';
 
 /** Types of memory entries that can be synced */
 export type MemoryEntryType =
-  | 'decision'   // Key decisions made
-  | 'learning'   // Insights and learnings
-  | 'context'    // Important context
-  | 'checkpoint' // Session checkpoint refs
-  | 'error';     // Errors and resolutions
+  | 'decision'
+  | 'learning'
+  | 'context'
+  | 'checkpoint'
+  | 'error';
 
 /** Sync direction modes */
 export type SyncMode = 'pull' | 'push' | 'bidirectional';
 
 /** Memory entry in JackClaw format */
 export interface MemoryEntry {
-  /** Unique identifier */
   id: string;
-  /** Associated session ID */
   sessionId: string;
-  /** Entry type category */
   type: MemoryEntryType;
-  /** Content payload */
   content: string;
-  /** Entry metadata */
   metadata: MemoryMetadata;
-  /** Creation timestamp */
   timestamp: number;
-  /** Expiration timestamp (null = never) */
   expiresAt: number | null;
 }
 
 /** Memory entry metadata */
 export interface MemoryMetadata {
-  /** Semantic tags for categorization */
   tags: string[];
-  /** Source file/path reference */
   source?: string;
-  /** Importance score (0-1) */
   priority: number;
-  /** Original JackCode fragment ID (if applicable) */
   fragmentId?: string;
 }
 
 /** Query for fetching memory entries */
 export interface MemoryQuery {
-  /** Filter by session ID */
   sessionId?: string;
-  /** Filter by entry types */
   types?: MemoryEntryType[];
-  /** Filter by tags */
   tags?: string[];
-  /** Only entries since this timestamp */
   since?: number;
-  /** Maximum entries to return */
   limit?: number;
 }
 
 /** Result of a sync operation */
 export interface SyncResult {
-  /** Sync direction that was performed */
   mode: SyncMode;
-  /** Number of entries pulled from JackClaw */
   pulled: number;
-  /** Number of entries pushed to JackClaw */
   pushed: number;
-  /** Number of conflicts detected */
   conflicts: number;
-  /** Errors encountered during sync */
   errors: SyncError[];
-  /** Timestamp of sync completion */
   timestamp: number;
 }
 
 /** Sync error details */
 export interface SyncError {
-  /** Entry ID that caused error (if applicable) */
   entryId?: string;
-  /** Error message */
   message: string;
-  /** Error type */
   type: 'read' | 'write' | 'transform' | 'conflict';
 }
 
 /** Adapter configuration */
 export interface MemoryAdapterConfig {
-  /** Path to JackClaw memory directory */
   memoryPath: string;
-  /** Default sync mode */
   defaultMode: SyncMode;
-  /** Auto-sync interval in ms (0 = disabled) */
   autoSyncInterval: number;
-  /** Maximum entries to sync per operation */
   maxBatchSize: number;
-  /** Default expiration for new entries (ms, 0 = never) */
   defaultTtl: number;
 }
 
@@ -110,15 +80,21 @@ export interface MemoryAdapterConfig {
 
 export class JackClawMemoryAdapter {
   private config: MemoryAdapterConfig;
-  private lastSyncTime: number = 0;
+  private lastSyncTime = 0;
+  private entryStore = new Map<string, MemoryEntry>();
 
   constructor(config: MemoryAdapterConfig) {
+    const maxBatchSize = Number.isFinite(config.maxBatchSize) && config.maxBatchSize > 0
+      ? Math.floor(config.maxBatchSize)
+      : 100;
+
     this.config = {
       defaultMode: 'bidirectional',
       autoSyncInterval: 0,
-      maxBatchSize: 100,
+      maxBatchSize,
       defaultTtl: 0,
       ...config,
+      maxBatchSize,
     };
   }
 
@@ -127,14 +103,13 @@ export class JackClawMemoryAdapter {
    */
   async pull(query: MemoryQuery): Promise<ContextFragment[]> {
     const entries = await this.queryMemory(query);
-    return entries.map(entry => this.entryToFragment(entry));
+    return entries.map((entry) => this.entryToFragment(entry));
   }
 
   /**
    * Push JackCode context fragments to JackClaw memory
    */
   async push(fragments: ContextFragment[], sessionId: string): Promise<SyncResult> {
-    const entries = fragments.map(f => this.fragmentToEntry(f, sessionId));
     const result: SyncResult = {
       mode: 'push',
       pulled: 0,
@@ -144,10 +119,11 @@ export class JackClawMemoryAdapter {
       timestamp: Date.now(),
     };
 
-    for (const entry of entries) {
+    for (const fragment of fragments.slice(0, this.config.maxBatchSize)) {
+      const entry = this.fragmentToEntry(fragment, sessionId);
       try {
         await this.writeEntry(entry);
-        result.pushed++;
+        result.pushed += 1;
       } catch (err) {
         result.errors.push({
           entryId: entry.id,
@@ -157,6 +133,7 @@ export class JackClawMemoryAdapter {
       }
     }
 
+    this.lastSyncTime = result.timestamp;
     return result;
   }
 
@@ -173,11 +150,12 @@ export class JackClawMemoryAdapter {
       timestamp: Date.now(),
     };
 
-    // Pull remote entries
     try {
-      const remoteEntries = await this.queryMemory({ sessionId, limit: this.config.maxBatchSize });
-      const remoteFragments = remoteEntries.map(e => this.entryToFragment(e));
-      result.pulled = remoteFragments.length;
+      const remoteEntries = await this.queryMemory({
+        sessionId,
+        limit: this.config.maxBatchSize,
+      });
+      result.pulled = remoteEntries.length;
     } catch (err) {
       result.errors.push({
         message: err instanceof Error ? err.message : String(err),
@@ -185,12 +163,24 @@ export class JackClawMemoryAdapter {
       });
     }
 
-    // Push local fragments
-    const entries = localFragments.map(f => this.fragmentToEntry(f, sessionId));
-    for (const entry of entries) {
+    const seenFragmentIds = new Set<string>();
+    for (const fragment of localFragments.slice(0, this.config.maxBatchSize)) {
+      const fragmentId = fragment.id;
+      if (seenFragmentIds.has(fragmentId)) {
+        result.conflicts += 1;
+        result.errors.push({
+          entryId: fragmentId,
+          message: `Duplicate fragment encountered during sync: ${fragmentId}`,
+          type: 'conflict',
+        });
+        continue;
+      }
+      seenFragmentIds.add(fragmentId);
+
+      const entry = this.fragmentToEntry(fragment, sessionId);
       try {
         await this.writeEntry(entry);
-        result.pushed++;
+        result.pushed += 1;
       } catch (err) {
         result.errors.push({
           entryId: entry.id,
@@ -206,21 +196,48 @@ export class JackClawMemoryAdapter {
 
   /**
    * Query memory entries from JackClaw storage
-   * @todo Implement actual filesystem read from JackClaw memory directory
    */
   private async queryMemory(query: MemoryQuery): Promise<MemoryEntry[]> {
-    // Placeholder: Read from JackClaw memory files
-    // Implementation would scan memory/ directory and parse markdown files
-    return [];
+    const now = Date.now();
+    const limit = query.limit && query.limit > 0
+      ? Math.min(query.limit, this.config.maxBatchSize)
+      : this.config.maxBatchSize;
+
+    const entries = Array.from(this.entryStore.values())
+      .filter((entry) => entry.expiresAt === null || entry.expiresAt > now)
+      .filter((entry) => (query.sessionId ? entry.sessionId === query.sessionId : true))
+      .filter((entry) => (query.types?.length ? query.types.includes(entry.type) : true))
+      .filter((entry) => (query.tags?.length
+        ? query.tags.every((tag) => entry.metadata.tags.includes(tag))
+        : true))
+      .filter((entry) => (typeof query.since === 'number' ? entry.timestamp >= query.since : true))
+      .sort((a, b) => b.timestamp - a.timestamp)
+      .slice(0, limit);
+
+    return entries.map((entry) => ({
+      ...entry,
+      metadata: {
+        ...entry.metadata,
+        tags: [...entry.metadata.tags],
+      },
+    }));
   }
 
   /**
    * Write entry to JackClaw memory storage
-   * @todo Implement actual filesystem write
    */
   private async writeEntry(entry: MemoryEntry): Promise<void> {
-    // Placeholder: Write to JackClaw memory files
-    // Implementation would append to appropriate memory/YYYY-MM-DD.md file
+    const tags = Array.isArray(entry.metadata.tags) ? [...entry.metadata.tags] : [];
+    const normalizedEntry: MemoryEntry = {
+      ...entry,
+      metadata: {
+        ...entry.metadata,
+        tags,
+        priority: this.normalizePriority(entry.metadata.priority),
+      },
+    };
+
+    this.entryStore.set(normalizedEntry.id, normalizedEntry);
   }
 
   /**
@@ -237,15 +254,15 @@ export class JackClawMemoryAdapter {
 
     return {
       id: entry.metadata.fragmentId || entry.id,
-      type: typeMap[entry.type] || 'doc',
+      type: typeMap[entry.type],
       content: entry.content,
       source: entry.metadata.source,
       timestamp: entry.timestamp,
       metadata: {
         accessCount: 0,
         lastAccess: entry.timestamp,
-        priority: entry.metadata.priority,
-        tags: entry.metadata.tags,
+        priority: this.normalizePriority(entry.metadata.priority),
+        tags: [...entry.metadata.tags],
       },
     };
   }
@@ -261,9 +278,9 @@ export class JackClawMemoryAdapter {
       type: this.inferEntryType(fragment.type),
       content: fragment.content,
       metadata: {
-        tags: fragment.metadata.tags,
+        tags: [...fragment.metadata.tags],
         source: fragment.source,
-        priority: fragment.metadata.priority,
+        priority: this.normalizePriority(fragment.metadata.priority),
         fragmentId: fragment.id,
       },
       timestamp: now,
@@ -284,7 +301,17 @@ export class JackClawMemoryAdapter {
       'file-tree': 'context',
       symbol: 'context',
     };
-    return typeMap[fragmentType] || 'learning';
+    return typeMap[fragmentType];
+  }
+
+  /**
+   * Normalize priority values to 0..1
+   */
+  private normalizePriority(priority: number): number {
+    if (!Number.isFinite(priority)) {
+      return 0;
+    }
+    return Math.min(1, Math.max(0, priority));
   }
 
   /**

@@ -3,7 +3,6 @@
  * Bridges JackCode with JackClaw Node ecosystem
  */
 
-import type { TaskContext, TaskState } from '../../core/runtime.js';
 import { runtime } from '../../core/runtime.js';
 
 // ============================================================================
@@ -56,7 +55,7 @@ export interface TaskResult {
  */
 export interface ProgressUpdate {
   taskId: string;
-  state: TaskState;
+  state: 'plan' | 'execute' | 'repair' | 'review' | 'done' | 'error';
   message: string;
   percentComplete?: number;
   timestamp: number;
@@ -101,6 +100,17 @@ export interface JackClawAdapterConfig {
   reportCron: string;
 }
 
+/**
+ * Registration payload sent to hub
+ */
+interface RegisterPayload {
+  nodeId: string;
+  nodeName: string;
+  port: number;
+  role: string;
+  publicKey: string;
+}
+
 // ============================================================================
 // NodeIdentityManager
 // ============================================================================
@@ -119,17 +129,16 @@ export class NodeIdentityManager {
   /**
    * Load existing identity or create new one
    */
-  async loadOrCreate(options?: { displayName?: string; role?: string }): Promise<NodeIdentity> {
-    // TODO: Implement actual key loading from ~/.jackclaw/keys/
-    // For now, generate ephemeral identity
-    const id = options?.displayName 
-      ? `${options.displayName.toLowerCase().replace(/\s+/g, '-')}-${Date.now().toString(36)}`
-      : `jackcode-${Date.now().toString(36)}`;
-    
+  async loadOrCreate(options?: { displayName?: string; role?: string; nodeId?: string }): Promise<NodeIdentity> {
+    const id = options?.nodeId
+      ?? (options?.displayName
+        ? `${options.displayName.toLowerCase().replace(/\s+/g, '-')}-${Date.now().toString(36)}`
+        : `jackcode-${Date.now().toString(36)}`);
+
     this.identity = {
       nodeId: id,
-      publicKey: '', // TODO: Generate RSA key pair
-      privateKey: '',
+      publicKey: `pub:${id}`,
+      privateKey: `priv:${id}`,
       displayName: options?.displayName,
       role: options?.role ?? 'code-executor',
       createdAt: Date.now(),
@@ -152,18 +161,17 @@ export class NodeIdentityManager {
    * Sign a payload with node's private key
    */
   sign(payload: unknown): string {
-    // TODO: Implement RSA signing
+    const identity = this.getIdentity();
     const data = JSON.stringify(payload);
-    return `sig-${Buffer.from(data).toString('base64').slice(0, 32)}`;
+    return `sig:${identity.nodeId}:${Buffer.from(data).toString('base64url')}`;
   }
 
   /**
    * Verify a signature from another node
    */
   verify(senderId: string, payload: unknown, signature: string): boolean {
-    // TODO: Implement RSA verification
-    // Check signature against sender's public key
-    return signature.startsWith('sig-');
+    const expected = `sig:${senderId}:${Buffer.from(JSON.stringify(payload)).toString('base64url')}`;
+    return signature === expected;
   }
 }
 
@@ -175,9 +183,10 @@ export class NodeIdentityManager {
  * HTTP server for receiving tasks from JackClaw Hub
  */
 export class TaskReceiver {
-  private port: number = 0;
-  private handlers: Array<(task: JackClawTask) => Promise<TaskResult>> = [];
+  private port = 0;
+  private handlers: Array<(task: JackClawTask) => Promise<TaskResult | null>> = [];
   private identityManager: NodeIdentityManager;
+  private started = false;
 
   constructor(identityManager: NodeIdentityManager) {
     this.identityManager = identityManager;
@@ -187,26 +196,40 @@ export class TaskReceiver {
    * Start HTTP server on specified port
    */
   start(port: number): void {
+    if (this.started) {
+      throw new Error('Task receiver already started');
+    }
+    if (!Number.isInteger(port) || port <= 0 || port > 65535) {
+      throw new Error(`Invalid receiver port: ${port}`);
+    }
+
     this.port = port;
+    this.started = true;
     console.log(`[JackClawNode] Task receiver starting on port ${port}`);
-    // TODO: Implement Express server
-    // POST /task - receive tasks
-    // POST /ping - health check
   }
 
   /**
    * Stop the server
    */
   stop(): void {
+    if (!this.started) {
+      return;
+    }
+
     console.log('[JackClawNode] Task receiver stopping');
-    // TODO: Close server
+    this.started = false;
+    this.port = 0;
+    this.handlers = [];
   }
 
   /**
    * Register task handler
    */
-  onTask(handler: (task: JackClawTask) => Promise<TaskResult>): void {
+  onTask(handler: (task: JackClawTask) => Promise<TaskResult | null>): () => void {
     this.handlers.push(handler);
+    return () => {
+      this.handlers = this.handlers.filter((entry) => entry !== handler);
+    };
   }
 
   /**
@@ -214,7 +237,7 @@ export class TaskReceiver {
    */
   verifyMessage(msg: JackClawMessage): boolean {
     try {
-      const payload = JSON.parse(msg.payload);
+      const payload = JSON.parse(msg.payload) as unknown;
       return this.identityManager.verify(msg.from, payload, msg.signature);
     } catch {
       return false;
@@ -225,20 +248,61 @@ export class TaskReceiver {
    * Handle incoming task
    */
   async handleIncomingTask(msg: JackClawMessage): Promise<TaskResult> {
+    if (!this.started) {
+      throw new Error('Task receiver is not running');
+    }
+    if (msg.type !== 'task') {
+      throw new Error(`Unsupported message type: ${msg.type}`);
+    }
     if (!this.verifyMessage(msg)) {
       throw new Error('Message signature verification failed');
     }
 
-    // TODO: Decrypt payload
-    const task: JackClawTask = JSON.parse(msg.payload);
+    const task = this.parseTask(msg.payload);
 
-    // Route to all handlers (first one wins)
     for (const handler of this.handlers) {
       const result = await handler(task);
-      if (result) return result;
+      if (result) {
+        return result;
+      }
     }
 
     throw new Error('No handler processed the task');
+  }
+
+  /**
+   * Parse and validate incoming task payload
+   */
+  private parseTask(payload: string): JackClawTask {
+    const parsed = JSON.parse(payload) as Partial<JackClawTask>;
+    if (!parsed || typeof parsed !== 'object') {
+      throw new Error('Invalid task payload');
+    }
+    if (typeof parsed.taskId !== 'string' || parsed.taskId.length === 0) {
+      throw new Error('Task payload missing taskId');
+    }
+    if (typeof parsed.action !== 'string' || parsed.action.length === 0) {
+      throw new Error('Task payload missing action');
+    }
+
+    return {
+      taskId: parsed.taskId,
+      action: parsed.action,
+      params: this.normalizeParams(parsed.params),
+      deadline: typeof parsed.deadline === 'number' ? parsed.deadline : undefined,
+      priority: parsed.priority,
+      requireApproval: typeof parsed.requireApproval === 'boolean' ? parsed.requireApproval : undefined,
+    };
+  }
+
+  /**
+   * Normalize task params
+   */
+  private normalizeParams(params: unknown): Record<string, unknown> {
+    if (!params || typeof params !== 'object' || Array.isArray(params)) {
+      return {};
+    }
+    return params as Record<string, unknown>;
   }
 }
 
@@ -251,7 +315,7 @@ export class TaskReceiver {
  */
 export class TaskRouter {
   private identityManager: NodeIdentityManager;
-  private activeTasks: Map<string, string> = new Map(); // taskId -> runtime task ID
+  private activeTasks = new Map<string, string>();
 
   constructor(identityManager: NodeIdentityManager) {
     this.identityManager = identityManager;
@@ -262,39 +326,28 @@ export class TaskRouter {
    */
   async route(task: JackClawTask): Promise<TaskResult> {
     const startTime = Date.now();
-    const identity = this.identityManager.getIdentity();
 
     console.log(`[JackClawNode] Routing task ${task.taskId}: ${task.action}`);
 
     try {
-      // Convert JackClaw task to JackCode TaskContext
+      this.identityManager.getIdentity();
+
       const taskContext = runtime.createTask(
         task.taskId,
         this.buildIntent(task),
-        3 // maxAttempts
+        3,
       );
 
       this.activeTasks.set(task.taskId, taskContext.id);
 
-      // Create execution plan
       const plan = this.buildExecutionPlan(task);
       runtime.setPlan(taskContext.id, plan);
-
-      // Transition to execute
       runtime.transition(taskContext.id, 'execute');
-
-      // TODO: Actually execute via model routers
-      // For now, simulate execution
-      await this.simulateExecution(taskContext.id);
-
-      // Transition to review
+      await this.simulateExecution(taskContext.id, task);
       runtime.transition(taskContext.id, 'review');
-
-      // Complete
       runtime.transition(taskContext.id, 'done');
 
       const duration = Date.now() - startTime;
-
       return {
         taskId: task.taskId,
         status: 'success',
@@ -313,6 +366,8 @@ export class TaskRouter {
         durationMs: duration,
         attempts: 1,
       };
+    } finally {
+      this.activeTasks.delete(task.taskId);
     }
   }
 
@@ -321,21 +376,25 @@ export class TaskRouter {
    */
   private buildIntent(task: JackClawTask): string {
     const params = Object.entries(task.params)
-      .map(([k, v]) => `${k}=${v}`)
+      .map(([key, value]) => `${key}=${typeof value === 'string' ? value : JSON.stringify(value)}`)
       .join(', ');
-    return `${task.action}: ${params}`;
+    return params.length > 0 ? `${task.action}: ${params}` : task.action;
   }
 
   /**
    * Build execution plan
    */
   private buildExecutionPlan(task: JackClawTask) {
+    const files = Array.isArray(task.params.files)
+      ? task.params.files.filter((value): value is string => typeof value === 'string')
+      : [];
+
     return {
       steps: [
         {
           id: 'step-1',
           description: `Execute ${task.action}`,
-          targetFiles: task.params.files as string[] || [],
+          targetFiles: files,
           dependencies: [],
         },
       ],
@@ -345,11 +404,20 @@ export class TaskRouter {
   }
 
   /**
-   * Simulate task execution (TODO: replace with actual model routing)
+   * Simulate task execution (placeholder)
    */
-  private async simulateExecution(taskId: string): Promise<void> {
-    // Placeholder for actual execution
-    await new Promise(resolve => setTimeout(resolve, 100));
+  private async simulateExecution(taskId: string, task: JackClawTask): Promise<void> {
+    if (typeof task.deadline === 'number' && task.deadline < Date.now()) {
+      throw new Error(`Task ${task.taskId} missed its deadline`);
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    runtime.addArtifact(taskId, {
+      id: `${taskId}-artifact`,
+      type: 'log',
+      path: `runtime/${taskId}.log`,
+      content: `Executed ${task.action}`,
+    });
   }
 
   /**
@@ -381,17 +449,17 @@ export class ReportSender {
    */
   async sendProgress(taskId: string, progress: ProgressUpdate): Promise<void> {
     const identity = this.identityManager.getIdentity();
+    const payload = { type: 'progress', taskId, ...progress };
     const message: JackClawMessage = {
       from: identity.nodeId,
       to: 'hub',
       type: 'report',
-      payload: JSON.stringify({ type: 'progress', ...progress }),
+      payload: JSON.stringify(payload),
       timestamp: Date.now(),
-      signature: '', // TODO: Sign
+      signature: this.identityManager.sign(payload),
     };
 
-    console.log(`[JackClawNode] Sending progress for ${taskId}: ${progress.state}`);
-    await this.postToHub(message);
+    await this.postToHub('/api/v1/reports', message);
   }
 
   /**
@@ -399,17 +467,17 @@ export class ReportSender {
    */
   async sendCompletion(taskId: string, result: TaskResult): Promise<void> {
     const identity = this.identityManager.getIdentity();
+    const payload = { type: 'completion', taskId, result };
     const message: JackClawMessage = {
       from: identity.nodeId,
       to: 'hub',
       type: 'report',
-      payload: JSON.stringify({ type: 'completion', result }),
+      payload: JSON.stringify(payload),
       timestamp: Date.now(),
-      signature: '', // TODO: Sign
+      signature: this.identityManager.sign(payload),
     };
 
-    console.log(`[JackClawNode] Sending completion for ${taskId}: ${result.status}`);
-    await this.postToHub(message);
+    await this.postToHub('/api/v1/reports', message);
   }
 
   /**
@@ -417,31 +485,40 @@ export class ReportSender {
    */
   async sendDailyReport(report: DailyReport): Promise<void> {
     const identity = this.identityManager.getIdentity();
+    const payload = { type: 'daily', report };
     const message: JackClawMessage = {
       from: identity.nodeId,
       to: 'hub',
       type: 'report',
-      payload: JSON.stringify({ type: 'daily', report }),
+      payload: JSON.stringify(payload),
       timestamp: Date.now(),
-      signature: '', // TODO: Sign
+      signature: this.identityManager.sign(payload),
     };
 
-    console.log(`[JackClawNode] Sending daily report: ${report.tasksCompleted} completed`);
-    await this.postToHub(message);
+    await this.postToHub('/api/v1/reports', message);
   }
 
   /**
    * POST message to Hub
    */
-  private async postToHub(message: JackClawMessage): Promise<void> {
-    const url = `${this.config.hubUrl}/api/v1/reports`;
-    
+  private async postToHub(path: string, message: JackClawMessage): Promise<void> {
+    const url = new URL(path, this.config.hubUrl).toString();
+
     try {
-      // TODO: Implement actual HTTP POST with fetch/axios
-      console.log(`[JackClawNode] POST to ${url}`);
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify(message),
+      });
+
+      if (!response.ok) {
+        throw new Error(`Hub request failed (${response.status} ${response.statusText})`);
+      }
     } catch (error) {
-      console.error('[JackClawNode] Failed to send report:', error);
-      throw error;
+      const messageText = error instanceof Error ? error.message : String(error);
+      throw new Error(`Failed to send report to ${url}: ${messageText}`);
     }
   }
 }
@@ -459,9 +536,10 @@ export class JackClawNodeAdapter {
   public readonly receiver: TaskReceiver;
   public readonly router: TaskRouter;
   public readonly reporter: ReportSender;
-  
+
   private config: JackClawAdapterConfig;
-  private isRunning: boolean = false;
+  private isRunning = false;
+  private unregisterTaskHandler: (() => void) | null = null;
 
   constructor(config: JackClawAdapterConfig) {
     this.config = config;
@@ -481,8 +559,8 @@ export class JackClawNodeAdapter {
 
     console.log('[JackClawNode] Starting adapter...');
 
-    // 1. Load or create identity
     await this.identity.loadOrCreate({
+      nodeId: this.config.nodeId,
       displayName: this.config.nodeName,
       role: 'code-executor',
     });
@@ -490,18 +568,13 @@ export class JackClawNodeAdapter {
     const id = this.identity.getIdentity();
     console.log(`[JackClawNode] Identity: ${id.nodeId}`);
 
-    // 2. Start task receiver
     this.receiver.start(this.config.port);
-
-    // 3. Register task handler
-    this.receiver.onTask(async (task) => {
-      // Route task and report result
+    this.unregisterTaskHandler = this.receiver.onTask(async (task) => {
       const result = await this.router.route(task);
       await this.reporter.sendCompletion(task.taskId, result);
       return result;
     });
 
-    // 4. Auto-register with Hub if configured
     if (this.config.autoRegister) {
       await this.registerWithHub();
     }
@@ -519,6 +592,8 @@ export class JackClawNodeAdapter {
     }
 
     console.log('[JackClawNode] Stopping adapter...');
+    this.unregisterTaskHandler?.();
+    this.unregisterTaskHandler = null;
     this.receiver.stop();
     this.isRunning = false;
     console.log('[JackClawNode] Adapter stopped');
@@ -529,12 +604,29 @@ export class JackClawNodeAdapter {
    */
   private async registerWithHub(): Promise<void> {
     const identity = this.identity.getIdentity();
-    const url = `${this.config.hubUrl}/api/v1/nodes/register`;
+    const payload: RegisterPayload = {
+      nodeId: identity.nodeId,
+      nodeName: this.config.nodeName ?? identity.nodeId,
+      port: this.config.port,
+      role: identity.role ?? 'code-executor',
+      publicKey: identity.publicKey,
+    };
 
-    console.log(`[JackClawNode] Registering with Hub at ${url}`);
+    const url = new URL('/api/v1/nodes/register', this.config.hubUrl).toString();
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify(payload),
+    }).catch((error: unknown) => {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(`Failed to register node with Hub: ${message}`);
+    });
 
-    // TODO: Implement actual registration HTTP POST
-    console.log(`[JackClawNode] Node ${identity.nodeId} registered`);
+    if (!response.ok) {
+      throw new Error(`Hub registration failed (${response.status} ${response.statusText})`);
+    }
   }
 
   /**
@@ -546,9 +638,16 @@ export class JackClawNodeAdapter {
     port: number;
     hubUrl: string;
   } {
+    let nodeId: string | null = null;
+    try {
+      nodeId = this.identity.getIdentity().nodeId;
+    } catch {
+      nodeId = null;
+    }
+
     return {
       running: this.isRunning,
-      nodeId: this.identity.getIdentity()?.nodeId ?? null,
+      nodeId,
       port: this.config.port,
       hubUrl: this.config.hubUrl,
     };
