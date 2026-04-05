@@ -2,7 +2,7 @@
  * JackCode CLI Type Definitions
  */
 
-export type ModelTier = 'qwen-3.6' | 'deepseek' | 'gpt54';
+export type ModelTier = 'qwen-3.6' | 'gpt-5.4';
 
 export type CLIMode = 'chat' | 'oneshot' | 'execute' | 'help' | 'version';
 

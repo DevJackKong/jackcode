@@ -187,8 +187,8 @@ test('built-in save/load/model/theme/review/history commands mutate session', as
     exit: () => undefined,
   };
 
-  await executeSlashCommand('model', ['deepseek'], ctx);
-  assert.equal(session.config.defaultModel, 'deepseek');
+  await executeSlashCommand('model', ['gpt-5.4'], ctx);
+  assert.equal(session.config.defaultModel, 'gpt-5.4');
 
   await executeSlashCommand('theme', ['dark'], ctx);
   assert.equal(session.config.theme, 'dark');

@@ -201,7 +201,7 @@ Usage:
 Options:
   -h, --help                      Show this help message
   -v, --version                   Show version
-  -m, --model <tier>              Set default model tier (qwen-3.6/deepseek/gpt54)
+  -m, --model <tier>              Set default model tier (qwen-3.6/gpt-5.4)
   -e, --execute                   Execute mode: apply changes immediately
   --no-stream                     Disable streaming output
   --theme <theme>                 Set theme (dark/light/auto)
@@ -216,7 +216,7 @@ Examples:
   jackcode chat                   Interactive session
   jackcode --resume               Resume latest interactive session
   jackcode --load .jackcode/s.json
-  jackcode -m deepseek "..."      Use DeepSeek for this request
+  jackcode -m qwen-3.6 "..."      Use Qwen 3.6 for this request
 
 Interactive Commands:
   /help                           Show available commands
@@ -248,7 +248,7 @@ function printVersion(): void {
 }
 
 function isModelTier(value: string | undefined): value is ModelTier {
-  return value === 'qwen-3.6' || value === 'deepseek' || value === 'gpt54';
+  return value === 'qwen-3.6' || value === 'gpt-5.4';
 }
 
 function isTheme(value: string | undefined): value is Theme {

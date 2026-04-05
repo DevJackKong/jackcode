@@ -1,12 +1,10 @@
 /**
- * Pre-execution planning with Qwen-first strategy selection and optional DeepSeek review.
+ * Pre-execution planning with Qwen-first strategy selection.
  */
 
 import type { TaskContext as RuntimeTaskContext, ExecutionPlan, PlanStep } from './runtime.js';
 import type { ModelTier } from '../model/types/policy.js';
 import type { ExecutionBrief, WorkflowRiskLevel } from '../types/workflow.js';
-import type { DeepSeekReasonerRouter } from '../model/deepseek-router.js';
-import type { RepairContext } from '../model/types/reasoning.js';
 import type { CompressedContext } from '../types/context.js';
 
 function estimateTokens(text: string): number {
@@ -14,8 +12,6 @@ function estimateTokens(text: string): number {
 }
 
 export class WorkflowPlanner {
-  constructor(private readonly deepseek?: DeepSeekReasonerRouter) {}
-
   async createExecutionBrief(
     task: RuntimeTaskContext,
     compressedContext?: CompressedContext
@@ -25,17 +21,18 @@ export class WorkflowPlanner {
     const reasoningRequired = multiFile || task.attempts > 1 || /refactor|architecture|dependency|design/i.test(task.intent);
     const riskLevel = this.assessRisk(task, affectedFiles, reasoningRequired);
     const contextBudgetTokens = compressedContext?.stats.finalTokens ?? estimateTokens(task.intent);
-
-    const deepseekHints = this.deepseek && (reasoningRequired || riskLevel === 'critical') ? await this.safeAnalyze(task, compressedContext) : null;
-    const selectedModel: ModelTier = 'qwen';
-    const steps = this.buildSteps(task, affectedFiles, deepseekHints?.planHints ?? []);
+    const selectedModel: ModelTier = task.state === 'reviewing' ? 'gpt54' : 'qwen';
+    const assumptions = reasoningRequired
+      ? ['Qwen 3.6 should handle implementation planning directly without escalation.']
+      : [];
+    const steps = this.buildSteps(task, affectedFiles, []);
 
     return {
       taskId: task.id,
       intent: task.intent,
       strategy: reasoningRequired ? 'plan_then_execute' : 'direct_execute',
       selectedModel,
-      escalationTarget: reasoningRequired || riskLevel === 'critical' ? 'deepseek' : undefined,
+      escalationTarget: riskLevel === 'critical' ? 'gpt54' : undefined,
       contextBudgetTokens,
       reasoningRequired,
       multiFile,
@@ -45,7 +42,7 @@ export class WorkflowPlanner {
         'Prefer minimal safe changes',
         'Preserve public behavior unless intent explicitly changes it',
       ],
-      assumptions: deepseekHints?.assumptions ?? [],
+      assumptions,
       affectedFiles,
       relatedTests: this.inferRelatedTests(affectedFiles),
       steps,
@@ -56,9 +53,8 @@ export class WorkflowPlanner {
       ],
       createdAt: Date.now(),
       metadata: {
-        deepseekEscalated: deepseekHints?.escalated ?? false,
-        dossierSummary: deepseekHints?.summary,
-        plannerMode: 'qwen-first',
+        plannerModel: 'qwen',
+        auditModel: 'gpt54',
       },
     };
   }
@@ -87,16 +83,13 @@ export class WorkflowPlanner {
 
   private extractAffectedFiles(task: RuntimeTaskContext, compressedContext?: CompressedContext): string[] {
     const files = new Set<string>();
-
     task.plan?.steps.forEach((step) => step.targetFiles.forEach((file) => files.add(file)));
     task.artifacts.forEach((artifact) => {
       if (/\.(ts|tsx|js|jsx|json|md)$/i.test(artifact.path)) files.add(artifact.path);
     });
-
     const text = [task.intent, compressedContext?.content ?? ''].join('\n');
     const matches = text.match(/([\w./-]+\.(?:ts|tsx|js|jsx|json|md))/g) ?? [];
     matches.forEach((file) => files.add(file));
-
     return [...files].slice(0, 12);
   }
 
@@ -140,36 +133,6 @@ export class WorkflowPlanner {
         verificationHint: 'Check tests, type safety, and regressions around changed code.',
       },
     ];
-  }
-
-  private async safeAnalyze(task: RuntimeTaskContext, compressedContext?: CompressedContext): Promise<{
-    escalated: boolean;
-    summary: string;
-    assumptions: string[];
-    planHints: string[];
-  } | null> {
-    try {
-      const repairContext: RepairContext = {
-        taskId: task.id,
-        errors: task.errors,
-        artifacts: task.artifacts,
-        context: compressedContext,
-        attemptNumber: Math.max(task.attempts, 1),
-        maxAttempts: Math.max(task.maxAttempts, 1),
-        intent: task.intent,
-      };
-      const packet = this.deepseek?.createHandoffPacket(repairContext);
-      return packet
-        ? {
-            escalated: packet.shouldEscalate,
-            summary: packet.summary,
-            assumptions: packet.hypotheses.map((item) => item.hypothesis),
-            planHints: packet.planSteps,
-          }
-        : null;
-    } catch {
-      return null;
-    }
   }
 }
 

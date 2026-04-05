@@ -377,10 +377,7 @@ export class QwenExecutorRouter {
   }
 
   private selectModel(request: ExtendedQwenRouteRequest, contextTokens: number, policyDecision: RoutingDecision | undefined, qwenCapability: ReturnType<QwenExecutorRouter['assessQwenCapability']>): QwenModelId {
-    if (policyDecision?.selectedModel === 'deepseek') {
-      return qwenCapability.contextFits ? 'qwen-3.6' : this.config.fallbackModel;
-    }
-    if (policyDecision?.selectedModel === 'qwen' && policyDecision.budgetStatus?.allowed === false) {
+    if (policyDecision?.budgetStatus?.allowed === false) {
       return 'qwen-3.6-fast';
     }
     if (!qwenCapability.canHandle && qwenCapability.contextFits) {

@@ -1,12 +1,9 @@
 /**
  * Canonical model router entrypoint.
  *
- * Qwen 3.6 is the primary developer route for all coding work.
- * DeepSeek is used only as an escalation/specialist reasoning pass.
- * GPT-5.4 is reserved for verification and audit flows.
- *
- * This module intentionally re-exports the full Qwen router implementation so
- * older imports (`../model/router.js`) automatically use the Qwen-first stack.
+ * JackCode uses a simple two-model architecture:
+ * - Qwen 3.6 for all development work
+ * - GPT-5.4 for audit / verification flows
  */
 
 export {

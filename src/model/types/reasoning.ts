@@ -87,7 +87,7 @@ export interface RepairPlan {
   /** Individual repair steps */
   steps: RepairStep[];
   /** Target model for execution */
-  targetModel: 'deepseek' | 'qwen' | 'gpt54';
+  targetModel: 'qwen' | 'gpt54';
   /** Estimated token requirement */
   estimatedTokens: number;
 }

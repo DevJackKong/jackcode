@@ -42,7 +42,7 @@ export type RuntimeTaskState =
 
 export type TaskState = RuntimeTaskState;
 
-export type ModelTier = 'qwen' | 'deepseek' | 'gpt54';
+export type ModelTier = 'qwen' | 'gpt54';
 
 export type TaskPriority = 'low' | 'normal' | 'high' | 'critical';
 
@@ -567,7 +567,6 @@ export class RuntimeStateMachine {
         return 'qwen';
       case 'retrying':
       case 'rolling_back':
-        return 'deepseek';
       case 'reviewing':
         return 'gpt54';
       default:

@@ -469,11 +469,11 @@ export function createSlashCommands(customCommands: SlashCommand[] = []): Map<st
   register({
     name: 'model',
     description: 'Switch active model tier',
-    usage: '/model <qwen-3.6|deepseek|gpt54>',
+    usage: '/model <qwen-3.6|gpt-5.4>',
     handler: async (args, session) => {
       const model = args[0] as ModelTier | undefined;
-      if (model !== 'qwen-3.6' && model !== 'deepseek' && model !== 'gpt54') {
-        throw new Error('Usage: /model <qwen-3.6|deepseek|gpt54>');
+      if (model !== 'qwen-3.6' && model !== 'gpt-5.4') {
+        throw new Error('Usage: /model <qwen-3.6|gpt-5.4>');
       }
       session.config.defaultModel = model;
       addMessage(session, 'system', `Model switched to ${model}`);
