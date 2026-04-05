@@ -28,15 +28,12 @@ export type PolicyDecisionMode = 'normal' | 'forced' | 'overridden' | 'downgrade
 
 /** Core model policy configuration */
 export interface ModelPolicy {
-  /** Default model when no rules match */
   defaultModel: ModelTier;
-  /** Token thresholds for complexity classification */
   complexityThresholds: {
     low: number;
     medium: number;
     high: number;
   };
-  /** Cost limits in USD */
   costLimits: {
     perTask: number;
     perSession: number;
@@ -44,18 +41,13 @@ export interface ModelPolicy {
     perWeek: number;
     perMonth: number;
   };
-  /** Model escalation chain (cheapest to most expensive) */
   escalationChain: ModelTier[];
 }
 
-/** Complete policy configuration */
 export interface PolicyConfig {
   policy: ModelPolicy;
-  /** Cache TTL in milliseconds */
   cacheTtlMs: number;
-  /** Enable automatic downgrades on budget pressure */
   enableAutoDowngrade: boolean;
-  /** Budget warning thresholds (0-1) */
   warningThresholds: {
     session: number;
     daily: number;
@@ -70,7 +62,6 @@ export interface PolicyConfig {
   };
 }
 
-/** Default policy configuration */
 export const DEFAULT_POLICY_CONFIG: PolicyConfig = {
   policy: {
     defaultModel: 'qwen',
@@ -88,7 +79,7 @@ export const DEFAULT_POLICY_CONFIG: PolicyConfig = {
     },
     escalationChain: ['qwen', 'deepseek', 'gpt54'],
   },
-  cacheTtlMs: 300000, // 5 minutes
+  cacheTtlMs: 300000,
   enableAutoDowngrade: true,
   warningThresholds: {
     session: 0.7,
@@ -104,58 +95,37 @@ export const DEFAULT_POLICY_CONFIG: PolicyConfig = {
   },
 };
 
-/** Pricing per 1K tokens for each model */
 export const MODEL_PRICING: Record<ModelTier, { input: number; output: number }> = {
-  qwen: { input: 0.001, output: 0.002 },      // $0.002 avg per 1K
-  deepseek: { input: 0.002, output: 0.008 },  // $0.005 avg per 1K
-  gpt54: { input: 0.015, output: 0.06 },      // $0.03 avg per 1K
+  qwen: { input: 0.001, output: 0.002 },
+  deepseek: { input: 0.002, output: 0.008 },
+  gpt54: { input: 0.015, output: 0.06 },
 };
 
-/** Task context for policy evaluation */
 export interface TaskContext {
   taskId: string;
   taskType: TaskType;
-  /** Files involved in task */
   files?: string[];
-  /** Human-readable intent */
   intent?: string;
-  /** Estimated token count (if known) */
   estimatedTokens?: number;
-  /** Explicit complexity override */
   complexity?: ComplexityScore;
-  /** Whether task requires deep reasoning */
   requiresReasoning?: boolean;
-  /** Previous failure count for this task */
   failureCount?: number;
-  /** Urgency level */
   urgency?: 'low' | 'normal' | 'high' | 'critical';
-  /** Optional existing session id */
   sessionId?: string;
-  /** Optional task-specific budget override */
   maxCostUsd?: number;
-  /** Hint that similar tasks are batchable */
   batchable?: boolean;
-  /** Approximate count of similar tasks in the batch */
   batchSize?: number;
-  /** Prefer using cached outputs if possible */
   preferCached?: boolean;
-  /** Optional model override request */
   overrideModel?: ModelTier;
-  /** Extra metadata for custom policy rules */
   metadata?: Record<string, unknown>;
 }
 
-/** Routing decision output */
 export interface RoutingDecision {
   taskId: string;
   selectedModel: ModelTier;
-  /** Human-readable reasoning */
   reasoning: string;
-  /** Estimated cost in USD */
   estimatedCost: number;
-  /** Estimated token usage */
   estimatedTokens: number;
-  /** Whether fallback is allowed on failure */
   fallbackOnFailure: boolean;
   mode?: PolicyDecisionMode;
   appliedRules?: string[];
@@ -168,7 +138,6 @@ export interface RoutingDecision {
   earlyTerminationSuggested?: boolean;
 }
 
-/** Cost tracking state */
 export interface CostTracker {
   sessionId: string;
   taskCosts: Map<string, TaskCost>;
@@ -182,7 +151,6 @@ export interface CostTracker {
   lastMonthlyReset: number;
 }
 
-/** Individual task cost record */
 export interface TaskCost {
   model: ModelTier;
   inputTokens: number;
@@ -197,7 +165,6 @@ export interface TaskCost {
   earlyTerminated?: boolean;
 }
 
-/** Token usage report */
 export interface TokenUsage {
   model: ModelTier;
   inputTokens: number;
@@ -209,7 +176,6 @@ export interface TokenUsage {
   terminatedEarly?: boolean;
 }
 
-/** Budget check result */
 export interface BudgetStatus {
   allowed: boolean;
   reason: string;
@@ -217,7 +183,6 @@ export interface BudgetStatus {
   projectedSpend?: number;
 }
 
-/** Budget allocation response */
 export interface BudgetAllocation {
   allocated: number;
   maxAllowed: number;
@@ -227,7 +192,6 @@ export interface BudgetAllocation {
   window?: BudgetWindow;
 }
 
-/** Budget snapshot */
 export interface BudgetSnapshot {
   perTask: number;
   perSession: number;
@@ -236,7 +200,6 @@ export interface BudgetSnapshot {
   perMonth: number;
 }
 
-/** Policy rule definition */
 export interface PolicyRule {
   name: string;
   priority: number;
@@ -244,21 +207,14 @@ export interface PolicyRule {
   action: (task: TaskContext) => RuleAction;
 }
 
-/** Rule action result */
 export interface RuleAction {
-  /** Preferred models in order */
   modelPreference: ModelTier[];
-  /** Force this preference (ignore other rules) */
   forceModel?: boolean;
-  /** Additional cost multiplier */
   costMultiplier?: number;
-  /** Suggested optimization hints */
   optimizations?: OptimizationAction[];
-  /** Override max task cost */
   maxTaskCostUsd?: number;
 }
 
-/** Rule evaluation result */
 export interface RuleResult {
   ruleName: string;
   priority: number;
@@ -304,7 +260,6 @@ export interface UsageDashboard {
   alerts: PolicyAlert[];
 }
 
-/** Cost report structure */
 export interface CostReport {
   sessionId: string;
   summary: {
@@ -344,7 +299,6 @@ export interface CostReport {
   generatedAt: number;
 }
 
-/** Escalation decision */
 export interface EscalationDecision {
   shouldEscalate: boolean;
   from: ModelTier;
@@ -353,17 +307,17 @@ export interface EscalationDecision {
   estimatedAdditionalCost: number;
 }
 
-/** Model capabilities */
 export interface ModelCapabilities {
   tier: ModelTier;
   maxContextTokens: number;
   supportsReasoning: boolean;
   supportsBatching: boolean;
   averageLatencyMs: number;
-  accuracyScore: number; // 0-1
+  accuracyScore: number;
+  preferredComplexity?: ComplexityScore[];
+  idealTaskTypes?: string[];
 }
 
-/** Model capability registry */
 export const MODEL_CAPABILITIES: Record<ModelTier, ModelCapabilities> = {
   qwen: {
     tier: 'qwen',
@@ -372,6 +326,8 @@ export const MODEL_CAPABILITIES: Record<ModelTier, ModelCapabilities> = {
     supportsBatching: true,
     averageLatencyMs: 2000,
     accuracyScore: 0.85,
+    preferredComplexity: ['low', 'medium'],
+    idealTaskTypes: ['simple_edit', 'build_fix', 'test_fix', 'batch_operation'],
   },
   deepseek: {
     tier: 'deepseek',
@@ -380,6 +336,8 @@ export const MODEL_CAPABILITIES: Record<ModelTier, ModelCapabilities> = {
     supportsBatching: true,
     averageLatencyMs: 5000,
     accuracyScore: 0.90,
+    preferredComplexity: ['medium', 'high'],
+    idealTaskTypes: ['debug', 'refactor', 'multi_file_change', 'batch_operation'],
   },
   gpt54: {
     tier: 'gpt54',
@@ -388,5 +346,7 @@ export const MODEL_CAPABILITIES: Record<ModelTier, ModelCapabilities> = {
     supportsBatching: false,
     averageLatencyMs: 8000,
     accuracyScore: 0.95,
+    preferredComplexity: ['high'],
+    idealTaskTypes: ['final_verification', 'architecture_review', 'refactor'],
   },
 };

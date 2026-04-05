@@ -6,6 +6,7 @@
 import path from 'node:path';
 
 import type { TaskContext, Artifact } from './runtime.js';
+import type { ExecutionBrief, FailureDossier, VerificationBrief } from '../types/workflow.js';
 import type { PatchResult } from '../types/patch.js';
 import type {
   VerificationResult,
@@ -98,6 +99,9 @@ export interface WorkflowSessionState {
   currentStepId?: string;
   startTime: number;
   endTime?: number;
+  executionBrief?: ExecutionBrief;
+  verificationBrief?: VerificationBrief;
+  failureDossier?: FailureDossier;
 }
 
 /** Task execution summary */
@@ -110,6 +114,9 @@ export interface TaskSummary {
   totalLinesRemoved: number;
   issues: SummaryIssue[];
   rollbackAvailable: boolean;
+  executionBrief?: ExecutionBrief;
+  verificationBrief?: VerificationBrief;
+  iterations?: number;
 }
 
 /** Single file change summary */
@@ -312,7 +319,7 @@ export class SummaryGenerator {
   static create(
     patchResult: PatchResult,
     verification?: VerificationResult,
-    options: { level?: SummaryLevel; intent?: string } = {}
+    options: { level?: SummaryLevel; intent?: string; executionBrief?: ExecutionBrief; verificationBrief?: VerificationBrief; iterations?: number } = {}
   ): TaskSummary {
     const intent = options.intent || 'Task';
 
@@ -360,6 +367,9 @@ export class SummaryGenerator {
       totalLinesRemoved,
       issues,
       rollbackAvailable: patchResult.canRollback,
+      executionBrief: options.executionBrief,
+      verificationBrief: options.verificationBrief,
+      iterations: options.iterations,
     };
   }
 
@@ -670,10 +680,13 @@ export class WorkflowExecutor {
    */
   async execute(
     task: TaskContext,
-    operation: () => Promise<{ patchResult: PatchResult; verification?: VerificationResult }>,
+    operation: () => Promise<{ patchResult: PatchResult; verification?: VerificationResult; executionBrief?: ExecutionBrief; verificationBrief?: VerificationBrief; failureDossier?: FailureDossier; iterations?: number }>,
     options: {
       workspacePath: string;
       onApprovalRequest?: (prompt: ApprovalPrompt) => Promise<boolean>;
+      executionBrief?: ExecutionBrief;
+      verificationBrief?: VerificationBrief;
+      maxIterations?: number;
     }
   ): Promise<{ approved: boolean; result?: PatchResult; summary?: TaskSummary }> {
     // Build initial workflow state
@@ -687,10 +700,12 @@ export class WorkflowExecutor {
       ],
       currentStepId: '2',
       startTime: Date.now(),
+      executionBrief: options.executionBrief,
+      verificationBrief: options.verificationBrief,
     };
 
     try {
-      const { patchResult, verification } = await operation();
+      const { patchResult, verification, executionBrief, verificationBrief, failureDossier, iterations } = await operation();
 
       state.steps[1].status = patchResult.success ? 'completed' : 'failed';
       state.steps[1].endTime = Date.now();
@@ -698,9 +713,16 @@ export class WorkflowExecutor {
       state.steps[2].startTime = verification ? Date.now() : undefined;
       state.currentStepId = verification ? '3' : undefined;
 
+      state.executionBrief = executionBrief ?? state.executionBrief;
+      state.verificationBrief = verificationBrief ?? state.verificationBrief;
+      state.failureDossier = failureDossier;
+
       const summary = SummaryGenerator.create(patchResult, verification, {
         level: 'standard',
         intent: task.intent,
+        executionBrief: state.executionBrief,
+        verificationBrief: state.verificationBrief,
+        iterations,
       });
 
       const decision = this.approval.evaluate({

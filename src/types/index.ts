@@ -14,3 +14,4 @@ export * from './scanner.js';
 export * from './session.js';
 export * from './symbol-index.js';
 export * from './test-runner.js';
+export * from './workflow.js';
