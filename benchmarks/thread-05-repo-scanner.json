@@ -1,0 +1,26 @@
+{
+  "command": "node --experimental-strip-types <inline benchmark>",
+  "generatedAt": "2026-04-05T01:10:00Z",
+  "scenario": {
+    "files": 251,
+    "description": "Synthetic TypeScript repo with one package.json and 250 linked source files"
+  },
+  "results": {
+    "firstDurationMs": 932,
+    "secondDurationMs": 16,
+    "benchmark": {
+      "totalDurationMs": 16,
+      "traversalDurationMs": 11,
+      "fileProcessingDurationMs": 902,
+      "gitDurationMs": 0,
+      "dependencyDurationMs": 3,
+      "fileCount": 251,
+      "cacheHits": 251,
+      "cacheMisses": 0
+    }
+  },
+  "notes": [
+    "Warm scan demonstrates cache reuse.",
+    "Per-file processing timer is cumulative across async tasks, so it overstates wall-clock time; totalDurationMs is the wall-clock number to trust."
+  ]
+}
