@@ -1,0 +1,1200 @@
+/**
+ * Session Context Manager
+ * Thread 02: Manages session state, task context, checkpoints, handoffs, persistence,
+ * memory integration, and model usage tracking.
+ */
+import { createHash, randomUUID } from 'node:crypto';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { ContextCompressor, estimateTokens } from '../repo/context-compressor.js';
+const DEFAULT_CONTEXT_WINDOW = {
+    maxTokens: 128000,
+    warningThreshold: 0.75,
+    compressionThreshold: 0.9,
+    currentTokens: 0,
+    lastCompressedAt: null,
+};
+const DEFAULT_MEMORY_ENTRY_TYPES = [
+    'decision',
+    'learning',
+    'context',
+    'checkpoint',
+    'error',
+];
+class EventEmitter {
+    listeners = {};
+    on(event, handler) {
+        const existing = this.listeners[event] ?? [];
+        existing.push(handler);
+        this.listeners[event] = existing;
+    }
+    emit(event, payload) {
+        const handlers = this.listeners[event] ?? [];
+        for (const handler of handlers) {
+            handler(payload);
+        }
+    }
+}
+export class SessionManager {
+    sessions = new Map();
+    events = new EventEmitter();
+    persistence;
+    memoryAdapter;
+    compressor = new ContextCompressor();
+    constructor(options = {}) {
+        this.persistence = {
+            baseDir: options.persistence?.baseDir ?? '.jackcode/sessions',
+            autoSave: options.persistence?.autoSave ?? false,
+        };
+        this.memoryAdapter = options.memoryAdapter;
+    }
+    on(event, handler) {
+        this.events.on(event, handler);
+    }
+    createSession(options) {
+        const rootGoal = options.rootGoal.trim();
+        if (!rootGoal)
+            throw new Error('rootGoal is required');
+        const now = new Date();
+        const rootTaskId = randomUUID();
+        const rootGoalId = randomUUID();
+        const rootTask = {
+            id: rootTaskId,
+            parentId: null,
+            goal: rootGoal,
+            criteria: [],
+            status: 'in-progress',
+            createdAt: now,
+            updatedAt: now,
+            completedAt: null,
+            metadata: options.parentSessionId ? { parentSessionId: options.parentSessionId } : {},
+            notes: [],
+            contextFragments: [],
+        };
+        const rootGoalNode = {
+            id: rootGoalId,
+            parentId: null,
+            taskId: rootTaskId,
+            title: rootGoal,
+            status: 'in-progress',
+            createdAt: now,
+            updatedAt: now,
+            children: [],
+        };
+        const session = {
+            id: randomUUID(),
+            state: 'created',
+            createdAt: now,
+            updatedAt: now,
+            closedAt: null,
+            rootGoal,
+            taskStack: [rootTask],
+            currentTask: rootTask,
+            tasks: [rootTask],
+            goalTree: [rootGoalNode],
+            checkpoints: [],
+            modelUsage: [],
+            memoryPath: options.memoryPath ?? null,
+            parentSessionId: options.parentSessionId ?? null,
+            metadata: { ...(options.metadata ?? {}) },
+            contextFragments: [],
+            contextWindow: this.buildContextWindow(options.contextWindow),
+            lastMemorySyncAt: null,
+            runtimeQueue: {
+                activeTaskId: null,
+                queue: [],
+                activeTask: null,
+                lastSyncedAt: null,
+            },
+            patchHistory: [],
+            fileVersions: {},
+            testResults: [],
+            repoSnapshot: null,
+            recoveryState: {
+                recoveredFromCheckpointId: null,
+                recoveredAt: null,
+            },
+        };
+        this.bindSessionMethods(session);
+        this.sessions.set(session.id, session);
+        this.events.emit('session-created', { session: this.cloneSession(session) });
+        this.setState(session, 'active');
+        this.touchSession(session, 'session-initialized');
+        this.events.emit('task-start', { sessionId: session.id, task: this.cloneTask(rootTask) });
+        return this.cloneSession(session);
+    }
+    getSession(id) {
+        const session = this.sessions.get(id);
+        return session ? this.cloneSession(session) : undefined;
+    }
+    listSessions() {
+        return Array.from(this.sessions.values()).map((session) => this.cloneSession(session));
+    }
+    attachToRuntime(sessionId, runtime) {
+        const session = this.sessions.get(sessionId);
+        if (!session)
+            return false;
+        const runtimeLike = runtime;
+        const sync = () => {
+            const queue = (runtimeLike.getQueue?.() ?? []).map((task) => this.toRuntimeTaskSnapshot(task));
+            const activeTaskRaw = runtimeLike.getActiveTask?.();
+            const activeTask = activeTaskRaw ? this.toRuntimeTaskSnapshot(activeTaskRaw) : null;
+            session.runtimeQueue = {
+                activeTaskId: activeTask?.id ?? null,
+                queue,
+                activeTask,
+                lastSyncedAt: new Date(),
+            };
+            this.touchSession(session, 'runtime-synced');
+            this.events.emit('runtime-updated', { sessionId, runtimeQueue: this.cloneRuntimeQueue(session.runtimeQueue) });
+        };
+        for (const event of ['task-created', 'task-enqueued', 'task-started', 'state-changed', 'task-completed', 'task-failed', 'task-cancelled', 'queue-drained', 'task-restored']) {
+            runtimeLike.on?.(event, sync);
+        }
+        sync();
+        this.events.emit('runtime-attached', { sessionId });
+        return true;
+    }
+    addPatch(sessionId, file, patch) {
+        const session = this.sessions.get(sessionId);
+        const normalizedFile = file.trim();
+        if (!session || !normalizedFile)
+            return null;
+        const version = (session.fileVersions[normalizedFile] ?? 0) + 1;
+        session.fileVersions[normalizedFile] = version;
+        const record = {
+            id: randomUUID(),
+            file: normalizedFile,
+            patch: structuredClone(patch),
+            taskId: session.currentTask?.id ?? null,
+            version,
+            timestamp: new Date(),
+        };
+        session.patchHistory.push(record);
+        if (session.repoSnapshot) {
+            const cloned = this.cloneFileIndex(session.repoSnapshot.snapshot);
+            cloned.generatedAt = Date.now();
+            const existing = cloned.files.get(normalizedFile);
+            if (existing) {
+                cloned.files.set(normalizedFile, {
+                    ...existing,
+                    modifiedAt: Date.now(),
+                });
+            }
+            session.repoSnapshot = { snapshot: cloned, updatedAt: new Date() };
+        }
+        this.touchSession(session, 'patch-added');
+        this.events.emit('patch-added', { sessionId, patch: this.clonePatchRecord(record) });
+        return this.clonePatchRecord(record);
+    }
+    addTestResult(sessionId, result) {
+        const session = this.sessions.get(sessionId);
+        if (!session)
+            return null;
+        const record = {
+            id: randomUUID(),
+            taskId: session.currentTask?.id ?? null,
+            timestamp: new Date(),
+            result: structuredClone(result),
+        };
+        session.testResults.push(record);
+        const task = session.currentTask;
+        if (task) {
+            const history = Array.isArray(task.metadata.testHistory) ? task.metadata.testHistory : [];
+            task.metadata.testHistory = [...history, structuredClone(result)];
+            task.updatedAt = new Date();
+            this.events.emit('task-update', { sessionId, task: this.cloneTask(task) });
+        }
+        this.touchSession(session, 'test-result-added');
+        this.events.emit('test-result-added', { sessionId, result: this.cloneTestResult(record) });
+        return this.cloneTestResult(record);
+    }
+    setRepoSnapshot(sessionId, snapshot) {
+        const session = this.sessions.get(sessionId);
+        if (!session)
+            return false;
+        session.repoSnapshot = {
+            snapshot: this.cloneFileIndex(snapshot),
+            updatedAt: new Date(),
+        };
+        this.touchSession(session, 'repo-snapshot-updated');
+        this.events.emit('repo-snapshot-updated', { sessionId, snapshot: this.cloneRepoSnapshot(session.repoSnapshot) });
+        return true;
+    }
+    selectContext(sessionId, budget) {
+        const session = this.sessions.get(sessionId);
+        if (!session || budget <= 0)
+            return null;
+        if (this.shouldCompressContext(sessionId) || session.contextWindow.currentTokens > budget) {
+            this.compressContext(sessionId, budget);
+        }
+        const sorted = [...session.contextFragments].sort((a, b) => {
+            const priorityDelta = (b.metadata.priority ?? 0) - (a.metadata.priority ?? 0);
+            if (priorityDelta !== 0)
+                return priorityDelta;
+            return (b.timestamp ?? 0) - (a.timestamp ?? 0);
+        });
+        const selected = [];
+        let totalTokens = 0;
+        for (const fragment of sorted) {
+            const tokenCount = fragment.tokenCount ?? estimateTokens(fragment.content);
+            if (selected.length > 0 && totalTokens + tokenCount > budget)
+                continue;
+            if (selected.length === 0 && tokenCount > budget) {
+                selected.push(this.cloneFragment(fragment));
+                totalTokens += tokenCount;
+                break;
+            }
+            if (totalTokens + tokenCount <= budget) {
+                selected.push(this.cloneFragment(fragment));
+                totalTokens += tokenCount;
+            }
+        }
+        return {
+            fragments: selected,
+            totalTokens,
+            truncated: selected.length < session.contextFragments.length,
+        };
+    }
+    closeSession(id) {
+        const session = this.sessions.get(id);
+        if (!session || session.state === 'closed')
+            return false;
+        const now = new Date();
+        session.closedAt = now;
+        if (session.currentTask && session.currentTask.status === 'in-progress') {
+            session.currentTask.status = 'completed';
+            session.currentTask.completedAt = now;
+            session.currentTask.updatedAt = now;
+        }
+        this.setState(session, 'closed');
+        this.events.emit('session-closed', { session: this.cloneSession(session) });
+        return true;
+    }
+    pauseSession(id) {
+        const session = this.sessions.get(id);
+        if (!session || session.state !== 'active')
+            return false;
+        this.setState(session, 'paused');
+        return true;
+    }
+    resumeSession(id) {
+        const session = this.sessions.get(id);
+        if (!session || session.state !== 'paused')
+            return false;
+        this.setState(session, 'active');
+        return true;
+    }
+    setErrorState(id, error) {
+        const session = this.sessions.get(id);
+        if (!session)
+            return false;
+        this.events.emit('error', { sessionId: id, error });
+        this.setState(session, 'error');
+        return true;
+    }
+    pushTask(sessionId, goal, options = {}) {
+        const session = this.sessions.get(sessionId);
+        const normalizedGoal = goal.trim();
+        if (!session || session.state !== 'active' || !normalizedGoal)
+            return null;
+        const now = new Date();
+        const parentTaskId = session.currentTask?.id ?? null;
+        const task = {
+            id: randomUUID(),
+            parentId: parentTaskId,
+            goal: normalizedGoal,
+            criteria: [...(options.criteria ?? [])],
+            status: options.status ?? 'in-progress',
+            createdAt: now,
+            updatedAt: now,
+            completedAt: null,
+            metadata: { ...(options.metadata ?? {}) },
+            notes: [...(options.notes ?? [])],
+            contextFragments: [],
+        };
+        session.taskStack.push(task);
+        session.tasks.push(task);
+        session.currentTask = task;
+        const goalNode = {
+            id: randomUUID(),
+            parentId: this.findGoalNodeByTaskId(session, parentTaskId)?.id ?? session.goalTree[0]?.id ?? null,
+            taskId: task.id,
+            title: normalizedGoal,
+            status: task.status,
+            createdAt: now,
+            updatedAt: now,
+            children: [],
+        };
+        session.goalTree.push(goalNode);
+        if (goalNode.parentId) {
+            const parentNode = session.goalTree.find((node) => node.id === goalNode.parentId);
+            if (parentNode && !parentNode.children.includes(goalNode.id)) {
+                parentNode.children.push(goalNode.id);
+                parentNode.updatedAt = now;
+            }
+        }
+        this.touchSession(session, 'task-pushed');
+        this.events.emit('task-push', { sessionId, task: this.cloneTask(task) });
+        this.events.emit('task-start', { sessionId, task: this.cloneTask(task) });
+        return this.cloneTask(task);
+    }
+    popTask(sessionId) {
+        const session = this.sessions.get(sessionId);
+        if (!session || session.state !== 'active' || session.taskStack.length <= 1)
+            return null;
+        const task = session.taskStack.pop();
+        if (!task)
+            return null;
+        const now = new Date();
+        task.status = 'completed';
+        task.completedAt = now;
+        task.updatedAt = now;
+        this.updateGoalNodeStatus(session, task.id, 'completed', now);
+        session.currentTask = session.taskStack.at(-1) ?? null;
+        this.touchSession(session, 'task-popped');
+        this.events.emit('task-pop', { sessionId, task: this.cloneTask(task) });
+        this.events.emit('task-complete', { sessionId, task: this.cloneTask(task) });
+        return this.cloneTask(task);
+    }
+    completeTask(sessionId, taskId) {
+        return this.updateTaskStatus(sessionId, taskId, 'completed');
+    }
+    failTask(sessionId, taskId, error) {
+        const updated = this.updateTaskStatus(sessionId, taskId, 'failed');
+        if (!updated)
+            return false;
+        const session = this.sessions.get(sessionId);
+        const task = session?.tasks.find((candidate) => candidate.id === taskId);
+        if (!session || !task)
+            return false;
+        this.events.emit('task-fail', { sessionId, task: this.cloneTask(task), error });
+        if (error) {
+            task.notes ??= [];
+            task.notes.push(`FAILURE: ${error}`);
+            this.touchSession(session, 'task-failed');
+        }
+        return true;
+    }
+    updateTaskStatus(sessionId, taskId, status) {
+        const session = this.sessions.get(sessionId);
+        if (!session)
+            return false;
+        const task = session.tasks.find((candidate) => candidate.id === taskId);
+        if (!task)
+            return false;
+        const now = new Date();
+        task.status = status;
+        task.updatedAt = now;
+        task.completedAt = status === 'completed' || status === 'failed' ? now : null;
+        this.updateGoalNodeStatus(session, taskId, status, now);
+        this.touchSession(session, 'task-status-updated');
+        this.events.emit('task-update', { sessionId, task: this.cloneTask(task) });
+        if (status === 'completed')
+            this.events.emit('task-complete', { sessionId, task: this.cloneTask(task) });
+        return true;
+    }
+    getTaskStack(sessionId) {
+        const session = this.sessions.get(sessionId);
+        return session ? session.taskStack.map((task) => this.cloneTask(task)) : [];
+    }
+    getGoalHierarchy(sessionId) {
+        const session = this.sessions.get(sessionId);
+        return session ? session.goalTree.map((node) => this.cloneGoalNode(node)) : [];
+    }
+    addTaskNote(sessionId, taskId, note) {
+        const session = this.sessions.get(sessionId);
+        if (!session || !note.trim())
+            return false;
+        const task = session.tasks.find((candidate) => candidate.id === taskId);
+        if (!task)
+            return false;
+        task.notes ??= [];
+        task.notes.push(note.trim());
+        task.updatedAt = new Date();
+        this.touchSession(session, 'task-note-added');
+        this.events.emit('task-update', { sessionId, task: this.cloneTask(task) });
+        return true;
+    }
+    addContextFragment(sessionId, fragment, taskId) {
+        const session = this.sessions.get(sessionId);
+        if (!session)
+            return false;
+        const normalizedFragment = this.normalizeFragment(fragment);
+        session.contextFragments.push(normalizedFragment);
+        session.contextWindow.currentTokens = this.calculateTokens(session.contextFragments);
+        const targetTask = taskId ? session.tasks.find((candidate) => candidate.id === taskId) : session.currentTask;
+        if (targetTask) {
+            targetTask.contextFragments ??= [];
+            targetTask.contextFragments.push(normalizedFragment);
+            targetTask.updatedAt = new Date();
+            this.events.emit('task-update', { sessionId, task: this.cloneTask(targetTask) });
+        }
+        this.touchSession(session, 'context-fragment-added');
+        return true;
+    }
+    addContextFragments(sessionId, fragments, taskId) {
+        let added = 0;
+        for (const fragment of fragments) {
+            if (this.addContextFragment(sessionId, fragment, taskId))
+                added += 1;
+        }
+        return added;
+    }
+    getContextFragments(sessionId) {
+        const session = this.sessions.get(sessionId);
+        return session ? session.contextFragments.map((fragment) => this.cloneFragment(fragment)) : [];
+    }
+    getContextWindow(sessionId) {
+        const session = this.sessions.get(sessionId);
+        return session ? this.cloneContextWindow(session.contextWindow) : null;
+    }
+    getScannerSnapshot(sessionId) {
+        const session = this.sessions.get(sessionId);
+        return session?.repoSnapshot ? this.cloneFileIndex(session.repoSnapshot.snapshot) : null;
+    }
+    setScannerSnapshot(sessionId, snapshot) {
+        return this.setRepoSnapshot(sessionId, snapshot);
+    }
+    recordFileChanges(sessionId, changes) {
+        const session = this.sessions.get(sessionId);
+        if (!session)
+            return false;
+        const existing = Array.isArray(session.metadata.changedFiles) ? session.metadata.changedFiles : [];
+        const merged = new Map();
+        for (const change of existing)
+            merged.set(`${change.path}:${change.type}`, { ...change });
+        for (const change of changes) {
+            if (!change?.path || !change?.type)
+                continue;
+            merged.set(`${change.path}:${change.type}`, { path: change.path, type: change.type });
+        }
+        session.metadata.changedFiles = Array.from(merged.values());
+        this.touchSession(session, 'changed-files-recorded');
+        return true;
+    }
+    getChangedFiles(sessionId) {
+        const session = this.sessions.get(sessionId);
+        if (!session)
+            return [];
+        const changes = Array.isArray(session.metadata.changedFiles) ? session.metadata.changedFiles : [];
+        return changes.map((change) => ({ ...change }));
+    }
+    shouldCompressContext(sessionId) {
+        const session = this.sessions.get(sessionId);
+        if (!session)
+            return false;
+        const ratio = session.contextWindow.maxTokens > 0 ? session.contextWindow.currentTokens / session.contextWindow.maxTokens : 0;
+        return ratio >= session.contextWindow.compressionThreshold;
+    }
+    compressContext(sessionId, targetBudget) {
+        const session = this.sessions.get(sessionId);
+        if (!session)
+            return null;
+        const beforeTokens = session.contextWindow.currentTokens;
+        const packed = this.compressor.pack(session.contextFragments);
+        const compressed = this.compressor.compress(packed, targetBudget ?? Math.floor(session.contextWindow.maxTokens * session.contextWindow.warningThreshold));
+        session.contextFragments = compressed.fragments.map((fragment) => this.normalizeFragment(fragment));
+        session.contextWindow.currentTokens = compressed.stats.finalTokens;
+        session.contextWindow.lastCompressedAt = new Date(compressed.compressedAt);
+        const enforcedBudget = targetBudget ?? Math.floor(session.contextWindow.maxTokens * session.contextWindow.warningThreshold);
+        let finalFragments = compressed.fragments.map((fragment) => this.normalizeFragment(fragment));
+        let finalTokens = compressed.stats.finalTokens;
+        if (finalTokens > enforcedBudget) {
+            const trimmed = [];
+            let remaining = enforcedBudget;
+            for (const fragment of finalFragments) {
+                if (remaining <= 0)
+                    break;
+                const fragmentTokens = fragment.tokenCount ?? estimateTokens(fragment.content);
+                if (fragmentTokens <= remaining) {
+                    trimmed.push(fragment);
+                    remaining -= fragmentTokens;
+                    continue;
+                }
+                const sliced = this.normalizeFragment({
+                    ...fragment,
+                    content: fragment.content.slice(0, Math.max(1, remaining * 4)),
+                    metadata: {
+                        ...fragment.metadata,
+                        tags: Array.from(new Set([...(fragment.metadata.tags ?? []), 'truncated'])),
+                    },
+                });
+                if (sliced.tokenCount && sliced.tokenCount <= remaining) {
+                    trimmed.push(sliced);
+                    remaining -= sliced.tokenCount;
+                }
+                break;
+            }
+            finalFragments = trimmed;
+            finalTokens = this.calculateTokens(finalFragments);
+        }
+        session.contextFragments = finalFragments;
+        session.contextWindow.currentTokens = finalTokens;
+        session.contextWindow.lastCompressedAt = new Date(compressed.compressedAt);
+        const result = {
+            triggered: beforeTokens > finalTokens || beforeTokens > enforcedBudget,
+            beforeTokens,
+            afterTokens: finalTokens,
+            compressedContext: {
+                ...compressed,
+                fragments: finalFragments,
+                stats: {
+                    ...compressed.stats,
+                    finalTokens,
+                    savedTokens: Math.max(0, beforeTokens - finalTokens),
+                    ratio: beforeTokens > 0 ? finalTokens / beforeTokens : 0,
+                    fragmentsDropped: Math.max(0, session.contextFragments.length - finalFragments.length),
+                },
+            },
+            droppedFragments: Math.max(0, compressed.fragments.length - finalFragments.length),
+        };
+        this.touchSession(session, 'context-compressed');
+        this.events.emit('context-compressed', { sessionId, result });
+        return result;
+    }
+    async createCheckpoint(sessionId, files, options = {}) {
+        const session = this.sessions.get(sessionId);
+        if (!session || !session.currentTask)
+            return null;
+        const fileHashes = new Map();
+        const cursorPositions = new Map();
+        for (const filePath of files) {
+            try {
+                const content = readFileSync(filePath, 'utf-8');
+                fileHashes.set(filePath, createHash('sha256').update(content).digest('hex'));
+            }
+            catch {
+                continue;
+            }
+            const cursor = options.cursorPositions?.[filePath] ?? { line: 1, column: 1 };
+            cursorPositions.set(filePath, { ...cursor });
+        }
+        const checkpoint = {
+            id: randomUUID(),
+            sessionId,
+            tag: options.tag ?? null,
+            timestamp: new Date(),
+            fileHashes,
+            cursorPositions,
+            taskContextId: session.currentTask.id,
+            notes: options.notes ?? '',
+            auto: options.auto ?? false,
+            snapshot: this.createSnapshot(session),
+        };
+        session.checkpoints.push(checkpoint);
+        this.touchSession(session, 'checkpoint-created');
+        this.events.emit('checkpoint-created', { sessionId, checkpoint: this.cloneCheckpoint(checkpoint) });
+        return this.cloneCheckpoint(checkpoint);
+    }
+    getCheckpoints(sessionId) {
+        const session = this.sessions.get(sessionId);
+        return session ? session.checkpoints.map((checkpoint) => this.cloneCheckpoint(checkpoint)) : [];
+    }
+    findCheckpoint(sessionId, tag) {
+        const session = this.sessions.get(sessionId);
+        const checkpoint = session?.checkpoints.find((candidate) => candidate.tag === tag);
+        return checkpoint ? this.cloneCheckpoint(checkpoint) : undefined;
+    }
+    restoreCheckpoint(sessionId, checkpointIdOrTag) {
+        const session = this.sessions.get(sessionId);
+        if (!session)
+            return false;
+        const checkpoint = session.checkpoints.find((candidate) => candidate.id === checkpointIdOrTag || candidate.tag === checkpointIdOrTag);
+        if (!checkpoint)
+            return false;
+        this.applySnapshot(session, checkpoint.snapshot);
+        session.recoveryState.recoveredFromCheckpointId = checkpoint.id;
+        session.recoveryState.recoveredAt = new Date();
+        this.touchSession(session, 'checkpoint-restored');
+        this.events.emit('checkpoint-restored', { sessionId, checkpoint: this.cloneCheckpoint(checkpoint) });
+        return true;
+    }
+    prepareHandoff(sessionId, fromModel, toModel, relevantFiles, expectedActions) {
+        const session = this.sessions.get(sessionId);
+        if (!session || !session.currentTask)
+            return null;
+        const progress = session.tasks.filter((task) => task.status === 'completed').map((task) => task.goal);
+        const blockers = session.tasks.filter((task) => task.status === 'blocked' || task.status === 'failed').map((task) => task.goal);
+        const payload = {
+            sessionId,
+            summary: [
+                `Root goal: ${session.rootGoal}`,
+                `Current task: ${session.currentTask.goal}`,
+                progress.length > 0 ? `Completed: ${progress.join('; ')}` : 'Completed: none yet',
+                blockers.length > 0 ? `Blockers: ${blockers.join('; ')}` : 'Blockers: none',
+            ].join(' | '),
+            progress,
+            blockers,
+            decisions: this.extractDecisions(session),
+            currentTask: this.cloneTask(session.currentTask),
+            taskStack: session.taskStack.map((task) => this.cloneTask(task)),
+            relevantFiles,
+            expectedActions: [...expectedActions],
+            fromModel,
+            toModel,
+            timestamp: new Date(),
+            compressedContext: this.shouldCompressContext(sessionId)
+                ? this.compressor.compress(this.compressor.pack(session.contextFragments), Math.floor(session.contextWindow.maxTokens * session.contextWindow.warningThreshold))
+                : undefined,
+        };
+        this.events.emit('handoff-prepared', { sessionId, payload });
+        return payload;
+    }
+    recordModelUsage(sessionId, model, tokensIn, tokensOut, cost, options = {}) {
+        const session = this.sessions.get(sessionId);
+        const metrics = [tokensIn, tokensOut, cost, options.latencyMs ?? 0];
+        if (!session || metrics.some((value) => !Number.isFinite(value) || value < 0) || !model.trim())
+            return false;
+        const usage = {
+            model: model.trim(),
+            tokensIn,
+            tokensOut,
+            totalTokens: tokensIn + tokensOut,
+            cost,
+            latencyMs: options.latencyMs,
+            success: options.success ?? true,
+            taskId: options.taskId,
+            timestamp: new Date(),
+        };
+        session.modelUsage.push(usage);
+        this.touchSession(session, 'model-usage-recorded');
+        return true;
+    }
+    getModelUsage(sessionId) {
+        const session = this.sessions.get(sessionId);
+        return session ? session.modelUsage.map((usage) => this.cloneModelUsage(usage)) : [];
+    }
+    getModelUsageTotals(sessionId) {
+        const usage = this.sessions.get(sessionId)?.modelUsage ?? [];
+        const totals = {
+            totalTokensIn: 0,
+            totalTokensOut: 0,
+            totalTokens: 0,
+            totalCost: 0,
+            averageLatencyMs: 0,
+            successRate: 0,
+            byModel: {},
+        };
+        let latencyCount = 0;
+        let successCount = 0;
+        for (const item of usage) {
+            totals.totalTokensIn += item.tokensIn;
+            totals.totalTokensOut += item.tokensOut;
+            totals.totalTokens += item.totalTokens;
+            totals.totalCost += item.cost;
+            if (item.success)
+                successCount += 1;
+            if (typeof item.latencyMs === 'number') {
+                totals.averageLatencyMs += item.latencyMs;
+                latencyCount += 1;
+            }
+            const bucket = totals.byModel[item.model] ?? { calls: 0, tokensIn: 0, tokensOut: 0, totalTokens: 0, cost: 0, averageLatencyMs: 0, successRate: 0 };
+            bucket.calls += 1;
+            bucket.tokensIn += item.tokensIn;
+            bucket.tokensOut += item.tokensOut;
+            bucket.totalTokens += item.totalTokens;
+            bucket.cost += item.cost;
+            if (typeof item.latencyMs === 'number')
+                bucket.averageLatencyMs += item.latencyMs;
+            if (item.success)
+                bucket.successRate += 1;
+            totals.byModel[item.model] = bucket;
+        }
+        totals.averageLatencyMs = latencyCount > 0 ? totals.averageLatencyMs / latencyCount : 0;
+        totals.successRate = usage.length > 0 ? successCount / usage.length : 0;
+        for (const bucket of Object.values(totals.byModel)) {
+            bucket.averageLatencyMs = bucket.calls > 0 ? bucket.averageLatencyMs / bucket.calls : 0;
+            bucket.successRate = bucket.calls > 0 ? bucket.successRate / bucket.calls : 0;
+        }
+        return totals;
+    }
+    getTotalCost(sessionId) {
+        return this.getModelUsageTotals(sessionId).totalCost;
+    }
+    saveSession(sessionId) {
+        const session = this.sessions.get(sessionId);
+        if (!session)
+            return null;
+        const filePath = this.getSessionFilePath(sessionId);
+        mkdirSync(this.persistence.baseDir, { recursive: true });
+        writeFileSync(filePath, JSON.stringify(this.serializeSession(session), null, 2), 'utf-8');
+        return filePath;
+    }
+    recoverSession(sessionId) {
+        const filePath = this.getSessionFilePath(sessionId);
+        if (!existsSync(filePath))
+            return null;
+        const raw = JSON.parse(readFileSync(filePath, 'utf-8'));
+        const session = this.deserializeSession(raw);
+        this.sessions.set(session.id, session);
+        this.touchSession(session, 'session-recovered');
+        return { session: this.cloneSession(session), source: 'persistence' };
+    }
+    async pushMemory(sessionId, options = {}) {
+        const session = this.sessions.get(sessionId);
+        if (!session || !this.memoryAdapter)
+            return null;
+        const fragments = this.buildMemoryFragments(session, options.tags ?? [], options.types ?? DEFAULT_MEMORY_ENTRY_TYPES);
+        const result = await this.memoryAdapter.push(fragments, sessionId);
+        session.lastMemorySyncAt = new Date(result.timestamp);
+        this.touchSession(session, 'memory-pushed');
+        const details = { result };
+        this.events.emit('memory-synced', { sessionId, details });
+        return details;
+    }
+    async pullMemory(sessionId, options = {}) {
+        const session = this.sessions.get(sessionId);
+        if (!session || !this.memoryAdapter)
+            return null;
+        const entries = await this.memoryAdapter.pull({ sessionId, tags: options.tags, types: options.types, since: options.since, limit: options.limit });
+        this.addContextFragments(sessionId, entries);
+        const result = {
+            mode: 'pull',
+            pulled: entries.length,
+            pushed: 0,
+            conflicts: 0,
+            errors: [],
+            timestamp: Date.now(),
+        };
+        session.lastMemorySyncAt = new Date(result.timestamp);
+        this.touchSession(session, 'memory-pulled');
+        const details = { result };
+        this.events.emit('memory-synced', { sessionId, details });
+        return details;
+    }
+    bindSessionMethods(session) {
+        session.attachToRuntime = (runtime) => {
+            this.attachToRuntime(session.id, runtime);
+        };
+        session.addPatch = (file, patch) => this.addPatch(session.id, file, patch);
+        session.addTestResult = (result) => this.addTestResult(session.id, result);
+        session.setRepoSnapshot = (snapshot) => {
+            this.setRepoSnapshot(session.id, snapshot);
+        };
+        session.selectContext = (budget) => this.selectContext(session.id, budget) ?? { fragments: [], totalTokens: 0, truncated: false };
+    }
+    buildMemoryFragments(session, tags, types) {
+        const now = Date.now();
+        const sharedTags = Array.from(new Set(['session', ...tags]));
+        const fragments = [];
+        if (types.includes('decision')) {
+            for (const decision of this.extractDecisions(session)) {
+                fragments.push({
+                    id: randomUUID(),
+                    type: 'system',
+                    content: `${decision.decision}\nReason: ${decision.reason}`,
+                    source: `session:${session.id}`,
+                    timestamp: now,
+                    metadata: { accessCount: 0, lastAccess: now, priority: 0.9, tags: [...sharedTags, 'decision'] },
+                });
+            }
+        }
+        if (types.includes('learning')) {
+            for (const task of session.tasks) {
+                for (const note of task.notes ?? []) {
+                    fragments.push({
+                        id: randomUUID(),
+                        type: 'doc',
+                        content: note,
+                        source: `task:${task.id}`,
+                        timestamp: now,
+                        metadata: { accessCount: 0, lastAccess: now, priority: 0.6, tags: [...sharedTags, 'learning'] },
+                    });
+                }
+            }
+        }
+        if (types.includes('context')) {
+            fragments.push(...session.contextFragments.map((fragment) => ({
+                ...this.cloneFragment(fragment),
+                metadata: { ...fragment.metadata, tags: Array.from(new Set([...fragment.metadata.tags, ...sharedTags, 'context'])) },
+            })));
+        }
+        if (types.includes('checkpoint')) {
+            for (const checkpoint of session.checkpoints) {
+                fragments.push({
+                    id: randomUUID(),
+                    type: 'system',
+                    content: `Checkpoint ${checkpoint.tag ?? checkpoint.id}: ${checkpoint.notes}`,
+                    source: `checkpoint:${checkpoint.id}`,
+                    timestamp: checkpoint.timestamp.getTime(),
+                    metadata: {
+                        accessCount: 0,
+                        lastAccess: checkpoint.timestamp.getTime(),
+                        priority: checkpoint.auto ? 0.5 : 0.75,
+                        tags: [...sharedTags, 'checkpoint'],
+                    },
+                });
+            }
+        }
+        if (types.includes('error')) {
+            for (const task of session.tasks.filter((candidate) => candidate.status === 'failed')) {
+                fragments.push({
+                    id: randomUUID(),
+                    type: 'error',
+                    content: task.notes?.at(-1) ?? `Task failed: ${task.goal}`,
+                    source: `task:${task.id}`,
+                    timestamp: now,
+                    metadata: { accessCount: 0, lastAccess: now, priority: 1, tags: [...sharedTags, 'error'] },
+                });
+            }
+        }
+        return fragments;
+    }
+    extractDecisions(session) {
+        const decisions = [];
+        for (const task of session.tasks) {
+            for (const note of task.notes ?? []) {
+                if (note.toLowerCase().startsWith('decision:')) {
+                    const content = note.slice('decision:'.length).trim();
+                    const [decision, ...reasonParts] = content.split('|');
+                    decisions.push({
+                        timestamp: task.updatedAt,
+                        decision: decision.trim(),
+                        reason: reasonParts.join('|').trim() || 'No reason captured',
+                    });
+                }
+            }
+        }
+        return decisions;
+    }
+    createSnapshot(session) {
+        return {
+            state: session.state,
+            currentTaskId: session.currentTask?.id ?? null,
+            taskStack: session.taskStack.map((task) => this.cloneTask(task)),
+            goalTree: session.goalTree.map((node) => this.cloneGoalNode(node)),
+            contextFragments: session.contextFragments.map((fragment) => this.cloneFragment(fragment)),
+            modelUsage: session.modelUsage.map((usage) => this.cloneModelUsage(usage)),
+            contextWindow: this.cloneContextWindow(session.contextWindow),
+            metadata: structuredClone(session.metadata),
+        };
+    }
+    applySnapshot(session, snapshot) {
+        session.state = snapshot.state;
+        session.taskStack = snapshot.taskStack.map((task) => this.cloneTask(task));
+        session.tasks = this.mergeTasks(session.tasks, session.taskStack);
+        session.goalTree = snapshot.goalTree.map((node) => this.cloneGoalNode(node));
+        session.contextFragments = snapshot.contextFragments.map((fragment) => this.cloneFragment(fragment));
+        session.modelUsage = snapshot.modelUsage.map((usage) => this.cloneModelUsage(usage));
+        session.contextWindow = this.cloneContextWindow(snapshot.contextWindow);
+        session.metadata = structuredClone(snapshot.metadata);
+        session.currentTask = session.taskStack.find((task) => task.id === snapshot.currentTaskId) ?? null;
+    }
+    mergeTasks(existing, fromStack) {
+        const merged = new Map();
+        for (const task of existing)
+            merged.set(task.id, this.cloneTask(task));
+        for (const task of fromStack)
+            merged.set(task.id, this.cloneTask(task));
+        return Array.from(merged.values());
+    }
+    buildContextWindow(partial) {
+        return {
+            ...DEFAULT_CONTEXT_WINDOW,
+            ...(partial ?? {}),
+            maxTokens: partial?.maxTokens && partial.maxTokens > 0 ? partial.maxTokens : DEFAULT_CONTEXT_WINDOW.maxTokens,
+            warningThreshold: partial?.warningThreshold ?? DEFAULT_CONTEXT_WINDOW.warningThreshold,
+            compressionThreshold: partial?.compressionThreshold ?? DEFAULT_CONTEXT_WINDOW.compressionThreshold,
+            currentTokens: partial?.currentTokens ?? 0,
+            lastCompressedAt: partial?.lastCompressedAt ?? null,
+        };
+    }
+    normalizeFragment(fragment) {
+        return {
+            ...fragment,
+            tokenCount: fragment.tokenCount ?? estimateTokens(fragment.content),
+            metadata: {
+                accessCount: fragment.metadata.accessCount,
+                lastAccess: fragment.metadata.lastAccess,
+                priority: fragment.metadata.priority,
+                tags: [...fragment.metadata.tags],
+            },
+        };
+    }
+    calculateTokens(fragments) {
+        return fragments.reduce((sum, fragment) => sum + (fragment.tokenCount ?? estimateTokens(fragment.content)), 0);
+    }
+    toRuntimeTaskSnapshot(task) {
+        return {
+            id: String(task.id ?? ''),
+            state: String(task.state ?? 'unknown'),
+            status: String(task.status ?? 'unknown'),
+            intent: String(task.intent ?? ''),
+            priority: typeof task.priority === 'string' ? task.priority : undefined,
+            updatedAt: typeof task.updatedAt === 'number' ? task.updatedAt : undefined,
+        };
+    }
+    findGoalNodeByTaskId(session, taskId) {
+        return session.goalTree.find((node) => node.taskId === taskId);
+    }
+    updateGoalNodeStatus(session, taskId, status, when) {
+        const node = this.findGoalNodeByTaskId(session, taskId);
+        if (!node)
+            return;
+        node.status = status;
+        node.updatedAt = when;
+    }
+    touchSession(session, reason) {
+        session.updatedAt = new Date();
+        if (this.persistence.autoSave)
+            this.saveSession(session.id);
+        this.events.emit('session-updated', { session: this.cloneSession(session), reason });
+    }
+    setState(session, newState) {
+        const oldState = session.state;
+        if (oldState === newState)
+            return;
+        session.state = newState;
+        this.touchSession(session, `state:${oldState}->${newState}`);
+        this.events.emit('state-change', { sessionId: session.id, from: oldState, to: newState });
+    }
+    getSessionFilePath(sessionId) {
+        return join(this.persistence.baseDir, `${sessionId}.json`);
+    }
+    serializeSession(session) {
+        return {
+            id: session.id,
+            state: session.state,
+            createdAt: session.createdAt.toISOString(),
+            updatedAt: session.updatedAt.toISOString(),
+            closedAt: session.closedAt?.toISOString() ?? null,
+            rootGoal: session.rootGoal,
+            taskStack: session.taskStack.map((task) => this.serializeTask(task)),
+            currentTaskId: session.currentTask?.id ?? null,
+            tasks: session.tasks.map((task) => this.serializeTask(task)),
+            goalTree: session.goalTree.map((node) => this.serializeGoalNode(node)),
+            checkpoints: session.checkpoints.map((checkpoint) => this.serializeCheckpoint(checkpoint)),
+            modelUsage: session.modelUsage.map((usage) => this.serializeModelUsage(usage)),
+            memoryPath: session.memoryPath,
+            parentSessionId: session.parentSessionId,
+            metadata: structuredClone(session.metadata),
+            contextFragments: session.contextFragments.map((fragment) => this.serializeFragment(fragment)),
+            contextWindow: this.serializeContextWindow(session.contextWindow),
+            lastMemorySyncAt: session.lastMemorySyncAt?.toISOString() ?? null,
+            runtimeQueue: this.serializeRuntimeQueue(session.runtimeQueue),
+            patchHistory: session.patchHistory.map((record) => this.serializePatchRecord(record)),
+            fileVersions: { ...session.fileVersions },
+            testResults: session.testResults.map((record) => this.serializeTestResult(record)),
+            repoSnapshot: session.repoSnapshot ? this.serializeRepoSnapshot(session.repoSnapshot) : null,
+            recoveryState: {
+                recoveredFromCheckpointId: session.recoveryState.recoveredFromCheckpointId,
+                recoveredAt: session.recoveryState.recoveredAt?.toISOString() ?? null,
+            },
+        };
+    }
+    deserializeSession(raw) {
+        const tasks = raw.tasks.map((task) => this.deserializeTask(task));
+        const taskMap = new Map(tasks.map((task) => [task.id, task]));
+        const taskStack = raw.taskStack.map((task) => taskMap.get(task.id) ?? this.deserializeTask(task));
+        const session = {
+            id: raw.id,
+            state: raw.state,
+            createdAt: new Date(raw.createdAt),
+            updatedAt: new Date(raw.updatedAt),
+            closedAt: raw.closedAt ? new Date(raw.closedAt) : null,
+            rootGoal: raw.rootGoal,
+            taskStack,
+            currentTask: raw.currentTaskId ? taskMap.get(raw.currentTaskId) ?? null : null,
+            tasks,
+            goalTree: raw.goalTree.map((node) => this.deserializeGoalNode(node)),
+            checkpoints: raw.checkpoints.map((checkpoint) => this.deserializeCheckpoint(checkpoint)),
+            modelUsage: raw.modelUsage.map((usage) => this.deserializeModelUsage(usage)),
+            memoryPath: raw.memoryPath,
+            parentSessionId: raw.parentSessionId,
+            metadata: structuredClone(raw.metadata),
+            contextFragments: raw.contextFragments.map((fragment) => this.deserializeFragment(fragment)),
+            contextWindow: this.deserializeContextWindow(raw.contextWindow),
+            lastMemorySyncAt: raw.lastMemorySyncAt ? new Date(raw.lastMemorySyncAt) : null,
+            runtimeQueue: this.deserializeRuntimeQueue(raw.runtimeQueue),
+            patchHistory: raw.patchHistory.map((record) => this.deserializePatchRecord(record)),
+            fileVersions: { ...(raw.fileVersions ?? {}) },
+            testResults: raw.testResults.map((record) => this.deserializeTestResult(record)),
+            repoSnapshot: raw.repoSnapshot ? this.deserializeRepoSnapshot(raw.repoSnapshot) : null,
+            recoveryState: {
+                recoveredFromCheckpointId: raw.recoveryState.recoveredFromCheckpointId,
+                recoveredAt: raw.recoveryState.recoveredAt ? new Date(raw.recoveryState.recoveredAt) : null,
+            },
+        };
+        this.bindSessionMethods(session);
+        return session;
+    }
+    serializeTask(task) {
+        return {
+            id: task.id,
+            parentId: task.parentId,
+            goal: task.goal,
+            criteria: [...task.criteria],
+            status: task.status,
+            createdAt: task.createdAt.toISOString(),
+            updatedAt: task.updatedAt.toISOString(),
+            completedAt: task.completedAt?.toISOString() ?? null,
+            metadata: structuredClone(task.metadata),
+            notes: [...(task.notes ?? [])],
+            contextFragments: (task.contextFragments ?? []).map((fragment) => this.serializeFragment(fragment)),
+        };
+    }
+    deserializeTask(raw) {
+        return {
+            id: raw.id,
+            parentId: raw.parentId,
+            goal: raw.goal,
+            criteria: [...raw.criteria],
+            status: raw.status,
+            createdAt: new Date(raw.createdAt),
+            updatedAt: new Date(raw.updatedAt),
+            completedAt: raw.completedAt ? new Date(raw.completedAt) : null,
+            metadata: structuredClone(raw.metadata),
+            notes: [...raw.notes],
+            contextFragments: raw.contextFragments.map((fragment) => this.deserializeFragment(fragment)),
+        };
+    }
+    serializeGoalNode(node) {
+        return { ...node, createdAt: node.createdAt.toISOString(), updatedAt: node.updatedAt.toISOString(), children: [...node.children] };
+    }
+    deserializeGoalNode(raw) {
+        return { ...raw, createdAt: new Date(raw.createdAt), updatedAt: new Date(raw.updatedAt), children: [...raw.children] };
+    }
+    serializeModelUsage(usage) {
+        return { ...usage, timestamp: usage.timestamp.toISOString() };
+    }
+    deserializeModelUsage(raw) {
+        return { ...raw, timestamp: new Date(raw.timestamp) };
+    }
+    serializeFragment(fragment) {
+        return { ...fragment, metadata: { ...fragment.metadata, tags: [...fragment.metadata.tags] } };
+    }
+    deserializeFragment(raw) {
+        return { ...raw, metadata: { ...raw.metadata, tags: [...raw.metadata.tags] } };
+    }
+    serializeContextWindow(window) {
+        return { ...window, lastCompressedAt: window.lastCompressedAt?.toISOString() ?? null };
+    }
+    deserializeContextWindow(raw) {
+        return { ...raw, lastCompressedAt: raw.lastCompressedAt ? new Date(raw.lastCompressedAt) : null };
+    }
+    serializeCheckpoint(checkpoint) {
+        return {
+            id: checkpoint.id,
+            sessionId: checkpoint.sessionId,
+            tag: checkpoint.tag,
+            timestamp: checkpoint.timestamp.toISOString(),
+            fileHashes: Array.from(checkpoint.fileHashes.entries()),
+            cursorPositions: Array.from(checkpoint.cursorPositions.entries()).map(([path, value]) => [path, { ...value }]),
+            taskContextId: checkpoint.taskContextId,
+            notes: checkpoint.notes,
+            auto: checkpoint.auto,
+            snapshot: this.serializeSnapshot(checkpoint.snapshot),
+        };
+    }
+    deserializeCheckpoint(raw) {
+        return {
+            id: raw.id,
+            sessionId: raw.sessionId,
+            tag: raw.tag,
+            timestamp: new Date(raw.timestamp),
+            fileHashes: new Map(raw.fileHashes),
+            cursorPositions: new Map(raw.cursorPositions.map(([path, value]) => [path, { ...value }])),
+            taskContextId: raw.taskContextId,
+            notes: raw.notes,
+            auto: raw.auto,
+            snapshot: this.deserializeSnapshot(raw.snapshot),
+        };
+    }
+    serializeSnapshot(snapshot) {
+        return {
+            state: snapshot.state,
+            currentTaskId: snapshot.currentTaskId,
+            taskStack: snapshot.taskStack.map((task) => this.serializeTask(task)),
+            goalTree: snapshot.goalTree.map((node) => this.serializeGoalNode(node)),
+            contextFragments: snapshot.contextFragments.map((fragment) => this.serializeFragment(fragment)),
+            modelUsage: snapshot.modelUsage.map((usage) => this.serializeModelUsage(usage)),
+            contextWindow: this.serializeContextWindow(snapshot.contextWindow),
+            metadata: structuredClone(snapshot.metadata),
+        };
+    }
+    deserializeSnapshot(raw) {
+        return {
+            state: raw.state,
+            currentTaskId: raw.currentTaskId,
+            taskStack: raw.taskStack.map((task) => this.deserializeTask(task)),
+            goalTree: raw.goalTree.map((node) => this.deserializeGoalNode(node)),
+            contextFragments: raw.contextFragments.map((fragment) => this.deserializeFragment(fragment)),
+            modelUsage: raw.modelUsage.map((usage) => this.deserializeModelUsage(usage)),
+            contextWindow: this.deserializeContextWindow(raw.contextWindow),
+            metadata: structuredClone(raw.metadata),
+        };
+    }
+    serializeRuntimeQueue(runtimeQueue) {
+        return {
+            activeTaskId: runtimeQueue.activeTaskId,
+            queue: runtimeQueue.queue.map((task) => ({ ...task })),
+            activeTask: runtimeQueue.activeTask ? { ...runtimeQueue.activeTask } : null,
+            lastSyncedAt: runtimeQueue.lastSyncedAt?.toISOString() ?? null,
+        };
+    }
+    deserializeRuntimeQueue(raw) {
+        return {
+            activeTaskId: raw.activeTaskId,
+            queue: raw.queue.map((task) => ({ ...task })),
+            activeTask: raw.activeTask ? { ...raw.activeTask } : null,
+            lastSyncedAt: raw.lastSyncedAt ? new Date(raw.lastSyncedAt) : null,
+        };
+    }
+    serializePatchRecord(record) {
+        return { ...record, patch: structuredClone(record.patch), timestamp: record.timestamp.toISOString() };
+    }
+    deserializePatchRecord(raw) {
+        return { ...raw, patch: structuredClone(raw.patch), timestamp: new Date(raw.timestamp) };
+    }
+    serializeTestResult(record) {
+        return { ...record, result: structuredClone(record.result), timestamp: record.timestamp.toISOString() };
+    }
+    deserializeTestResult(raw) {
+        return { ...raw, result: structuredClone(raw.result), timestamp: new Date(raw.timestamp) };
+    }
+    serializeRepoSnapshot(snapshot) {
+        return { snapshot: this.serializeFileIndex(snapshot.snapshot), updatedAt: snapshot.updatedAt.toISOString() };
+    }
+    deserializeRepoSnapshot(raw) {
+        return { snapshot: this.deserializeFileIndex(raw.snapshot), updatedAt: new Date(raw.updatedAt) };
+    }
+    serializeFileIndex(index) {
+        const raw = index;
+        return {
+            ...raw,
+            rootDir: index.rootDir,
+            files: Array.from(index.files.entries()),
+            directories: Array.from(index.directories.entries()),
+            languages: Array.from(index.languages.entries()),
+            generatedAt: index.generatedAt,
+            gitInfo: raw.gitInfo,
+        };
+    }
+    deserializeFileIndex(raw) {
+        return {
+            ...raw,
+            rootDir: raw.rootDir,
+            files: new Map(raw.files),
+            directories: new Map(raw.directories),
+            languages: new Map(raw.languages),
+            generatedAt: raw.generatedAt,
+            gitInfo: raw.gitInfo,
+        };
+    }
+    cloneSession(session) {
+        return this.deserializeSession(this.serializeSession(session));
+    }
+    cloneTask(task) { return this.deserializeTask(this.serializeTask(task)); }
+    cloneGoalNode(node) { return this.deserializeGoalNode(this.serializeGoalNode(node)); }
+    cloneModelUsage(usage) { return this.deserializeModelUsage(this.serializeModelUsage(usage)); }
+    cloneCheckpoint(checkpoint) { return this.deserializeCheckpoint(this.serializeCheckpoint(checkpoint)); }
+    cloneFragment(fragment) { return this.deserializeFragment(this.serializeFragment(fragment)); }
+    cloneContextWindow(window) { return this.deserializeContextWindow(this.serializeContextWindow(window)); }
+    cloneRuntimeQueue(runtimeQueue) { return this.deserializeRuntimeQueue(this.serializeRuntimeQueue(runtimeQueue)); }
+    clonePatchRecord(record) { return this.deserializePatchRecord(this.serializePatchRecord(record)); }
+    cloneTestResult(record) { return this.deserializeTestResult(this.serializeTestResult(record)); }
+    cloneRepoSnapshot(snapshot) { return this.deserializeRepoSnapshot(this.serializeRepoSnapshot(snapshot)); }
+    cloneFileIndex(index) { return this.deserializeFileIndex(this.serializeFileIndex(index)); }
+}
+export const sessionManager = new SessionManager();

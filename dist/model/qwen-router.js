@@ -1,0 +1,585 @@
+/**
+ * Thread 09: Qwen Executor Router
+ * Full Qwen executor routing with model selection, retries, batching, caching,
+ * fallback handling, and lightweight policy/telemetry integration.
+ */
+import { createHash } from 'node:crypto';
+import { telemetry, telemetryMetrics } from '../core/telemetry.js';
+import { DEFAULT_ROUTER_CONFIG } from './types.js';
+const DEFAULT_QWEN_ROUTER_CONFIG = {
+    ...DEFAULT_ROUTER_CONFIG,
+    maxContextTokens: 128000,
+    retryLimit: 2,
+    retryBackoffMs: 150,
+    cacheTtlMs: 60_000,
+    enableCaching: true,
+    defaultModel: 'qwen-3.6',
+    fallbackModel: 'qwen-3.6-fast',
+    latencySensitiveThresholdMs: 2_500,
+    outputTokenReserve: 2048,
+    confidenceThreshold: 0.7,
+    escalationFileCountThreshold: 5,
+    minHistoricalSuccessRate: 0.6,
+};
+const MODEL_PROFILES = {
+    'qwen-3.6': { id: 'qwen-3.6', contextWindow: 128000, inputCostPer1k: 0.001, outputCostPer1k: 0.002, averageLatencyMs: 2200, supportsTools: true, strengths: ['general', 'large-context'] },
+    'qwen-coder': { id: 'qwen-coder', contextWindow: 64000, inputCostPer1k: 0.0015, outputCostPer1k: 0.0025, averageLatencyMs: 2600, supportsTools: true, strengths: ['coding'] },
+    'qwen-3.6-fast': { id: 'qwen-3.6-fast', contextWindow: 32000, inputCostPer1k: 0.0006, outputCostPer1k: 0.0012, averageLatencyMs: 1200, supportsTools: false, strengths: ['latency'] },
+};
+function estimateTokens(text) {
+    return Math.ceil(text.length / 4);
+}
+function createNoopSpan() {
+    return { setAttribute() { }, addEvent() { }, setStatus() { }, recordException() { } };
+}
+function cloneResult(result) {
+    return JSON.parse(JSON.stringify(result));
+}
+export class QwenExecutorRouter {
+    config;
+    provider;
+    policy;
+    telemetry;
+    telemetryMetrics;
+    activeSlots = new Map();
+    cache = new Map();
+    poolLoad = new Map();
+    requestHistory = [];
+    policyDecisionCache = new Map();
+    cacheHits = 0;
+    cacheMisses = 0;
+    slotSequence = 0;
+    metrics;
+    constructor(config = {}, dependencies = {}) {
+        this.config = { ...DEFAULT_QWEN_ROUTER_CONFIG, ...config };
+        this.provider = dependencies.provider ?? { execute: async () => ({ content: 'ok', tokensUsed: 0, outputTokens: 0 }) };
+        this.policy = dependencies.policy;
+        this.telemetry = dependencies.telemetry ?? telemetry;
+        this.telemetryMetrics = dependencies.telemetry?.getMetricsCollector?.() ?? telemetryMetrics;
+        this.metrics = { totalRequests: 0, successfulRequests: 0, failedRequests: 0, averageLatencyMs: 0, currentLoad: 0, maxConcurrency: this.config.maxConcurrency };
+        for (const model of Object.keys(MODEL_PROFILES))
+            this.poolLoad.set(model, 0);
+    }
+    async route(request) {
+        const normalized = this.normalizeRequest(request);
+        const span = this.startSpan('jackcode.qwen.route', { task_id: normalized.taskId, priority: normalized.priority, operation_count: normalized.operations.length });
+        const start = Date.now();
+        this.metrics.totalRequests += 1;
+        try {
+            const cacheKey = this.createCacheKey(normalized);
+            const cached = this.getCached(cacheKey);
+            if (cached) {
+                this.cacheHits += 1;
+                span.addEvent?.('cache_hit');
+                this.telemetryMetrics.incrementCounter('jackcode.qwen.cache_hit', 1, { model: 'cache' });
+                return cached;
+            }
+            this.cacheMisses += 1;
+            const slot = await this.acquireSlot(normalized.priority, normalized.timeoutMs);
+            try {
+                const prepared = this.prepareRequest(normalized);
+                const result = this.selectStrategy(normalized) === 'batch' && this.config.enableBatching
+                    ? await this.executeBatch(normalized, prepared, slot, span)
+                    : await this.executeSingle(normalized, prepared, slot, span);
+                this.updateMetrics(result.success, Date.now() - start);
+                this.telemetryMetrics.recordHistogram('jackcode.qwen.route_latency_ms', Date.now() - start, { model: prepared.model });
+                if (this.config.enableCaching && result.success) {
+                    this.cache.set(cacheKey, { result: cloneResult(result), expiresAt: Date.now() + this.config.cacheTtlMs });
+                }
+                span.setStatus?.({ code: 'ok' });
+                return result;
+            }
+            finally {
+                this.releaseSlot(slot);
+            }
+        }
+        catch (error) {
+            this.metrics.failedRequests += 1;
+            span.recordException?.(error);
+            span.setStatus?.({ code: 'error', message: error instanceof Error ? error.message : String(error) });
+            return this.createErrorResult(normalized.taskId, error);
+        }
+    }
+    async batchRoute(requests) {
+        if (requests.length > this.config.maxBatchSize)
+            throw new Error(`Batch size ${requests.length} exceeds maximum ${this.config.maxBatchSize}`);
+        const results = new Array(requests.length);
+        const inflight = new Set();
+        for (const [index, request] of requests.entries()) {
+            let promise;
+            promise = this.route(request).then((result) => { results[index] = result; }).finally(() => { inflight.delete(promise); });
+            inflight.add(promise);
+            if (inflight.size >= this.config.maxConcurrency)
+                await Promise.race(inflight);
+        }
+        await Promise.all(inflight);
+        return results;
+    }
+    canHandle(context) {
+        const tokens = typeof context === 'number' ? context : (context.stats?.finalTokens ?? estimateTokens(context.content));
+        return tokens <= this.config.maxContextTokens;
+    }
+    getMetrics() {
+        return { ...this.metrics };
+    }
+    prepareRequest(request) {
+        const contextTokens = request.context.stats?.finalTokens ?? estimateTokens(request.context.content);
+        const policyDecision = this.getPolicyDecision(request, contextTokens);
+        const qwenCapability = this.assessQwenCapability(request, contextTokens, policyDecision);
+        const model = this.selectModel(request, contextTokens, policyDecision, qwenCapability);
+        const profile = MODEL_PROFILES[model];
+        const trimmedContext = this.optimizeContext(request, profile.contextWindow, request.maxOutputTokens);
+        const systemPrompt = request.systemPrompt?.trim() || this.buildSystemPrompt(request, policyDecision);
+        const userPrompt = request.userPrompt?.trim() || this.buildUserPrompt(request, trimmedContext, policyDecision);
+        const messages = [{ role: 'system', content: systemPrompt }, { role: 'user', content: userPrompt }];
+        const tools = (request.tools ?? []).filter((tool) => profile.supportsTools || tool.name.length === 0);
+        const inputTokens = estimateTokens(`${systemPrompt}\n${userPrompt}`);
+        const maxOutputTokens = Math.max(256, request.maxOutputTokens ?? this.config.outputTokenReserve);
+        return {
+            model,
+            messages,
+            contextWindow: profile.contextWindow,
+            inputTokens,
+            maxOutputTokens,
+            timeoutMs: request.timeoutMs > 0 ? request.timeoutMs : this.config.defaultTimeoutMs,
+            stream: request.stream === true,
+            tools: profile.supportsTools ? tools : [],
+            metadata: {
+                taskId: request.taskId,
+                operationCount: request.operations.length,
+                contextTokens,
+                policyDecision: policyDecision?.selectedModel,
+                qwenCapability,
+            },
+        };
+    }
+    classifyError(error) {
+        const message = error instanceof Error ? error.message : String(error);
+        const normalized = message.toLowerCase();
+        if (normalized.includes('429') || normalized.includes('rate limit') || normalized.includes('too many requests'))
+            return 'rate_limit';
+        if (normalized.includes('timeout') || normalized.includes('timed out'))
+            return 'timeout';
+        if (normalized.includes('context') || normalized.includes('token') || normalized.includes('maximum length'))
+            return 'context_overflow';
+        if (normalized.includes('tool'))
+            return 'tool_error';
+        if (normalized.includes('temporary') || normalized.includes('transient') || normalized.includes('unavailable'))
+            return 'transient';
+        return 'fatal';
+    }
+    normalizeRequest(request) {
+        const normalized = request;
+        return { ...normalized, timeoutMs: normalized.timeoutMs > 0 ? normalized.timeoutMs : this.config.defaultTimeoutMs, metadata: { ...(normalized.metadata ?? {}) } };
+    }
+    async acquireSlot(priority, requestTimeoutMs) {
+        const routerTimeoutMs = priority === 'critical' ? this.config.criticalTimeoutMs : this.config.defaultTimeoutMs;
+        const effectiveTimeoutMs = Math.min(requestTimeoutMs ?? routerTimeoutMs, routerTimeoutMs);
+        const deadline = Date.now() + effectiveTimeoutMs;
+        while (this.activeSlots.size >= this.config.maxConcurrency) {
+            if (Date.now() >= deadline)
+                throw new Error('timeout acquiring execution slot');
+            await this.sleep(25);
+        }
+        const acquiredAt = Date.now();
+        const slot = { id: `slot_${acquiredAt}_${this.slotSequence++}`, acquiredAt, expiresAt: acquiredAt + effectiveTimeoutMs };
+        this.activeSlots.set(slot.id, slot);
+        this.metrics.currentLoad = this.activeSlots.size;
+        this.telemetryMetrics.recordGauge('jackcode.qwen.current_load', this.metrics.currentLoad, { priority });
+        return slot;
+    }
+    releaseSlot(slot) {
+        this.activeSlots.delete(slot.id);
+        this.metrics.currentLoad = this.activeSlots.size;
+    }
+    selectStrategy(request) {
+        return request.operations.length > 1 ? 'batch' : 'single';
+    }
+    getPolicyDecision(request, contextTokens) {
+        if (!this.policy?.selectModel)
+            return undefined;
+        const key = JSON.stringify({
+            taskId: request.taskId,
+            taskType: this.inferTaskType(request),
+            files: request.operations.map((operation) => operation.targetFile).sort(),
+            estimatedTokens: contextTokens,
+            failureCount: Number(request.metadata?.failureCount ?? 0),
+            urgency: request.priority === 'critical' ? 'critical' : request.priority,
+        });
+        const cached = this.policyDecisionCache.get(key);
+        if (cached)
+            return cached;
+        const decision = this.policy.selectModel({
+            taskId: request.taskId,
+            taskType: this.inferTaskType(request),
+            files: request.operations.map((operation) => operation.targetFile),
+            estimatedTokens: contextTokens,
+            failureCount: Number(request.metadata?.failureCount ?? 0),
+            urgency: request.priority === 'critical' ? 'critical' : request.priority,
+            requiresReasoning: false,
+            qwenConfidence: this.estimateQwenConfidence(request, contextTokens),
+            qwenHistoricalSuccessRate: undefined,
+            architectureChange: this.isArchitectureChange(request),
+            escalationAttemptCount: Number(request.metadata?.escalationAttemptCount ?? 0),
+        });
+        if (decision)
+            this.policyDecisionCache.set(key, decision);
+        return decision;
+    }
+    selectModel(request, contextTokens, policyDecision, qwenCapability) {
+        if (policyDecision?.budgetStatus?.allowed === false) {
+            return 'qwen-3.6-fast';
+        }
+        if (!qwenCapability.canHandle && qwenCapability.contextFits) {
+            return 'qwen-3.6';
+        }
+        if (this.requiresCoderModel(request)) {
+            return contextTokens > MODEL_PROFILES['qwen-coder'].contextWindow ? 'qwen-3.6' : 'qwen-coder';
+        }
+        return this.pickByCapability(contextTokens, request);
+    }
+    pickByCapability(contextTokens, request) {
+        if (request.tools?.length)
+            return contextTokens > MODEL_PROFILES['qwen-coder'].contextWindow ? 'qwen-3.6' : 'qwen-coder';
+        if (contextTokens > MODEL_PROFILES['qwen-3.6-fast'].contextWindow)
+            return 'qwen-3.6';
+        const cheapCandidate = request.priority === 'normal' ? 'qwen-3.6-fast' : this.config.defaultModel;
+        return this.isCostAllowed(cheapCandidate, contextTokens, request.maxOutputTokens) ? cheapCandidate : this.config.defaultModel;
+    }
+    assessQwenCapability(request, contextTokens, policyDecision) {
+        const confidence = this.estimateQwenConfidence(request, contextTokens);
+        const contextFits = contextTokens <= this.config.maxContextTokens;
+        const historicalSuccessRate = policyDecision?.qwenAssessment?.historicalSuccessRate ?? null;
+        const fileCount = request.operations.map((operation) => operation.targetFile).filter(Boolean).length;
+        const repeatedFailures = Number(request.metadata?.failureCount ?? 0) >= this.config.retryLimit;
+        const architectureChange = this.isArchitectureChange(request);
+        const reasons = [];
+        if (confidence < this.config.confidenceThreshold)
+            reasons.push('confidence_below_threshold');
+        if (!contextFits)
+            reasons.push('context_window_exceeded');
+        if (fileCount > this.config.escalationFileCountThreshold)
+            reasons.push('multi_file_change');
+        if (repeatedFailures)
+            reasons.push('repeated_failures');
+        if (architectureChange)
+            reasons.push('architecture_change');
+        if (historicalSuccessRate !== null && historicalSuccessRate < this.config.minHistoricalSuccessRate) {
+            reasons.push('historical_success_below_threshold');
+        }
+        return {
+            canHandle: contextFits,
+            confidence,
+            contextFits,
+            historicalSuccessRate,
+            shouldEscalate: reasons.length > 0,
+            reasons,
+        };
+    }
+    estimateQwenConfidence(request, contextTokens) {
+        let confidence = 0.9;
+        const fileCount = request.operations.map((operation) => operation.targetFile).filter(Boolean).length;
+        if (contextTokens > MODEL_PROFILES['qwen-coder'].contextWindow)
+            confidence -= 0.08;
+        if (fileCount > this.config.escalationFileCountThreshold)
+            confidence -= 0.15;
+        if (Number(request.metadata?.failureCount ?? 0) >= this.config.retryLimit)
+            confidence -= 0.18;
+        if (this.isArchitectureChange(request))
+            confidence -= 0.2;
+        if (request.operations.some((operation) => operation.type === 'refactor'))
+            confidence -= 0.05;
+        return Math.max(0, Math.min(1, confidence));
+    }
+    isArchitectureChange(request) {
+        const corpus = [request.userPrompt, request.systemPrompt, ...request.operations.map((operation) => operation.description)].join(' ').toLowerCase();
+        return /architecture|design|migration|boundary|dependency graph|service contract/.test(corpus);
+    }
+    requiresCoderModel(request) {
+        return request.operations.some((operation) => operation.type === 'edit' || operation.type === 'refactor' || /fix|implement|refactor/i.test(operation.description));
+    }
+    inferTaskType(request) {
+        if (request.operations.length > 1)
+            return 'batch_operation';
+        const operation = request.operations[0];
+        if (!operation)
+            return 'simple_edit';
+        if (operation.type === 'refactor' || /refactor/i.test(operation.description))
+            return 'refactor';
+        if (/fix|bug|repair|regression/i.test(operation.description))
+            return 'build_fix';
+        if (/implement|add|create|feature/i.test(operation.description))
+            return 'multi_file_change';
+        return 'simple_edit';
+    }
+    isCostAllowed(model, inputTokens, outputTokens) {
+        const estimatedCost = this.estimateCost(model, inputTokens, outputTokens ?? this.config.outputTokenReserve);
+        const budget = this.policy?.checkBudget?.(estimatedCost);
+        return budget?.allowed ?? true;
+    }
+    optimizeContext(request, window, requestedOutputTokens) {
+        const reserve = Math.max(512, requestedOutputTokens ?? this.config.outputTokenReserve);
+        const promptBudget = Math.max(1000, window - reserve - 1024);
+        const content = request.context.content;
+        if (estimateTokens(content) <= promptBudget)
+            return content;
+        const ops = request.operations.map((op) => `${op.targetFile} ${op.description}`).join('\n').toLowerCase();
+        const blocks = content.split(/\n{2,}/).map((block) => block.trim()).filter(Boolean);
+        const scored = blocks.map((block, index) => ({ block, score: this.scoreContextBlock(block, index, ops) }));
+        scored.sort((a, b) => b.score - a.score || a.block.length - b.block.length);
+        const kept = [];
+        let used = 0;
+        for (const item of scored) {
+            const blockTokens = estimateTokens(item.block);
+            if (used + blockTokens > promptBudget && kept.length > 0)
+                continue;
+            kept.push(item.block);
+            used += blockTokens;
+            if (used >= promptBudget)
+                break;
+        }
+        return `${kept.join('\n\n')}\n\n[... unrelated implementation details omitted for Qwen budget ...]`;
+    }
+    scoreContextBlock(block, index, ops) {
+        const text = block.toLowerCase();
+        let score = 0;
+        if (/^import\s|^export\s/m.test(block))
+            score += 9;
+        if (/interface\s+|type\s+|class\s+|function\s+|const\s+\w+\s*=\s*\(/m.test(block))
+            score += 8;
+        if (/describe\(|it\(|test\(/m.test(block))
+            score += 7;
+        if (/\.test\.|\.spec\./.test(text))
+            score += 6;
+        if (/recent|modified|changed/.test(text))
+            score += 4;
+        if (ops.split(/\s+/).some((token) => token.length > 3 && text.includes(token)))
+            score += 5;
+        if (/console\.log|debugger|temporary|todo/i.test(block))
+            score -= 3;
+        score += Math.max(0, 3 - index * 0.1);
+        return score;
+    }
+    buildSystemPrompt(request, policyDecision) {
+        const taskType = this.inferTaskType(request);
+        const styleGuide = [
+            'Preserve existing project conventions and naming.',
+            'Keep public interfaces stable unless the task explicitly requires an API change.',
+            'Prefer minimal, reviewable patches over broad rewrites.',
+            'Avoid unrelated edits, debug leftovers, and speculative refactors.',
+        ].join(' ');
+        const projectStructure = `Project structure hint: prioritize imports, exported signatures, interfaces, and adjacent tests for files: ${request.operations.map((op) => op.targetFile).join(', ')}.`;
+        const taskDirective = taskType === 'refactor'
+            ? 'You are performing a refactor. Improve structure without changing intended behavior unless explicitly requested.'
+            : taskType === 'build_fix'
+                ? 'You are fixing a defect. Diagnose the failing behavior and apply the smallest safe correction.'
+                : 'You are implementing code changes. Add the requested behavior while preserving compatibility.';
+        const policyLine = policyDecision ? `Policy selected tier=${policyDecision.selectedModel}; obey budget and keep output within scope.` : 'No stricter policy override was supplied.';
+        return ['You are Qwen executing code changes for JackCode.', taskDirective, styleGuide, projectStructure, policyLine, 'Return implementation-ready output with clear patch content only.'].join(' ');
+    }
+    buildUserPrompt(request, optimizedContext, policyDecision) {
+        return [
+            `Task ID: ${request.taskId}`,
+            `Priority: ${request.priority}`,
+            `Policy decision: ${policyDecision?.selectedModel ?? 'local-router'}`,
+            'Repository context (relevance-ranked):',
+            optimizedContext,
+            'Requested operations:',
+            ...request.operations.map((operation) => `- [${operation.type}] ${operation.targetFile}: ${operation.description}`),
+            'Execution requirements:',
+            '- Preserve function signatures and imports unless the task demands a change.',
+            '- Prefer touching related tests over unrelated modules.',
+            '- If context is incomplete, make the smallest safe assumption.',
+        ].join('\n');
+    }
+    async executeSingle(request, prepared, _slot, span) {
+        const startedAt = Date.now();
+        const response = await this.executeWithRetry(prepared, request, span);
+        const latency = Date.now() - startedAt;
+        const operation = request.operations[0];
+        const completed = { ...operation, success: true, diff: response.content, latencyMs: latency };
+        return {
+            taskId: request.taskId,
+            success: true,
+            operations: [completed],
+            metrics: {
+                latencyMs: latency,
+                tokensUsed: response.tokensUsed ?? prepared.inputTokens + (response.outputTokens ?? 0),
+                cacheHitRatio: this.calculateCacheHitRatio(),
+                retryCount: Number(response.metadata?.retryCount ?? 0),
+            },
+        };
+    }
+    async executeBatch(request, prepared, _slot, span) {
+        const batchSize = Math.min(this.config.maxConcurrency, this.config.maxBatchSize);
+        const operations = request.operations;
+        const completed = [];
+        let totalLatency = 0;
+        let totalTokens = 0;
+        let retryCount = 0;
+        for (let index = 0; index < operations.length; index += batchSize) {
+            const chunk = operations.slice(index, index + batchSize);
+            span.addEvent?.('batch_chunk', { size: chunk.length, index });
+            const chunkResults = await Promise.all(chunk.map(async (operation) => {
+                const opRequest = { ...request, operations: [operation], stream: false };
+                const opPrepared = this.prepareRequest(opRequest);
+                const startedAt = Date.now();
+                const response = await this.executeWithRetry(opPrepared, opRequest, span);
+                const latencyMs = Date.now() - startedAt;
+                totalLatency += latencyMs;
+                totalTokens += response.tokensUsed ?? 0;
+                retryCount += Number(response.metadata?.retryCount ?? 0);
+                return { ...operation, success: true, diff: response.content, latencyMs };
+            }));
+            completed.push(...chunkResults);
+        }
+        return {
+            taskId: request.taskId,
+            success: completed.every((operation) => operation.success),
+            operations: completed,
+            metrics: {
+                latencyMs: totalLatency,
+                tokensUsed: totalTokens || prepared.inputTokens,
+                cacheHitRatio: this.calculateCacheHitRatio(),
+                retryCount,
+            },
+        };
+    }
+    async executeWithRetry(prepared, request, span) {
+        let lastError;
+        let activeModel = prepared.model;
+        let retryCount = 0;
+        while (retryCount <= this.config.retryLimit) {
+            const currentPrepared = activeModel === prepared.model ? prepared : { ...prepared, model: activeModel, tools: MODEL_PROFILES[activeModel].supportsTools ? prepared.tools : [] };
+            this.incrementPool(activeModel);
+            try {
+                const response = await this.invokeProvider(currentPrepared, request);
+                response.metadata = { ...(response.metadata ?? {}), retryCount };
+                this.telemetryMetrics.incrementCounter('jackcode.qwen.request_success', 1, { model: activeModel });
+                return response;
+            }
+            catch (error) {
+                lastError = error;
+                const classification = this.classifyError(error);
+                span.addEvent?.('retryable_error', { classification, retryCount, model: activeModel });
+                this.telemetryMetrics.incrementCounter('jackcode.qwen.request_error', 1, { model: activeModel, type: classification });
+                if (!this.shouldRetry(classification, retryCount))
+                    break;
+                retryCount += 1;
+                const failedModel = activeModel;
+                if (classification === 'rate_limit' || classification === 'timeout')
+                    activeModel = this.selectFallbackModel(activeModel, prepared, request);
+                this.decrementPool(failedModel);
+                await this.sleep(this.config.retryBackoffMs * retryCount);
+                continue;
+            }
+            finally {
+                this.decrementPool(activeModel);
+            }
+        }
+        throw lastError instanceof Error ? lastError : new Error(String(lastError));
+    }
+    async invokeProvider(prepared, request) {
+        if (prepared.stream && typeof this.provider.stream === 'function') {
+            let streamed = '';
+            const response = await this.provider.stream(prepared, (chunk) => { streamed += chunk; request.onStreamChunk?.(chunk); });
+            return { ...response, content: response.content ?? streamed, tokensUsed: response.tokensUsed ?? prepared.inputTokens + estimateTokens(streamed) };
+        }
+        const response = await this.provider.execute(prepared);
+        return { ...response, tokensUsed: response.tokensUsed ?? prepared.inputTokens + (response.outputTokens ?? estimateTokens(response.content ?? '')) };
+    }
+    shouldRetry(type, retryCount) {
+        if (retryCount >= this.config.retryLimit)
+            return false;
+        return type === 'rate_limit' || type === 'timeout' || type === 'transient';
+    }
+    selectFallbackModel(activeModel, prepared, request) {
+        if (this.canHandleWithModel(this.config.fallbackModel, prepared.inputTokens, request.maxOutputTokens))
+            return this.config.fallbackModel;
+        if (activeModel !== 'qwen-3.6' && this.canHandleWithModel('qwen-3.6', prepared.inputTokens, request.maxOutputTokens))
+            return 'qwen-3.6';
+        return activeModel;
+    }
+    canHandleWithModel(model, inputTokens, outputTokens) {
+        return inputTokens + (outputTokens ?? this.config.outputTokenReserve) <= MODEL_PROFILES[model].contextWindow;
+    }
+    createErrorResult(taskId, error) {
+        const message = error instanceof Error ? error.message : String(error);
+        const classification = this.classifyError(error);
+        return {
+            taskId,
+            success: false,
+            operations: [],
+            metrics: { latencyMs: 0, tokensUsed: 0, cacheHitRatio: this.calculateCacheHitRatio(), retryCount: 0 },
+            escalation: this.toEscalationReason(classification, message),
+        };
+    }
+    toEscalationReason(type, message) {
+        if (type === 'timeout' || type === 'rate_limit')
+            return 'timeout';
+        if (type === 'context_overflow')
+            return 'context_overflow';
+        if (message.toLowerCase().includes('syntax') || message.toLowerCase().includes('parse'))
+            return 'syntax_error';
+        if (message.toLowerCase().includes('dependency') || message.toLowerCase().includes('import'))
+            return 'dependency_conflict';
+        return 'max_retries_exceeded';
+    }
+    createCacheKey(request) {
+        const payload = JSON.stringify({ taskId: request.taskId, priority: request.priority, context: request.context.content, operations: request.operations, systemPrompt: request.systemPrompt, userPrompt: request.userPrompt, tools: request.tools, stream: request.stream });
+        return createHash('sha1').update(payload).digest('hex');
+    }
+    getCached(key) {
+        const cached = this.cache.get(key);
+        if (!cached)
+            return null;
+        if (cached.expiresAt < Date.now()) {
+            this.cache.delete(key);
+            return null;
+        }
+        return cloneResult(cached.result);
+    }
+    calculateCacheHitRatio() {
+        const total = this.cacheHits + this.cacheMisses;
+        return total === 0 ? 0 : this.cacheHits / total;
+    }
+    updateMetrics(success, latencyMs) {
+        if (success)
+            this.metrics.successfulRequests += 1;
+        else
+            this.metrics.failedRequests += 1;
+        this.requestHistory.push(latencyMs);
+        if (this.requestHistory.length > 100)
+            this.requestHistory.shift();
+        this.metrics.averageLatencyMs = this.requestHistory.reduce((sum, value) => sum + value, 0) / this.requestHistory.length;
+    }
+    incrementPool(model) {
+        const next = (this.poolLoad.get(model) ?? 0) + 1;
+        this.poolLoad.set(model, next);
+        this.telemetryMetrics.recordGauge('jackcode.qwen.pool_load', next, { model });
+    }
+    decrementPool(model) {
+        const next = Math.max(0, (this.poolLoad.get(model) ?? 1) - 1);
+        this.poolLoad.set(model, next);
+        this.telemetryMetrics.recordGauge('jackcode.qwen.pool_load', next, { model });
+    }
+    estimateCost(model, inputTokens, outputTokens) {
+        const profile = MODEL_PROFILES[model];
+        return (inputTokens / 1000) * profile.inputCostPer1k + (outputTokens / 1000) * profile.outputCostPer1k;
+    }
+    startSpan(name, attributes) {
+        try {
+            return this.telemetry.startSpan(name, { attributes }) ?? createNoopSpan();
+        }
+        catch {
+            return createNoopSpan();
+        }
+    }
+    sleep(ms) {
+        return new Promise((resolve) => setTimeout(resolve, ms));
+    }
+}
+export const qwenRouter = new QwenExecutorRouter();
+export function createQwenRouter(config, dependencies) {
+    return new QwenExecutorRouter(config, dependencies);
+}

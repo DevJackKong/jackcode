@@ -1,0 +1,13 @@
+tests/
+.git/
+.gitignore
+.jackcode/
+.learnings/
+benchmarks/
+examples/
+*.log
+*.tsbuildinfo
+*.md
+!README.md
+!LICENSE
+!CHANGELOG.md

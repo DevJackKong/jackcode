@@ -217,6 +217,7 @@ Examples:
   jackcode --resume               Resume latest interactive session
   jackcode --load .jackcode/s.json
   jackcode -m qwen-3.6 "..."      Use Qwen 3.6 for this request
+  jackcode -e "add integration tests"  Execute immediately
 
 Interactive Commands:
   /help                           Show available commands
@@ -244,7 +245,7 @@ Interactive Commands:
  * Print version information
  */
 function printVersion(): void {
-  console.log('JackCode v0.1.0');
+  console.log('JackCode v1.0.0');
 }
 
 function isModelTier(value: string | undefined): value is ModelTier {
@@ -343,7 +344,7 @@ async function runInteractive(config: CLIConfig, flags: Record<string, string | 
 
   console.log(`
 ╔════════════════════════════════════════╗
-║     JackCode v0.1.0 - Interactive      ║
+║     JackCode v1.0.0 - Interactive      ║
 ║     Type /help for commands            ║
 ╚════════════════════════════════════════╝
 `);

@@ -76,7 +76,6 @@ export interface DailyReport {
   tokenUsage: {
     qwen: number;
     gpt54: number;
-    gpt54: number;
   };
 }
 
@@ -218,800 +217,487 @@ function sanitizeRecord(input: unknown, depth = 0): Record<string, unknown> {
 
   const output: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(input)) {
-    const safeKey = sanitizeString(key, 128);
-    if (!safeKey || safeKey === '__proto__' || safeKey === 'constructor' || safeKey === 'prototype') {
+    if (typeof value === 'string') {
+      output[key] = sanitizeString(value, 2_000);
       continue;
     }
-
-    if (typeof value === 'string') {
-      output[safeKey] = sanitizeString(value);
-    } else if (typeof value === 'number' || typeof value === 'boolean' || value === null) {
-      output[safeKey] = value;
-    } else if (Array.isArray(value)) {
-      output[safeKey] = value
-        .slice(0, 100)
-        .flatMap((entry) => {
-          if (typeof entry === 'string') return [sanitizeString(entry, 512)];
-          if (typeof entry === 'number' || typeof entry === 'boolean' || entry === null) return [entry];
-          return [];
-        });
-    } else if (typeof value === 'object') {
-      output[safeKey] = sanitizeRecord(value, depth + 1);
+    if (typeof value === 'number' || typeof value === 'boolean' || value === null) {
+      output[key] = value;
+      continue;
+    }
+    if (Array.isArray(value)) {
+      output[key] = value.slice(0, 50).map((entry) => {
+        if (typeof entry === 'string') return sanitizeString(entry, 500);
+        if (typeof entry === 'number' || typeof entry === 'boolean' || entry === null) return entry;
+        if (typeof entry === 'object') return sanitizeRecord(entry, depth + 1);
+        return String(entry);
+      });
+      continue;
+    }
+    if (typeof value === 'object') {
+      output[key] = sanitizeRecord(value, depth + 1);
     }
   }
-
   return output;
 }
 
-function clampPercent(input: number | undefined): number | undefined {
-  if (input === undefined) return undefined;
-  if (!Number.isFinite(input)) return undefined;
-  return Math.max(0, Math.min(100, input));
+function sha256(content: string): string {
+  return createHash('sha256').update(content).digest('hex');
 }
 
-function createDefaultRuntimeAdapter(): RuntimeAdapter {
-  return {
-    createTask: (intent, options) => runtime.createTask(intent, options),
-    setPlan: (id, plan) => runtime.setPlan(id, plan),
-    runTask: (id) => runtime.runTask(id),
-  };
+class DefaultRuntimeAdapter implements RuntimeAdapter {
+  createTask(intent: string, options?: { id?: string; priority?: JackClawTask['priority']; timeoutMs?: number }): { id: string } {
+    return runtime.createTask(intent, options);
+  }
+
+  setPlan(id: string, plan: ExecutionPlan): unknown {
+    return runtime.setPlan(id, plan);
+  }
+
+  async runTask(id: string): Promise<{ attempts: number; artifacts: Artifact[]; errors: Array<{ message: string }> }> {
+    const result = await runtime.runTask(id);
+    return {
+      attempts: result.attempts,
+      artifacts: result.artifacts,
+      errors: result.errors.map((error) => ({ message: error.message })),
+    };
+  }
 }
 
 export class NodeIdentityManager {
-  private identity: NodeIdentity | null = null;
+  private identity: NodeIdentity;
 
-  async loadOrCreate(options?: { displayName?: string; role?: string; nodeId?: string; signingSecret?: string }): Promise<NodeIdentity> {
-    const nodeId = options?.nodeId
-      ?? (options?.displayName ? `${options.displayName.toLowerCase().replace(/\s+/g, '-')}-${Date.now().toString(36)}` : `jackcode-${Date.now().toString(36)}`);
-    const sharedSecret = options?.signingSecret ?? `jackclaw-secret:${nodeId}`;
+  constructor(seed?: Partial<NodeIdentity>) {
+    this.identity = this.createIdentity(seed);
+  }
 
-    this.identity = {
+  loadOrCreate(): NodeIdentity {
+    return { ...this.identity };
+  }
+
+  async registerWithHub(hubUrl: string): Promise<void> {
+    if (!hubUrl) {
+      throw new Error('Hub URL is required for registration');
+    }
+  }
+
+  sign(payload: unknown): string {
+    return createHmac('sha256', this.identity.sharedSecret).update(stableStringify(payload)).digest('hex');
+  }
+
+  verify(senderId: string, payload: unknown, signature: string): boolean {
+    if (!senderId || !signature) return false;
+    const expected = this.sign(payload);
+    return signature === expected;
+  }
+
+  private createIdentity(seed?: Partial<NodeIdentity>): NodeIdentity {
+    const nodeId = seed?.nodeId ?? `node-${randomUUID().replace(/-/g, '').slice(0, 16)}`;
+    const secretSource = seed?.sharedSecret ?? randomUUID();
+    return {
       nodeId,
-      publicKey: `pub:${nodeId}`,
-      privateKey: `priv:${nodeId}`,
-      sharedSecret,
-      displayName: options?.displayName,
-      role: options?.role ?? 'code-executor',
-      createdAt: Date.now(),
+      publicKey: seed?.publicKey ?? sha256(`${nodeId}:public:${secretSource}`),
+      privateKey: seed?.privateKey ?? sha256(`${nodeId}:private:${secretSource}`),
+      sharedSecret: secretSource,
+      displayName: seed?.displayName,
+      role: seed?.role ?? 'jackcode',
+      createdAt: seed?.createdAt ?? Date.now(),
     };
-
-    return this.identity;
-  }
-
-  getIdentity(): NodeIdentity {
-    if (!this.identity) {
-      throw new Error('Identity not loaded. Call loadOrCreate() first.');
-    }
-    return this.identity;
-  }
-
-  sign(payload: unknown, secret?: string): string {
-    const identity = this.getIdentity();
-    return createHmac('sha256', secret ?? identity.sharedSecret).update(stableStringify(payload)).digest('hex');
-  }
-
-  verify(senderId: string, payload: unknown, signature: string, secret?: string): boolean {
-    const fallbackSecret = secret ?? `jackclaw-secret:${senderId}`;
-    const expected = createHmac('sha256', fallbackSecret).update(stableStringify(payload)).digest('hex');
-    return expected === signature;
-  }
-}
-
-export class MessageRouter {
-  serialize(message: JackClawMessage): string {
-    return JSON.stringify(message);
-  }
-
-  deserialize(raw: string): JackClawMessage {
-    const parsed = JSON.parse(raw) as Partial<JackClawMessage>;
-    if (!parsed || typeof parsed !== 'object') {
-      throw new Error('Invalid message payload');
-    }
-    if (typeof parsed.id !== 'string' || typeof parsed.from !== 'string' || typeof parsed.to !== 'string' || typeof parsed.type !== 'string') {
-      throw new Error('Malformed message envelope');
-    }
-    if (typeof parsed.timestamp !== 'number' || typeof parsed.signature !== 'string') {
-      throw new Error('Malformed message metadata');
-    }
-    return parsed as JackClawMessage;
-  }
-}
-
-export class RateLimiter {
-  private readonly timestamps: number[] = [];
-  private readonly limitPerMinute: number;
-  private readonly now: () => number;
-
-  constructor(limitPerMinute: number, now: () => number = () => Date.now()) {
-    this.limitPerMinute = limitPerMinute;
-    this.now = now;
-  }
-
-  consume(): boolean {
-    const cutoff = this.now() - 60_000;
-    while (this.timestamps.length > 0 && this.timestamps[0]! < cutoff) {
-      this.timestamps.shift();
-    }
-    if (this.timestamps.length >= this.limitPerMinute) {
-      return false;
-    }
-    this.timestamps.push(this.now());
-    return true;
-  }
-}
-
-export class TaskReceiver {
-  private readonly handlers: Array<(task: JackClawTask) => Promise<TaskResult | null>> = [];
-  private readonly identityManager: NodeIdentityManager;
-  private port = 0;
-  private started = false;
-
-  constructor(identityManager: NodeIdentityManager) {
-    this.identityManager = identityManager;
-  }
-
-  start(port: number): void {
-    if (this.started) {
-      throw new Error('Task receiver already started');
-    }
-    if (!Number.isInteger(port) || port <= 0 || port > 65535) {
-      throw new Error(`Invalid receiver port: ${port}`);
-    }
-    this.port = port;
-    this.started = true;
-  }
-
-  stop(): void {
-    this.port = 0;
-    this.started = false;
-    this.handlers.length = 0;
-  }
-
-  onTask(handler: (task: JackClawTask) => Promise<TaskResult | null>): () => void {
-    this.handlers.push(handler);
-    return () => {
-      const index = this.handlers.indexOf(handler);
-      if (index >= 0) this.handlers.splice(index, 1);
-    };
-  }
-
-  verifyMessage(message: JackClawMessage, secret?: string): boolean {
-    return this.identityManager.verify(message.from, message.payload, message.signature, secret);
-  }
-
-  async handleIncomingTask(message: JackClawMessage, secret?: string): Promise<TaskResult> {
-    if (!this.started) {
-      throw new Error('Task receiver is not running');
-    }
-    if (message.type !== 'task') {
-      throw new Error(`Unsupported message type: ${message.type}`);
-    }
-    if (!this.verifyMessage(message, secret)) {
-      throw new Error('Message signature verification failed');
-    }
-
-    const task = this.parseTask(message.payload);
-    for (const handler of this.handlers) {
-      const result = await handler(task);
-      if (result) return result;
-    }
-    throw new Error('No handler processed the task');
-  }
-
-  private parseTask(payload: unknown): JackClawTask {
-    const parsed = payload as Partial<JackClawTask>;
-    if (!parsed || typeof parsed !== 'object') {
-      throw new Error('Invalid task payload');
-    }
-    if (typeof parsed.taskId !== 'string' || !parsed.taskId.trim()) {
-      throw new Error('Task payload missing taskId');
-    }
-    if (typeof parsed.action !== 'string' || !parsed.action.trim()) {
-      throw new Error('Task payload missing action');
-    }
-    return {
-      taskId: sanitizeString(parsed.taskId, 128),
-      action: sanitizeString(parsed.action, 256),
-      params: sanitizeRecord(parsed.params),
-      deadline: typeof parsed.deadline === 'number' ? parsed.deadline : undefined,
-      priority: parsed.priority,
-      requireApproval: typeof parsed.requireApproval === 'boolean' ? parsed.requireApproval : undefined,
-      timeoutMs: typeof parsed.timeoutMs === 'number' ? parsed.timeoutMs : undefined,
-    };
-  }
-}
-
-export class TaskRouter {
-  private readonly activeTasks = new Map<string, string>();
-  private readonly runtimeAdapter: RuntimeAdapter;
-
-  constructor(runtimeAdapter: RuntimeAdapter = createDefaultRuntimeAdapter()) {
-    this.runtimeAdapter = runtimeAdapter;
-  }
-
-  async route(task: JackClawTask, onProgress?: (progress: ProgressUpdate) => Promise<void> | void): Promise<TaskResult> {
-    const startTime = Date.now();
-
-    const emit = async (state: ProgressUpdate['state'], message: string, percentComplete?: number): Promise<void> => {
-      await onProgress?.({
-        taskId: task.taskId,
-        state,
-        message,
-        percentComplete: clampPercent(percentComplete),
-        timestamp: Date.now(),
-      });
-    };
-
-    try {
-      await emit('plan', `Planning task ${task.action}`, 10);
-      const created = this.runtimeAdapter.createTask(this.buildIntent(task), {
-        id: task.taskId,
-        priority: task.priority,
-        timeoutMs: task.timeoutMs,
-      });
-      this.activeTasks.set(task.taskId, created.id);
-
-      const plan = this.buildExecutionPlan(task);
-      this.runtimeAdapter.setPlan(created.id, plan);
-
-      await emit('execute', `Executing task ${task.action}`, 50);
-      const completed = await this.runtimeAdapter.runTask(created.id);
-
-      await emit('review', `Reviewing task ${task.action}`, 90);
-
-      const errors = completed.errors ?? [];
-      const artifacts = (completed.artifacts ?? []).map((artifact) => ({
-        type: artifact.type,
-        path: artifact.path,
-        content: artifact.content,
-      }));
-
-      if (errors.length > 0 && artifacts.length === 0) {
-        throw new Error(errors[errors.length - 1]?.message ?? 'Task failed');
-      }
-
-      await emit('done', `Task ${task.action} completed`, 100);
-      return {
-        taskId: task.taskId,
-        status: 'success',
-        output: `Task ${task.action} completed successfully`,
-        artifacts,
-        durationMs: Date.now() - startTime,
-        attempts: completed.attempts ?? 1,
-      };
-    } catch (error) {
-      await emit('error', error instanceof Error ? error.message : String(error), 100);
-      return {
-        taskId: task.taskId,
-        status: 'failure',
-        error: error instanceof Error ? error.message : String(error),
-        durationMs: Date.now() - startTime,
-        attempts: 1,
-      };
-    } finally {
-      this.activeTasks.delete(task.taskId);
-    }
-  }
-
-  getRuntimeTaskId(jackclawTaskId: string): string | undefined {
-    return this.activeTasks.get(jackclawTaskId);
-  }
-
-  private buildIntent(task: JackClawTask): string {
-    const params = Object.entries(task.params)
-      .map(([key, value]) => `${key}=${typeof value === 'string' ? value : JSON.stringify(value)}`)
-      .join(', ');
-    return params ? `${task.action}: ${params}` : task.action;
-  }
-
-  private buildExecutionPlan(task: JackClawTask): ExecutionPlan {
-    const files = Array.isArray(task.params.files)
-      ? task.params.files.filter((value): value is string => typeof value === 'string')
-      : [];
-
-    return {
-      steps: [
-        {
-          id: `step-${task.taskId}`,
-          description: `Execute ${task.action}`,
-          targetFiles: files,
-          dependencies: [],
-        },
-      ],
-      estimatedTokens: 4000,
-      targetModel: 'qwen',
-    };
-  }
-}
-
-export class ReportSender {
-  private readonly config: JackClawAdapterConfig;
-  private readonly identityManager: NodeIdentityManager;
-  private readonly fetchImpl: typeof fetch;
-
-  constructor(
-    config: JackClawAdapterConfig,
-    identityManager: NodeIdentityManager,
-    fetchImpl: typeof fetch = fetch,
-  ) {
-    this.config = config;
-    this.identityManager = identityManager;
-    this.fetchImpl = fetchImpl;
-  }
-
-  async sendProgress(taskId: string, progress: ProgressUpdate): Promise<void> {
-    await this.send('report', { ...progress, type: 'progress', taskId });
-  }
-
-  async sendCompletion(taskId: string, result: TaskResult): Promise<void> {
-    await this.send('report', { type: 'completion', taskId, result });
-  }
-
-  async sendDailyReport(report: DailyReport): Promise<void> {
-    await this.send('report', { type: 'daily', report });
-  }
-
-  async sendHealth(snapshot: HealthSnapshot): Promise<void> {
-    await this.send('health_response', snapshot);
-  }
-
-  private async send(type: JackClawMessageType, payload: unknown): Promise<void> {
-    const identity = this.identityManager.getIdentity();
-    const message: JackClawMessage = {
-      id: randomUUID(),
-      from: identity.nodeId,
-      to: 'hub',
-      type,
-      payload,
-      timestamp: Date.now(),
-      signature: this.identityManager.sign(payload),
-    };
-
-    const url = new URL('/api/v1/reports', this.config.hubUrl).toString();
-    const response = await this.fetchImpl(url, {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        ...(this.config.authToken ? { authorization: `Bearer ${this.config.authToken}` } : {}),
-      },
-      body: JSON.stringify(message),
-    }).catch((error: unknown) => {
-      const messageText = error instanceof Error ? error.message : String(error);
-      throw new Error(`Failed to send report to ${url}: ${messageText}`);
-    });
-
-    if (!response.ok) {
-      throw new Error(`Hub request failed (${response.status} ${response.statusText})`);
-    }
   }
 }
 
 export class JackClawNodeAdapter extends EventEmitter {
-  public readonly identity: NodeIdentityManager;
-  public readonly receiver: TaskReceiver;
-  public readonly router: TaskRouter;
-  public readonly reporter: ReportSender;
-  public readonly messageRouter: MessageRouter;
-  public readonly rateLimiter: RateLimiter;
-
   private readonly config: JackClawAdapterConfig;
   private readonly fetchImpl: typeof fetch;
   private readonly runtimeAdapter: RuntimeAdapter;
   private readonly now: () => number;
+  private readonly identityManager: NodeIdentityManager;
+  private readonly transport: NodeTransport;
   private readonly pendingRequests = new Map<string, PendingRequest>();
-  private readonly inflightTasks = new Set<string>();
-  private transport: NodeTransport | null = null;
-  private isRunning = false;
+  private readonly requestTimestamps: number[] = [];
+  private readonly activeTasks = new Set<string>();
+  private connected = false;
   private authenticated = false;
-  private reconnectAttempts = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private lastHeartbeatAt = 0;
-  private unregisterTaskHandler: (() => void) | null = null;
+  private inflightRequests = 0;
+  private backoffMs: number;
 
   constructor(config: JackClawAdapterConfig, dependencies: NodeAdapterDependencies = {}) {
     super();
-    this.config = {
-      ...DEFAULT_CONFIG,
-      ...config,
-    };
+    this.config = { ...DEFAULT_CONFIG, ...config };
     this.fetchImpl = dependencies.fetchImpl ?? fetch;
-    this.runtimeAdapter = dependencies.runtimeAdapter ?? createDefaultRuntimeAdapter();
+    this.runtimeAdapter = dependencies.runtimeAdapter ?? new DefaultRuntimeAdapter();
     this.now = dependencies.now ?? (() => Date.now());
-    this.identity = new NodeIdentityManager();
-    this.receiver = new TaskReceiver(this.identity);
-    this.router = new TaskRouter(this.runtimeAdapter);
-    this.reporter = new ReportSender(this.config, this.identity, this.fetchImpl);
-    this.messageRouter = new MessageRouter();
-    this.rateLimiter = new RateLimiter(this.config.rateLimitPerMinute ?? DEFAULT_CONFIG.rateLimitPerMinute, this.now);
+    this.identityManager = new NodeIdentityManager({ nodeId: this.config.nodeId, displayName: this.config.nodeName, role: 'jackcode-node' });
+    this.transport = dependencies.transportFactory ? dependencies.transportFactory(this.config) : this.createNoopTransport();
+    this.backoffMs = this.config.reconnectIntervalMs ?? DEFAULT_CONFIG.reconnectIntervalMs;
+    this.bindTransport();
+  }
 
-    if (dependencies.transportFactory) {
-      this.transport = dependencies.transportFactory(this.config);
-      this.bindTransport(this.transport);
-    }
+  get nodeId(): string {
+    return this.identityManager.loadOrCreate().nodeId;
+  }
+
+  isConnected(): boolean {
+    return this.connected;
+  }
+
+  isAuthenticated(): boolean {
+    return this.authenticated;
   }
 
   async start(): Promise<void> {
-    if (this.isRunning) {
-      throw new Error('Adapter already running');
-    }
-
-    await this.identity.loadOrCreate({
-      nodeId: this.config.nodeId,
-      displayName: this.config.nodeName,
-      role: 'code-executor',
-      signingSecret: this.config.signingSecret,
-    });
-
-    this.receiver.start(this.config.port);
-    this.unregisterTaskHandler = this.receiver.onTask(async (task) => this.executeTask(task));
-
+    await this.transport.connect();
     if (this.config.autoRegister) {
-      await this.registerWithHub();
+      await this.register();
     }
-
-    if (this.transport) {
-      await this.transport.connect();
-    }
-
-    this.isRunning = true;
+    this.startHeartbeat();
   }
 
   async stop(): Promise<void> {
-    if (!this.isRunning) {
-      return;
-    }
-
-    this.clearTimers();
-    this.authenticated = false;
-    this.unregisterTaskHandler?.();
-    this.unregisterTaskHandler = null;
-    this.receiver.stop();
-
-    for (const [id, pending] of this.pendingRequests) {
-      clearTimeout(pending.timeout);
-      pending.reject(new Error(`Request ${id} cancelled during shutdown`));
-    }
-    this.pendingRequests.clear();
-
-    if (this.transport) {
-      await this.transport.close(1000, 'graceful shutdown');
-    }
-
-    this.emit('shutdown', this.getHealthSnapshot());
-    this.isRunning = false;
-  }
-
-  async sendRequest(type: JackClawMessageType, payload: unknown, options: { to?: string; awaitReply?: boolean } = {}): Promise<JackClawMessage | void> {
-    if (!this.transport) {
-      throw new Error('Transport not configured');
-    }
-    const identity = this.identity.getIdentity();
-    const message: JackClawMessage = {
-      id: randomUUID(),
-      from: identity.nodeId,
-      to: options.to ?? 'hub',
-      type,
-      payload,
-      timestamp: this.now(),
-      signature: this.identity.sign(payload),
-    };
-
-    let replyPromise: Promise<JackClawMessage> | undefined;
-    if (options.awaitReply) {
-      replyPromise = new Promise<JackClawMessage>((resolve, reject) => {
-        const timeout = setTimeout(() => {
-          this.pendingRequests.delete(message.id);
-          reject(new Error(`Request ${message.id} timed out`));
-        }, this.config.requestTimeoutMs ?? DEFAULT_CONFIG.requestTimeoutMs);
-        timeout.unref?.();
-        this.pendingRequests.set(message.id, { resolve, reject, timeout });
-      });
-    }
-
-    try {
-      await this.transport.send(this.messageRouter.serialize(message));
-    } catch (error) {
-      if (options.awaitReply) {
-        const pending = this.pendingRequests.get(message.id);
-        if (pending) {
-          clearTimeout(pending.timeout);
-          this.pendingRequests.delete(message.id);
-          pending.reject(error instanceof Error ? error : new Error(String(error)));
-        }
-      }
-      throw error;
-    }
-
-    return replyPromise;
-  }
-
-  async handleRawMessage(raw: string): Promise<void> {
-    if (!this.rateLimiter.consume()) {
-      throw new Error('Rate limit exceeded');
-    }
-    if (Buffer.byteLength(raw, 'utf8') > (this.config.maxPayloadBytes ?? DEFAULT_CONFIG.maxPayloadBytes)) {
-      throw new Error('Payload too large');
-    }
-
-    const message = this.messageRouter.deserialize(raw);
-    if (!this.identity.verify(message.from, message.payload, message.signature, this.config.signingSecret)) {
-      throw new Error('Invalid message signature');
-    }
-
-    this.lastHeartbeatAt = this.now();
-
-    if (message.replyTo && this.pendingRequests.has(message.replyTo)) {
-      const pending = this.pendingRequests.get(message.replyTo)!;
-      clearTimeout(pending.timeout);
-      this.pendingRequests.delete(message.replyTo);
-      pending.resolve(message);
-      return;
-    }
-
-    switch (message.type) {
-      case 'auth_ok':
-        this.authenticated = true;
-        this.reconnectAttempts = 0;
-        this.startHeartbeat();
-        this.emit('authenticated', message);
-        break;
-      case 'auth_error':
-        this.authenticated = false;
-        throw new Error(typeof message.payload === 'string' ? message.payload : 'Authentication rejected');
-      case 'ping':
-        await this.sendReply(message, 'pong', { ok: true, timestamp: this.now() });
-        break;
-      case 'health':
-        await this.sendReply(message, 'health_response', this.getHealthSnapshot());
-        break;
-      case 'broadcast':
-        this.emit('broadcast', message.payload);
-        break;
-      case 'task':
-        await this.receiver.handleIncomingTask(message, this.config.signingSecret);
-        break;
-      case 'shutdown':
-        await this.stop();
-        break;
-      case 'ack':
-      case 'pong':
-      case 'health_response':
-      case 'report':
-      case 'auth':
-        this.emit('message', message);
-        break;
-      default:
-        throw new Error(`Unsupported message type: ${message.type satisfies never}`);
-    }
-  }
-
-  async authenticate(): Promise<void> {
-    const identity = this.identity.getIdentity();
-    const token = this.config.authToken;
-    if (!token || !token.trim()) {
-      throw new Error('Missing auth token');
-    }
-
-    const payload = {
-      nodeId: identity.nodeId,
-      nodeName: this.config.nodeName ?? identity.nodeId,
-      tokenHash: createHash('sha256').update(token).digest('hex'),
-      timestamp: this.now(),
-    };
-    await this.sendRequest('auth', payload, { awaitReply: false });
-  }
-
-  getHealthSnapshot(): HealthSnapshot {
-    const usage = process.memoryUsage();
-    const cpu = process.cpuUsage();
-    const activeTasks = this.inflightTasks.size;
-    const queuedTasks = typeof (runtime as { getQueue?: () => unknown[] }).getQueue === 'function'
-      ? (((runtime as { getQueue: () => unknown[] }).getQueue())?.length ?? 0)
-      : 0;
-    const loadScore = Math.min(1, (activeTasks + queuedTasks) / Math.max(1, this.config.maxConcurrentTasks ?? DEFAULT_CONFIG.maxConcurrentTasks));
-
-    return {
-      nodeId: this.identity.getIdentity().nodeId,
-      connected: Boolean(this.transport),
-      authenticated: this.authenticated,
-      inflightRequests: this.pendingRequests.size,
-      activeTasks,
-      queuedTasks,
-      loadScore,
-      resourceUsage: {
-        memoryRss: usage.rss,
-        heapUsed: usage.heapUsed,
-        heapTotal: usage.heapTotal,
-        uptimeSeconds: process.uptime(),
-        cpuUserMicros: cpu.user,
-        cpuSystemMicros: cpu.system,
-      },
-      timestamp: this.now(),
-    };
-  }
-
-  getStatus(): { running: boolean; nodeId: string | null; port: number; hubUrl: string; authenticated: boolean; connected: boolean } {
-    let nodeId: string | null = null;
-    try {
-      nodeId = this.identity.getIdentity().nodeId;
-    } catch {
-      nodeId = null;
-    }
-
-    return {
-      running: this.isRunning,
-      nodeId,
-      port: this.config.port,
-      hubUrl: this.config.hubUrl,
-      authenticated: this.authenticated,
-      connected: Boolean(this.transport),
-    };
-  }
-
-  private async executeTask(task: JackClawTask): Promise<TaskResult> {
-    if (this.inflightTasks.size >= (this.config.maxConcurrentTasks ?? DEFAULT_CONFIG.maxConcurrentTasks)) {
-      return {
-        taskId: task.taskId,
-        status: 'failure',
-        error: 'Node is at task capacity',
-        durationMs: 0,
-        attempts: 0,
-      };
-    }
-
-    this.inflightTasks.add(task.taskId);
-    try {
-      const result = await this.router.route(task, async (progress) => {
-        await this.reporter.sendProgress(task.taskId, progress);
-      });
-      await this.reporter.sendCompletion(task.taskId, result);
-      return result;
-    } finally {
-      this.inflightTasks.delete(task.taskId);
-    }
-  }
-
-  private async registerWithHub(): Promise<void> {
-    const identity = this.identity.getIdentity();
-    const payload: RegisterPayload = {
-      nodeId: identity.nodeId,
-      nodeName: this.config.nodeName ?? identity.nodeId,
-      port: this.config.port,
-      role: identity.role ?? 'code-executor',
-      publicKey: identity.publicKey,
-      capabilities: ['tasks', 'progress', 'health', 'broadcasts'],
-      loadScore: this.getHealthSnapshot().loadScore,
-    };
-
-    const url = new URL('/api/v1/nodes/register', this.config.hubUrl).toString();
-    const response = await this.fetchImpl(url, {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        ...(this.config.authToken ? { authorization: `Bearer ${this.config.authToken}` } : {}),
-      },
-      body: JSON.stringify(payload),
-    }).catch((error: unknown) => {
-      const message = error instanceof Error ? error.message : String(error);
-      throw new Error(`Failed to register node with Hub: ${message}`);
-    });
-
-    if (!response.ok) {
-      throw new Error(`Hub registration failed (${response.status} ${response.statusText})`);
-    }
-  }
-
-  private bindTransport(transport: NodeTransport): void {
-    transport.onOpen(() => {
-      this.lastHeartbeatAt = this.now();
-      void this.authenticate().catch((error) => this.emit('error', error));
-    });
-
-    transport.onMessage((raw) => {
-      void this.handleRawMessage(raw).catch((error) => this.emit('error', error));
-    });
-
-    transport.onError((error) => {
-      this.emit('error', error);
-    });
-
-    transport.onClose(() => {
-      this.authenticated = false;
-      this.clearHeartbeat();
-      if (this.isRunning) {
-        this.scheduleReconnect();
-      }
-    });
-  }
-
-  private async sendReply(request: JackClawMessage, type: JackClawMessageType, payload: unknown): Promise<void> {
-    if (!this.transport) {
-      return;
-    }
-    const identity = this.identity.getIdentity();
-    const response: JackClawMessage = {
-      id: randomUUID(),
-      from: identity.nodeId,
-      to: request.from,
-      type,
-      payload,
-      timestamp: this.now(),
-      signature: this.identity.sign(payload),
-      replyTo: request.id,
-      correlationId: request.correlationId ?? request.id,
-    };
-    await this.transport.send(this.messageRouter.serialize(response));
-  }
-
-  private startHeartbeat(): void {
-    this.clearHeartbeat();
-    this.heartbeatTimer = setInterval(() => {
-      if (!this.transport) {
-        return;
-      }
-      if (this.now() - this.lastHeartbeatAt > (this.config.heartbeatTimeoutMs ?? DEFAULT_CONFIG.heartbeatTimeoutMs)) {
-        void this.transport.close(4000, 'heartbeat timeout');
-        return;
-      }
-      void this.sendRequest('ping', { timestamp: this.now() }).catch((error) => this.emit('error', error));
-    }, this.config.heartbeatIntervalMs ?? DEFAULT_CONFIG.heartbeatIntervalMs);
-    this.heartbeatTimer.unref?.();
-  }
-
-  private clearHeartbeat(): void {
-    if (this.heartbeatTimer) {
-      clearInterval(this.heartbeatTimer);
-      this.heartbeatTimer = null;
-    }
-  }
-
-  private clearTimers(): void {
-    this.clearHeartbeat();
+    this.stopHeartbeat();
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
     }
+    for (const pending of this.pendingRequests.values()) {
+      clearTimeout(pending.timeout);
+      pending.reject(new Error('Adapter stopped'));
+    }
+    this.pendingRequests.clear();
+    await this.transport.close(1000, 'shutdown');
+    this.connected = false;
+    this.authenticated = false;
+  }
+
+  async register(): Promise<void> {
+    const identity = this.identityManager.loadOrCreate();
+    const payload: RegisterPayload = {
+      nodeId: identity.nodeId,
+      nodeName: this.config.nodeName ?? 'JackCode Node',
+      port: this.config.port,
+      role: 'jackcode-node',
+      publicKey: identity.publicKey,
+      capabilities: ['execute', 'review', 'report'],
+      loadScore: this.computeLoadScore(),
+    };
+    await this.sendMessage('auth', payload, { awaitAck: false });
+  }
+
+  async handleTask(task: JackClawTask): Promise<TaskResult> {
+    const startedAt = this.now();
+    const taskId = sanitizeString(task.taskId || randomUUID(), 128);
+    if (this.activeTasks.size >= (this.config.maxConcurrentTasks ?? DEFAULT_CONFIG.maxConcurrentTasks)) {
+      throw new Error('Max concurrent tasks exceeded');
+    }
+    this.activeTasks.add(taskId);
+    try {
+      await this.sendProgress(taskId, {
+        taskId,
+        state: 'plan',
+        message: `Planning task: ${sanitizeString(task.action, 512)}`,
+        percentComplete: 10,
+        timestamp: this.now(),
+      });
+
+      const runtimeTask = this.runtimeAdapter.createTask(task.action, {
+        id: taskId,
+        priority: task.priority,
+        timeoutMs: task.timeoutMs,
+      });
+
+      const plan: ExecutionPlan = {
+        steps: [
+          {
+            id: `${taskId}-step-1`,
+            description: sanitizeString(task.action, 1_000),
+            targetFiles: [],
+            dependencies: [],
+          },
+        ],
+        estimatedTokens: 1_000,
+        targetModel: 'qwen',
+      };
+
+      this.runtimeAdapter.setPlan(runtimeTask.id, plan);
+      await this.sendProgress(taskId, {
+        taskId,
+        state: 'execute',
+        message: 'Executing task in JackCode runtime',
+        percentComplete: 50,
+        timestamp: this.now(),
+      });
+
+      const result = await this.runtimeAdapter.runTask(runtimeTask.id);
+      const taskResult: TaskResult = {
+        taskId,
+        status: result.errors.length > 0 ? 'failure' : 'success',
+        output: result.errors.length > 0 ? result.errors.map((error) => error.message).join('; ') : 'Task completed successfully',
+        artifacts: result.artifacts.map((artifact) => ({
+          type: artifact.type,
+          path: artifact.path,
+          content: artifact.content,
+        })),
+        error: result.errors.length > 0 ? result.errors[0]?.message : undefined,
+        durationMs: this.now() - startedAt,
+        attempts: result.attempts,
+      };
+
+      await this.sendCompletion(taskId, taskResult);
+      return taskResult;
+    } finally {
+      this.activeTasks.delete(taskId);
+    }
+  }
+
+  async sendProgress(taskId: string, progress: ProgressUpdate): Promise<void> {
+    await this.sendMessage('report', {
+      kind: 'progress',
+      taskId,
+      progress,
+    }, { awaitAck: false });
+  }
+
+  async sendCompletion(taskId: string, result: TaskResult): Promise<void> {
+    await this.sendMessage('report', {
+      kind: 'completion',
+      taskId,
+      result,
+    }, { awaitAck: false });
+  }
+
+  async sendDailyReport(report: DailyReport): Promise<void> {
+    await this.sendMessage('report', {
+      kind: 'daily_report',
+      report,
+    }, { awaitAck: false });
+  }
+
+  getHealthSnapshot(): HealthSnapshot {
+    return {
+      nodeId: this.nodeId,
+      connected: this.connected,
+      authenticated: this.authenticated,
+      inflightRequests: this.inflightRequests,
+      activeTasks: this.activeTasks.size,
+      queuedTasks: 0,
+      loadScore: this.computeLoadScore(),
+      resourceUsage: this.collectResourceUsage(),
+      timestamp: this.now(),
+    };
+  }
+
+  private bindTransport(): void {
+    this.transport.onOpen(() => {
+      this.connected = true;
+      this.backoffMs = this.config.reconnectIntervalMs ?? DEFAULT_CONFIG.reconnectIntervalMs;
+      this.emit('open');
+    });
+    this.transport.onClose((code, reason) => {
+      this.connected = false;
+      this.authenticated = false;
+      this.emit('close', code, reason);
+      this.scheduleReconnect();
+    });
+    this.transport.onError((error) => {
+      this.emit('error', error);
+    });
+    this.transport.onMessage((raw) => {
+      void this.handleIncoming(raw);
+    });
+  }
+
+  private async handleIncoming(raw: string): Promise<void> {
+    let message: JackClawMessage;
+    try {
+      message = JSON.parse(raw) as JackClawMessage;
+    } catch {
+      return;
+    }
+
+    if (!this.verifyMessage(message)) {
+      this.emit('warning', new Error('Discarded message with invalid signature'));
+      return;
+    }
+
+    if (message.type === 'auth_ok') {
+      this.authenticated = true;
+    }
+    if (message.type === 'ping') {
+      await this.sendMessage('pong', { timestamp: this.now() }, { awaitAck: false, correlationId: message.id });
+      return;
+    }
+    if (message.type === 'health') {
+      await this.sendMessage('health_response', this.getHealthSnapshot(), { awaitAck: false, correlationId: message.id });
+      return;
+    }
+    if (message.type === 'task') {
+      void this.handleTask(message.payload as JackClawTask).catch((error) => {
+        this.emit('task_error', error);
+      });
+    }
+
+    const pendingKey = message.correlationId ?? message.replyTo ?? message.id;
+    const pending = this.pendingRequests.get(pendingKey);
+    if (pending) {
+      clearTimeout(pending.timeout);
+      this.pendingRequests.delete(pendingKey);
+      pending.resolve(message);
+    }
+  }
+
+  private verifyMessage(message: JackClawMessage): boolean {
+    const { signature, ...unsigned } = message;
+    return this.identityManager.verify(message.from, unsigned, signature);
+  }
+
+  private async sendMessage(
+    type: JackClawMessageType,
+    payload: unknown,
+    options: { awaitAck?: boolean; correlationId?: string } = {}
+  ): Promise<JackClawMessage | void> {
+    this.enforceRateLimit();
+    const identity = this.identityManager.loadOrCreate();
+    const message: Omit<JackClawMessage, 'signature'> = {
+      id: randomUUID(),
+      from: identity.nodeId,
+      to: 'hub',
+      type,
+      payload: sanitizeRecord(payload),
+      timestamp: this.now(),
+      correlationId: options.correlationId,
+    };
+    const signed: JackClawMessage = {
+      ...message,
+      signature: this.identityManager.sign(message),
+    };
+    const raw = JSON.stringify(signed);
+    if (Buffer.byteLength(raw, 'utf8') > (this.config.maxPayloadBytes ?? DEFAULT_CONFIG.maxPayloadBytes)) {
+      throw new Error('Payload exceeds configured size limit');
+    }
+
+    this.inflightRequests += 1;
+    try {
+      await this.transport.send(raw);
+      if (!options.awaitAck) return;
+      return await new Promise<JackClawMessage>((resolve, reject) => {
+        const timeout = setTimeout(() => {
+          this.pendingRequests.delete(signed.id);
+          reject(new Error(`Request timed out for ${type}`));
+        }, this.config.requestTimeoutMs ?? DEFAULT_CONFIG.requestTimeoutMs);
+        this.pendingRequests.set(signed.id, { resolve, reject, timeout });
+      });
+    } finally {
+      this.inflightRequests = Math.max(0, this.inflightRequests - 1);
+    }
+  }
+
+  private enforceRateLimit(): void {
+    const limit = this.config.rateLimitPerMinute ?? DEFAULT_CONFIG.rateLimitPerMinute;
+    const now = this.now();
+    while (this.requestTimestamps.length > 0 && now - this.requestTimestamps[0]! > 60_000) {
+      this.requestTimestamps.shift();
+    }
+    if (this.requestTimestamps.length >= limit) {
+      throw new Error('Rate limit exceeded');
+    }
+    this.requestTimestamps.push(now);
   }
 
   private scheduleReconnect(): void {
-    if (this.reconnectTimer || !this.transport) {
-      return;
-    }
-    const base = this.config.reconnectIntervalMs ?? DEFAULT_CONFIG.reconnectIntervalMs;
-    const max = this.config.maxReconnectIntervalMs ?? DEFAULT_CONFIG.maxReconnectIntervalMs;
-    const delay = Math.min(max, base * 2 ** this.reconnectAttempts);
-    this.reconnectAttempts += 1;
+    if (this.reconnectTimer) return;
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
-      if (!this.transport || !this.isRunning) {
-        return;
-      }
-      void this.transport.connect().catch((error) => this.emit('error', error));
-    }, delay);
-    this.reconnectTimer.unref?.();
+      void this.transport.connect().catch((error) => {
+        this.emit('error', error);
+        this.backoffMs = Math.min(this.backoffMs * 2, this.config.maxReconnectIntervalMs ?? DEFAULT_CONFIG.maxReconnectIntervalMs);
+        this.scheduleReconnect();
+      });
+    }, this.backoffMs);
   }
-}
 
-export function createJackClawAdapter(options?: Partial<JackClawAdapterConfig>, dependencies?: NodeAdapterDependencies): JackClawNodeAdapter {
-  const config: JackClawAdapterConfig = {
-    hubUrl: options?.hubUrl ?? process.env.JACKCLAW_HUB_URL ?? 'http://localhost:3000',
-    nodeId: options?.nodeId,
-    nodeName: options?.nodeName ?? 'jackcode-node',
-    port: options?.port ?? 8080,
-    autoRegister: options?.autoRegister ?? DEFAULT_CONFIG.autoRegister,
-    reportCron: options?.reportCron ?? DEFAULT_CONFIG.reportCron,
-    authToken: options?.authToken ?? process.env.JACKCLAW_AUTH_TOKEN,
-    signingSecret: options?.signingSecret ?? process.env.JACKCLAW_SIGNING_SECRET,
-    reconnectIntervalMs: options?.reconnectIntervalMs ?? DEFAULT_CONFIG.reconnectIntervalMs,
-    maxReconnectIntervalMs: options?.maxReconnectIntervalMs ?? DEFAULT_CONFIG.maxReconnectIntervalMs,
-    heartbeatIntervalMs: options?.heartbeatIntervalMs ?? DEFAULT_CONFIG.heartbeatIntervalMs,
-    heartbeatTimeoutMs: options?.heartbeatTimeoutMs ?? DEFAULT_CONFIG.heartbeatTimeoutMs,
-    requestTimeoutMs: options?.requestTimeoutMs ?? DEFAULT_CONFIG.requestTimeoutMs,
-    rateLimitPerMinute: options?.rateLimitPerMinute ?? DEFAULT_CONFIG.rateLimitPerMinute,
-    maxConcurrentTasks: options?.maxConcurrentTasks ?? DEFAULT_CONFIG.maxConcurrentTasks,
-    maxPayloadBytes: options?.maxPayloadBytes ?? DEFAULT_CONFIG.maxPayloadBytes,
-  };
+  private startHeartbeat(): void {
+    if (this.heartbeatTimer) return;
+    this.heartbeatTimer = setInterval(() => {
+      const now = this.now();
+      if (this.lastHeartbeatAt && now - this.lastHeartbeatAt > (this.config.heartbeatTimeoutMs ?? DEFAULT_CONFIG.heartbeatTimeoutMs)) {
+        this.emit('warning', new Error('Heartbeat timeout detected'));
+      }
+      void this.sendMessage('ping', { timestamp: now }, { awaitAck: false }).catch((error) => this.emit('error', error));
+      this.lastHeartbeatAt = now;
+    }, this.config.heartbeatIntervalMs ?? DEFAULT_CONFIG.heartbeatIntervalMs);
+  }
 
-  return new JackClawNodeAdapter(config, dependencies);
+  private stopHeartbeat(): void {
+    if (!this.heartbeatTimer) return;
+    clearInterval(this.heartbeatTimer);
+    this.heartbeatTimer = null;
+  }
+
+  private computeLoadScore(): number {
+    const maxConcurrent = this.config.maxConcurrentTasks ?? DEFAULT_CONFIG.maxConcurrentTasks;
+    const inflightWeight = Math.min(1, this.inflightRequests / Math.max(1, maxConcurrent));
+    const activeWeight = Math.min(1, this.activeTasks.size / Math.max(1, maxConcurrent));
+    return Number(((inflightWeight * 0.4) + (activeWeight * 0.6)).toFixed(2));
+  }
+
+  private collectResourceUsage(): ResourceUsage {
+    const usage = process.memoryUsage();
+    const cpu = process.cpuUsage();
+    return {
+      memoryRss: usage.rss,
+      heapUsed: usage.heapUsed,
+      heapTotal: usage.heapTotal,
+      uptimeSeconds: process.uptime(),
+      cpuUserMicros: cpu.user,
+      cpuSystemMicros: cpu.system,
+    };
+  }
+
+  private createNoopTransport(): NodeTransport {
+    let openHandler: (() => void) | undefined;
+    let closeHandler: ((code?: number, reason?: string) => void) | undefined;
+    let _errorHandler: ((error: Error) => void) | undefined;
+    let messageHandler: ((raw: string) => void) | undefined;
+    const localNodeId = this.nodeId;
+    const sign = (payload: unknown) => this.identityManager.sign(payload);
+
+    return {
+      onOpen(handler) {
+        openHandler = handler;
+      },
+      onClose(handler) {
+        closeHandler = handler;
+      },
+      onError(handler) {
+        _errorHandler = handler;
+      },
+      onMessage(handler) {
+        messageHandler = handler;
+      },
+      async connect() {
+        openHandler?.();
+      },
+      async send(raw: string) {
+        void raw;
+        const ack = {
+          id: randomUUID(),
+          from: 'hub',
+          to: localNodeId,
+          type: 'ack',
+          payload: {},
+          timestamp: Date.now(),
+        };
+        messageHandler?.(JSON.stringify({
+          ...ack,
+          signature: sign(ack),
+        }));
+      },
+      async close(code?: number, reason?: string) {
+        closeHandler?.(code, reason);
+      },
+    };
+  }
 }
