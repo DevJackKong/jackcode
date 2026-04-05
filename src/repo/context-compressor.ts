@@ -11,7 +11,6 @@ import type {
   CompressionStats,
   CompressionLevel,
   FragmentType,
-  ScoredFragment,
   ModelBudget,
 } from '../types/context.js';
 
@@ -22,9 +21,6 @@ import type {
   FileContext,
 } from './types.js';
 
-/**
- * Default compression strategies per level
- */
 const DEFAULT_STRATEGIES: Record<CompressionLevel, CompressionStrategy> = {
   0: {
     level: 0,
@@ -36,226 +32,222 @@ const DEFAULT_STRATEGIES: Record<CompressionLevel, CompressionStrategy> = {
   1: {
     level: 1,
     targetBudget: null,
-    preserveTypes: ['code', 'error', 'system', 'symbol'],
+    preserveTypes: ['code', 'error', 'system', 'symbol', 'doc'],
     preserveTags: ['critical', 'error'],
     minPriority: 0.1,
   },
   2: {
     level: 2,
     targetBudget: null,
-    preserveTypes: ['code', 'error', 'system'],
+    preserveTypes: ['code', 'error', 'system', 'symbol'],
     preserveTags: ['critical'],
-    minPriority: 0.3,
+    minPriority: 0.25,
   },
   3: {
     level: 3,
     targetBudget: null,
-    preserveTypes: ['error', 'system'],
+    preserveTypes: ['error', 'system', 'symbol'],
     preserveTags: ['critical'],
     minPriority: 0.5,
   },
 };
 
-/**
- * Model token budgets
- */
-const MODEL_BUDGETS: Record<string, ModelBudget> = {
+const MODEL_BUDGETS: Record<'qwen' | 'deepseek' | 'gpt', ModelBudget> = {
   qwen: { model: 'qwen', maxTokens: 128000, safetyMargin: 0.1, effectiveBudget: 115200 },
   deepseek: { model: 'deepseek', maxTokens: 64000, safetyMargin: 0.1, effectiveBudget: 57600 },
   gpt: { model: 'gpt', maxTokens: 128000, safetyMargin: 0.15, effectiveBudget: 108800 },
 };
 
-/**
- * Estimate token count from text
- * Uses approximate 4 chars per token heuristic
- */
 export function estimateTokens(text: string): number {
   return Math.ceil(text.length / 4);
 }
 
-/**
- * Context Compressor class
- */
 export class ContextCompressor {
   private strategy: CompressionStrategy;
 
   constructor(strategy: CompressionStrategy = DEFAULT_STRATEGIES[1]) {
-    this.strategy = strategy;
+    this.strategy = { ...strategy };
   }
 
-  /**
-   * Set compression strategy
-   */
   setStrategy(strategy: CompressionStrategy): void {
-    this.strategy = strategy;
+    this.strategy = { ...strategy };
   }
 
-  /**
-   * Pack fragments into structured context
-   */
   pack(fragments: ContextFragment[]): PackedContext {
-    const totalTokens = fragments.reduce(
-      (sum, f) => sum + (f.tokenCount ?? estimateTokens(f.content)),
-      0
-    );
+    const normalizedFragments = fragments.map((fragment) => ({
+      ...fragment,
+      tokenCount: fragment.tokenCount ?? estimateTokens(fragment.content),
+    }));
+
+    const totalTokens = normalizedFragments.reduce((sum, fragment) => sum + (fragment.tokenCount ?? 0), 0);
 
     return {
-      fragments: [...fragments],
+      fragments: normalizedFragments,
       rawTokens: totalTokens,
       packedAt: Date.now(),
     };
   }
 
-  /**
-   * Compress packed context to fit budget
-   */
   compress(packed: PackedContext, budget?: number): CompressedContext {
-    const targetBudget = budget ?? this.strategy.targetBudget ?? packed.rawTokens;
+    const targetBudget = Math.max(0, budget ?? this.strategy.targetBudget ?? packed.rawTokens);
     const fragments = [...packed.fragments];
 
-    // If already under budget, apply level 0 (lossless) optimizations only
+    if (targetBudget === 0) {
+      return this.buildCompressed(packed, [], 0);
+    }
+
     if (packed.rawTokens <= targetBudget && this.strategy.level === 0) {
       return this.buildCompressed(packed, fragments, targetBudget);
     }
 
-    // Filter by minimum priority
-    let filtered = this.filterByPriority(fragments, this.strategy.minPriority);
+    const preserved = this.selectPreservedFragments(fragments);
+    const others = fragments.filter((fragment) => !preserved.has(fragment.id));
 
-    // Filter by preserved types
-    filtered = this.filterByTypes(filtered, this.strategy.preserveTypes);
+    let filtered = [
+      ...Array.from(preserved.values()),
+      ...others.filter((fragment) => this.matchesPriority(fragment) && this.matchesType(fragment)),
+    ];
 
-    // Filter by preserved tags
     if (this.strategy.preserveTags.length > 0) {
-      filtered = this.filterByTags(filtered, this.strategy.preserveTags);
+      const preservedByTag = others.filter((fragment) => this.matchesTags(fragment));
+      filtered = this.mergeUniqueFragments(filtered, preservedByTag);
     }
 
-    // If still over budget, apply truncation
-    let currentTokens = this.calculateTokens(filtered);
-    if (currentTokens > targetBudget) {
-      filtered = this.truncateToBudget(filtered, targetBudget);
+    if (this.calculateTokens(filtered) > targetBudget) {
+      filtered = this.truncateToBudget(filtered, targetBudget, preserved);
     }
 
     return this.buildCompressed(packed, filtered, targetBudget);
   }
 
-  /**
-   * Compress specifically for a model
-   */
-  compressForModel(
-    packed: PackedContext,
-    model: keyof typeof MODEL_BUDGETS
-  ): CompressedContext {
-    const budget = MODEL_BUDGETS[model].effectiveBudget;
-    return this.compress(packed, budget);
+  compressForModel(packed: PackedContext, model: keyof typeof MODEL_BUDGETS): CompressedContext {
+    return this.compress(packed, MODEL_BUDGETS[model].effectiveBudget);
   }
 
-  /**
-   * Filter fragments below minimum priority
-   */
-  private filterByPriority(
-    fragments: ContextFragment[],
-    minPriority: number
+  private selectPreservedFragments(fragments: ContextFragment[]): Map<string, ContextFragment> {
+    const preserved = new Map<string, ContextFragment>();
+
+    for (const fragment of fragments) {
+      const preserveByType = this.strategy.preserveTypes.includes(fragment.type);
+      const preserveByTag = fragment.metadata.tags.some((tag) => this.strategy.preserveTags.includes(tag));
+      if (preserveByType || preserveByTag) {
+        preserved.set(fragment.id, fragment);
+      }
+    }
+
+    return preserved;
+  }
+
+  private matchesPriority(fragment: ContextFragment): boolean {
+    return fragment.metadata.priority >= this.strategy.minPriority;
+  }
+
+  private matchesType(fragment: ContextFragment): boolean {
+    return this.strategy.preserveTypes.length === 0 || this.strategy.preserveTypes.includes(fragment.type);
+  }
+
+  private matchesTags(fragment: ContextFragment): boolean {
+    return fragment.metadata.tags.some((tag) => this.strategy.preserveTags.includes(tag));
+  }
+
+  private mergeUniqueFragments(
+    current: ContextFragment[],
+    incoming: ContextFragment[]
   ): ContextFragment[] {
-    return fragments.filter((f) => f.metadata.priority >= minPriority);
+    const merged = new Map(current.map((fragment) => [fragment.id, fragment]));
+    for (const fragment of incoming) {
+      merged.set(fragment.id, fragment);
+    }
+    return Array.from(merged.values());
   }
 
-  /**
-   * Filter to only specified types
-   */
-  private filterByTypes(
-    fragments: ContextFragment[],
-    types: FragmentType[]
-  ): ContextFragment[] {
-    return fragments.filter((f) => types.includes(f.type));
-  }
-
-  /**
-   * Filter to fragments with specified tags
-   */
-  private filterByTags(
-    fragments: ContextFragment[],
-    tags: string[]
-  ): ContextFragment[] {
-    return fragments.filter((f) =>
-      f.metadata.tags.some((t) => tags.includes(t))
-    );
-  }
-
-  /**
-   * Truncate fragments to fit budget
-   * Removes lowest priority fragments first
-   */
   private truncateToBudget(
     fragments: ContextFragment[],
-    budget: number
+    budget: number,
+    preserved: Map<string, ContextFragment>
   ): ContextFragment[] {
-    // Sort by priority descending
-    const sorted = [...fragments].sort(
-      (a, b) => b.metadata.priority - a.metadata.priority
-    );
+    const sorted = [...fragments].sort((a, b) => {
+      const preserveDelta = Number(preserved.has(b.id)) - Number(preserved.has(a.id));
+      if (preserveDelta !== 0) return preserveDelta;
+      const priorityDelta = b.metadata.priority - a.metadata.priority;
+      if (priorityDelta !== 0) return priorityDelta;
+      return b.metadata.lastAccess - a.metadata.lastAccess;
+    });
 
     const result: ContextFragment[] = [];
     let currentTokens = 0;
 
     for (const fragment of sorted) {
-      const tokens = fragment.tokenCount ?? estimateTokens(fragment.content);
-      if (currentTokens + tokens <= budget) {
+      const fragmentTokens = fragment.tokenCount ?? estimateTokens(fragment.content);
+      if (result.length === 0 && fragmentTokens > budget) {
+        result.push(this.trimFragmentToBudget(fragment, budget));
+        break;
+      }
+
+      if (currentTokens + fragmentTokens <= budget) {
         result.push(fragment);
-        currentTokens += tokens;
+        currentTokens += fragmentTokens;
       }
     }
 
     return result;
   }
 
-  /**
-   * Calculate total tokens for fragments
-   */
-  private calculateTokens(fragments: ContextFragment[]): number {
-    return fragments.reduce(
-      (sum, f) => sum + (f.tokenCount ?? estimateTokens(f.content)),
-      0
-    );
+  private trimFragmentToBudget(fragment: ContextFragment, budget: number): ContextFragment {
+    if (budget <= 0) {
+      return { ...fragment, content: '', tokenCount: 0 };
+    }
+
+    const maxChars = Math.max(1, budget * 4);
+    if (fragment.content.length <= maxChars) {
+      return { ...fragment, tokenCount: fragment.tokenCount ?? estimateTokens(fragment.content) };
+    }
+
+    const suffix = '\n// ... truncated';
+    const trimmedContent = `${fragment.content.slice(0, Math.max(1, maxChars - suffix.length))}${suffix}`;
+    return {
+      ...fragment,
+      content: trimmedContent,
+      tokenCount: estimateTokens(trimmedContent),
+      metadata: {
+        ...fragment.metadata,
+        tags: Array.from(new Set([...fragment.metadata.tags, 'truncated'])),
+      },
+    };
   }
 
-  /**
-   * Build compressed context output
-   */
+  private calculateTokens(fragments: ContextFragment[]): number {
+    return fragments.reduce((sum, fragment) => sum + (fragment.tokenCount ?? estimateTokens(fragment.content)), 0);
+  }
+
   private buildCompressed(
     original: PackedContext,
     fragments: ContextFragment[],
-    targetBudget: number
+    _targetBudget: number
   ): CompressedContext {
-    const finalTokens = this.calculateTokens(fragments);
-    const originalTokens = original.rawTokens;
-
-    // Sort fragments for coherent output
     const sortedFragments = this.sortForOutput(fragments);
-
-    // Build content string
+    const finalTokens = this.calculateTokens(sortedFragments);
+    const originalTokens = original.rawTokens;
     const content = this.formatContent(sortedFragments);
 
     const stats: CompressionStats = {
       originalTokens,
       finalTokens,
-      savedTokens: originalTokens - finalTokens,
+      savedTokens: Math.max(0, originalTokens - finalTokens),
       ratio: originalTokens > 0 ? finalTokens / originalTokens : 0,
-      fragmentsDropped: original.fragments.length - fragments.length,
-      fragmentsSummarized: 0, // Summarization not implemented in v0.1
+      fragmentsDropped: Math.max(0, original.fragments.length - sortedFragments.length),
+      fragmentsSummarized: sortedFragments.filter((fragment) => fragment.metadata.tags.includes('summarized') || fragment.metadata.tags.includes('truncated')).length,
     };
 
     return {
       content,
       fragments: sortedFragments,
       stats,
-      strategy: this.strategy,
+      strategy: { ...this.strategy },
       compressedAt: Date.now(),
     };
   }
 
-  /**
-   * Sort fragments for coherent output order
-   */
   private sortForOutput(fragments: ContextFragment[]): ContextFragment[] {
     const typeOrder: Record<FragmentType, number> = {
       system: 0,
@@ -268,35 +260,24 @@ export class ContextCompressor {
     };
 
     return [...fragments].sort((a, b) => {
-      // First by type order
       const typeDiff = typeOrder[a.type] - typeOrder[b.type];
       if (typeDiff !== 0) return typeDiff;
-      // Then by priority (descending)
-      return b.metadata.priority - a.metadata.priority;
+      const priorityDiff = b.metadata.priority - a.metadata.priority;
+      if (priorityDiff !== 0) return priorityDiff;
+      return b.metadata.lastAccess - a.metadata.lastAccess;
     });
   }
 
-  /**
-   * Format fragments into content string
-   */
   private formatContent(fragments: ContextFragment[]): string {
-    const sections: string[] = [];
-
-    for (const fragment of fragments) {
-      const header = fragment.source
-        ? `[${fragment.type}] ${fragment.source}`
-        : `[${fragment.type}]`;
-      sections.push(`${header}\n${fragment.content}`);
-    }
-
-    return sections.join('\n\n---\n\n');
+    return fragments
+      .map((fragment) => {
+        const header = fragment.source ? `[${fragment.type}] ${fragment.source}` : `[${fragment.type}]`;
+        return `${header}\n${fragment.content}`;
+      })
+      .join('\n\n---\n\n');
   }
 }
 
-/**
- * Repository-specific context compressor
- * Handles repo map integration and file-aware compression
- */
 export class RepoContextCompressor extends ContextCompressor {
   private repoConfig: RepoCompressionConfig;
   private repoMap: RepoMap | null = null;
@@ -315,47 +296,33 @@ export class RepoContextCompressor extends ContextCompressor {
     };
   }
 
-  /**
-   * Set repo map for context generation
-   */
   setRepoMap(repoMap: RepoMap): void {
     this.repoMap = repoMap;
   }
 
-  /**
-   * Compress repository context
-   */
-  compressRepo(
-    files: FileContext[],
-    budget?: number
-  ): RepoCompressedContext {
+  compressRepo(files: FileContext[], budget?: number): RepoCompressedContext {
     const targetBudget = budget ?? MODEL_BUDGETS.qwen.effectiveBudget;
-    
-    // Filter files by patterns
     const filteredFiles = this.filterByPatterns(files);
-    
-    // Apply size-based strategy
     const processedFiles = this.applySizeStrategy(filteredFiles);
-    
-    // Pack and compress
     const packed = this.pack(processedFiles);
     const compressed = this.compress(packed, targetBudget);
 
     const includedFiles = compressed.fragments
-      .map((f) => (f as FileContext).relativePath)
-      .filter(Boolean);
+      .map((fragment) => ('relativePath' in fragment ? (fragment as FileContext).relativePath : undefined))
+      .filter((value): value is string => Boolean(value));
 
-    const allPaths = files.map((f) => f.relativePath);
-    const omittedFiles = allPaths.filter((p) => !includedFiles.includes(p));
+    const allPaths = files.map((file) => file.relativePath);
+    const omittedFiles = allPaths.filter((path) => !includedFiles.includes(path));
 
     return {
       content: compressed.content,
-      repoMap: this.repoMap ?? {
-        rootPath: '.',
-        fileTree: [],
-        symbols: { definitions: new Map(), references: new Map() },
-        generatedAt: Date.now(),
-      },
+      repoMap:
+        this.repoMap ?? {
+          rootPath: '.',
+          fileTree: [],
+          symbols: { definitions: new Map(), references: new Map() },
+          generatedAt: Date.now(),
+        },
       includedFiles,
       omittedFiles,
       metrics: {
@@ -367,68 +334,55 @@ export class RepoContextCompressor extends ContextCompressor {
     };
   }
 
-  /**
-   * Filter files by include/exclude patterns
-   */
   private filterByPatterns(files: FileContext[]): FileContext[] {
     return files.filter((file) => {
       const path = file.relativePath;
 
-      // Check excludes first
       for (const pattern of this.repoConfig.excludePatterns) {
         if (this.matchPattern(path, pattern)) return false;
       }
 
-      // If includes specified, must match at least one
       if (this.repoConfig.includePatterns.length > 0) {
-        return this.repoConfig.includePatterns.some((p) =>
-          this.matchPattern(path, p)
-        );
+        return this.repoConfig.includePatterns.some((pattern) => this.matchPattern(path, pattern));
       }
 
       return true;
     });
   }
 
-  /**
-   * Simple pattern matching (glob-like)
-   */
   private matchPattern(path: string, pattern: string): boolean {
-    // Convert glob to regex
-    const regex = pattern
-      .replace(/\*\*/g, '{{GLOBSTAR}}')
+    const escapedPattern = pattern.replace(/[.+^${}()|[\]\\]/g, '\\$&');
+    const regex = escapedPattern
+      .replace(/\*\*/g, '::GLOBSTAR::')
       .replace(/\*/g, '[^/]*')
       .replace(/\?/g, '.')
-      .replace(/{{GLOBSTAR}}/g, '.*');
-    
-    return new RegExp(regex).test(path);
+      .replace(/::GLOBSTAR::/g, '.*');
+
+    return new RegExp(`^${regex}$`).test(path);
   }
 
-  /**
-   * Apply size-based compression strategy
-   * Large files get summarized or marked for omission
-   */
   private applySizeStrategy(files: FileContext[]): FileContext[] {
     return files.map((file) => {
-      if (file.fileSize > this.repoConfig.maxInlineSize) {
-        // Mark for summarization (v0.1: just truncate indicator)
-        return {
-          ...file,
-          content: `// File too large (${file.fileSize} bytes), showing first 500 chars:\n${file.content.slice(0, 500)}\n// ... truncated`,
-          metadata: {
-            ...file.metadata,
-            tags: [...file.metadata.tags, 'summarized'],
-          },
-        };
+      if (file.fileSize <= this.repoConfig.maxInlineSize) {
+        return file;
       }
-      return file;
+
+      const previewLimit = Math.min(file.content.length, Math.max(500, this.repoConfig.maxInlineSize / 10));
+      const content = `// File too large (${file.fileSize} bytes), showing first ${previewLimit} chars:\n${file.content.slice(0, previewLimit)}\n// ... truncated`;
+
+      return {
+        ...file,
+        content,
+        tokenCount: estimateTokens(content),
+        metadata: {
+          ...file.metadata,
+          tags: Array.from(new Set([...file.metadata.tags, 'summarized'])),
+        },
+      };
     });
   }
 }
 
-/**
- * Factory function for quick compression
- */
 export function compressContext(
   fragments: ContextFragment[],
   budget?: number,
@@ -439,9 +393,6 @@ export function compressContext(
   return compressor.compress(packed, budget);
 }
 
-/**
- * Factory function for repo compression
- */
 export function compressRepoContext(
   files: FileContext[],
   repoMap: RepoMap,

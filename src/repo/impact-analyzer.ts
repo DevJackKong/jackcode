@@ -3,6 +3,7 @@
  * Analyzes the ripple effects of code changes across the codebase.
  */
 
+import { dirname, normalize, resolve } from 'path';
 import {
   ChangeDescriptor,
   ChangeType,
@@ -12,8 +13,6 @@ import {
   ImpactCategory,
   ImpactSeverity,
   DependencyNode,
-  SymbolExport,
-  SymbolImport,
   ImpactAnalyzerOptions,
   DEFAULT_ANALYZER_OPTIONS,
   IImpactAnalyzer,
@@ -26,6 +25,7 @@ import {
 export class ImpactAnalyzer implements IImpactAnalyzer {
   private dependencyGraph: Map<string, DependencyNode> = new Map();
   private options: ImpactAnalyzerOptions;
+  private readonly fileExtensions = ['.ts', '.tsx', '.js', '.jsx', '.mts', '.cts'];
 
   constructor(options: Partial<ImpactAnalyzerOptions> = {}) {
     this.options = { ...DEFAULT_ANALYZER_OPTIONS, ...options };
@@ -40,29 +40,24 @@ export class ImpactAnalyzer implements IImpactAnalyzer {
     const affectedTests: AffectedTest[] = [];
     const timestamp = Date.now();
 
-    // Process each change
     for (const change of changeList) {
       await this.analyzeSingleChange(change, impactedFiles);
     }
 
-    // Find affected tests
     if (this.options.includeTests) {
       this.discoverAffectedTests(impactedFiles, affectedTests);
     }
 
-    // Calculate summary
     const summary = this.calculateSummary(impactedFiles, affectedTests);
-
-    // Determine risk level
     const riskLevel = this.assessRiskLevel(impactedFiles, affectedTests);
-
-    // Generate recommendations
     const recommendations = this.generateRecommendations(impactedFiles, affectedTests, riskLevel);
 
     return {
       changes: changeList,
       timestamp,
-      impactedFiles: Array.from(impactedFiles.values()).sort((a, b) => b.severity.localeCompare(a.severity)),
+      impactedFiles: Array.from(impactedFiles.values()).sort(
+        (a, b) => this.severityRank(a.severity) - this.severityRank(b.severity) || a.distance - b.distance
+      ),
       affectedTests,
       summary,
       riskLevel,
@@ -70,16 +65,14 @@ export class ImpactAnalyzer implements IImpactAnalyzer {
     };
   }
 
-  /**
-   * Analyze a single change and update the impacted files map
-   */
   private async analyzeSingleChange(
     change: ChangeDescriptor,
     impactedFiles: Map<string, ImpactedFile>
   ): Promise<void> {
-    // Mark the changed file as directly impacted
+    const normalizedPath = this.normalizePath(change.path);
+
     this.addImpactedFile(impactedFiles, {
-      path: change.path,
+      path: normalizedPath,
       category: 'direct',
       severity: this.severityFromChangeType(change.type),
       reasons: [`${change.type} operation on ${change.scope}`],
@@ -87,10 +80,9 @@ export class ImpactAnalyzer implements IImpactAnalyzer {
       affectedSymbols: change.symbolName ? [change.symbolName] : undefined,
     });
 
-    // If previous path exists (rename), mark it too
     if (change.previousPath) {
       this.addImpactedFile(impactedFiles, {
-        path: change.previousPath,
+        path: this.normalizePath(change.previousPath),
         category: 'direct',
         severity: 'high',
         reasons: ['file renamed from this path'],
@@ -98,158 +90,171 @@ export class ImpactAnalyzer implements IImpactAnalyzer {
       });
     }
 
-    // Find transitive dependencies
-    await this.propagateImpact(change.path, impactedFiles, 1);
+    await this.propagateImpact(normalizedPath, impactedFiles, 1);
 
-    // If the change affects specific symbols, analyze symbol-level impact
     if (change.symbolName && change.scope === 'symbol') {
-      await this.analyzeSymbolImpact(change.path, change.symbolName, impactedFiles);
+      await this.analyzeSymbolImpact(normalizedPath, change.symbolName, impactedFiles);
     }
   }
 
-  /**
-   * Propagate impact through the dependency graph
-   */
   private async propagateImpact(
     sourcePath: string,
     impactedFiles: Map<string, ImpactedFile>,
-    distance: number
+    distance: number,
+    visited = new Set<string>()
   ): Promise<void> {
     if (distance > this.options.maxDepth) {
       return;
     }
 
-    const node = this.dependencyGraph.get(sourcePath);
+    const normalizedSourcePath = this.normalizePath(sourcePath);
+    if (visited.has(normalizedSourcePath)) {
+      return;
+    }
+    visited.add(normalizedSourcePath);
+
+    const node = this.dependencyGraph.get(normalizedSourcePath);
     if (!node) {
+      visited.delete(normalizedSourcePath);
       return;
     }
 
-    // Find all files that depend on the source
     for (const dependentPath of node.dependents) {
-      // Skip if already marked with lower distance
-      const existing = impactedFiles.get(dependentPath);
+      const normalizedDependentPath = this.normalizePath(dependentPath);
+      const existing = impactedFiles.get(normalizedDependentPath);
       if (existing && existing.distance <= distance) {
         continue;
       }
 
-      const dependentNode = this.dependencyGraph.get(dependentPath);
-      const isTestFile = this.isTestFile(dependentPath);
-      
-      // Determine what symbols from source are used by dependent
+      const dependentNode = this.dependencyGraph.get(normalizedDependentPath);
+      const isTestFile = this.isTestFile(normalizedDependentPath);
       const usedSymbols = this.findUsedSymbols(node, dependentNode);
+      const circularDependency = visited.has(normalizedDependentPath);
 
       this.addImpactedFile(impactedFiles, {
-        path: dependentPath,
+        path: normalizedDependentPath,
         category: isTestFile ? 'test' : 'transitive',
-        severity: this.calculateTransitiveSeverity(distance, isTestFile),
-        reasons: [`depends on ${sourcePath}`],
+        severity: circularDependency ? 'high' : this.calculateTransitiveSeverity(distance, isTestFile),
+        reasons: circularDependency
+          ? [`circular dependency detected with ${normalizedSourcePath}`]
+          : [`depends on ${normalizedSourcePath}`],
         distance,
         affectedSymbols: usedSymbols.length > 0 ? usedSymbols : undefined,
       });
 
-      // Continue propagation
-      await this.propagateImpact(dependentPath, impactedFiles, distance + 1);
+      if (!circularDependency) {
+        await this.propagateImpact(normalizedDependentPath, impactedFiles, distance + 1, visited);
+      }
     }
+
+    visited.delete(normalizedSourcePath);
   }
 
-  /**
-   * Analyze impact at symbol level
-   */
   private async analyzeSymbolImpact(
     filePath: string,
     symbolName: string,
     impactedFiles: Map<string, ImpactedFile>
   ): Promise<void> {
-    const node = this.dependencyGraph.get(filePath);
+    const node = this.dependencyGraph.get(this.normalizePath(filePath));
     if (!node) {
       return;
     }
 
-    // Find symbol export info
-    const symbolExport = node.exports.find(e => e.name === symbolName);
+    const symbolExport = node.exports.find((e) => e.name === symbolName);
     if (!symbolExport) {
       return;
     }
 
-    // For type-only exports, reduce severity of transitive impacts
     if (symbolExport.isTypeOnly) {
       for (const [path, file] of impactedFiles) {
         if (file.category === 'transitive' && file.distance > 0) {
-          // Downgrade severity for type-only impacts at runtime
           if (!this.options.includeTypeDependencies) {
             impactedFiles.delete(path);
           } else {
             file.category = 'type-only';
             file.severity = 'low';
+            file.reasons = [...new Set([...file.reasons, `type-only dependency on ${symbolName}`])];
           }
         }
       }
     }
   }
 
-  /**
-   * Find which symbols from source are used by dependent
-   */
   private findUsedSymbols(sourceNode: DependencyNode, dependentNode?: DependencyNode): string[] {
     if (!dependentNode) {
       return [];
     }
 
-    const usedSymbols: string[] = [];
+    const usedSymbols = new Set<string>();
     for (const imp of dependentNode.imports) {
-      // Resolve the import source to absolute path
+      if (imp.isTypeOnly && !this.options.includeTypeDependencies) {
+        continue;
+      }
+
       const resolvedSource = this.resolveImportPath(imp.source, dependentNode.path);
-      if (resolvedSource === sourceNode.path) {
+      if (resolvedSource === this.normalizePath(sourceNode.path)) {
         if (imp.name === '*') {
-          // Namespace import - all exports used
-          usedSymbols.push(...sourceNode.exports.map(e => e.name));
+          for (const exported of sourceNode.exports) {
+            if (!exported.isTypeOnly || this.options.includeTypeDependencies) {
+              usedSymbols.add(exported.name);
+            }
+          }
         } else {
-          usedSymbols.push(imp.localName || imp.name);
+          usedSymbols.add(imp.name);
         }
       }
     }
-    return usedSymbols;
+
+    return Array.from(usedSymbols);
   }
 
-  /**
-   * Resolve an import path to absolute file path
-   * Stub implementation - should use actual module resolution
-   */
   private resolveImportPath(importPath: string, fromFile: string): string {
-    // Handle relative imports
-    if (importPath.startsWith('.')) {
-      // Simple resolution - real implementation would use proper path resolution
-      return importPath; // Placeholder
+    if (!importPath) {
+      return this.normalizePath(fromFile);
     }
-    // Handle node_modules or other imports
-    return importPath;
+
+    if (!importPath.startsWith('.')) {
+      return importPath;
+    }
+
+    const fromDir = dirname(this.normalizePath(fromFile));
+    const basePath = this.normalizePath(resolve(fromDir, importPath));
+    const candidates = [
+      basePath,
+      ...this.fileExtensions.map((ext) => `${basePath}${ext}`),
+      ...this.fileExtensions.map((ext) => `${basePath}/index${ext}`),
+    ];
+
+    for (const candidate of candidates) {
+      if (this.dependencyGraph.has(candidate)) {
+        return candidate;
+      }
+    }
+
+    return basePath;
   }
 
-  /**
-   * Discover which tests are affected by the changes
-   */
   private discoverAffectedTests(
     impactedFiles: Map<string, ImpactedFile>,
     affectedTests: AffectedTest[]
   ): void {
-    const testFiles: AffectedTest[] = [];
-    const seenTests = new Set<string>();
+    const seenTests = new Map<string, AffectedTest>();
 
     for (const [path, file] of impactedFiles) {
-      // Skip if already a test file
       if (this.isTestFile(path)) {
         continue;
       }
 
-      // Find tests that cover this file
       const coveringTests = this.findCoveringTests(path);
       for (const testPath of coveringTests) {
-        if (seenTests.has(testPath)) {
+        const existing = seenTests.get(testPath);
+        if (existing) {
+          existing.coversFiles = Array.from(new Set([...existing.coversFiles, path]));
+          existing.priority = this.higherTestPriority(existing.priority, this.calculateTestPriority(file));
           continue;
         }
-        seenTests.add(testPath);
 
-        testFiles.push({
+        seenTests.set(testPath, {
           path: testPath,
           coversFiles: [path],
           priority: this.calculateTestPriority(file),
@@ -258,52 +263,46 @@ export class ImpactAnalyzer implements IImpactAnalyzer {
       }
     }
 
-    affectedTests.push(...testFiles);
+    affectedTests.push(...seenTests.values());
   }
 
-  /**
-   * Helper: Add or update an impacted file
-   */
   private addImpactedFile(
     impactedFiles: Map<string, ImpactedFile>,
     file: ImpactedFile
   ): void {
-    const existing = impactedFiles.get(file.path);
+    const normalizedPath = this.normalizePath(file.path);
+    const nextFile = { ...file, path: normalizedPath };
+    const existing = impactedFiles.get(normalizedPath);
+
     if (existing) {
-      // Merge with existing entry
-      existing.category = this.mergeCategory(existing.category, file.category);
-      existing.severity = this.higherSeverity(existing.severity, file.severity);
-      existing.reasons = [...new Set([...existing.reasons, ...file.reasons])];
-      existing.distance = Math.min(existing.distance, file.distance);
-      if (file.affectedSymbols) {
-        existing.affectedSymbols = [...new Set([...(existing.affectedSymbols || []), ...file.affectedSymbols])];
+      existing.category = this.mergeCategory(existing.category, nextFile.category);
+      existing.severity = this.higherSeverity(existing.severity, nextFile.severity);
+      existing.reasons = [...new Set([...existing.reasons, ...nextFile.reasons])];
+      existing.distance = Math.min(existing.distance, nextFile.distance);
+      if (nextFile.affectedSymbols) {
+        existing.affectedSymbols = [
+          ...new Set([...(existing.affectedSymbols || []), ...nextFile.affectedSymbols]),
+        ];
       }
-    } else {
-      impactedFiles.set(file.path, file);
+      return;
     }
+
+    impactedFiles.set(normalizedPath, nextFile);
   }
 
-  /**
-   * Calculate severity from change type
-   */
   private severityFromChangeType(type: ChangeType): ImpactSeverity {
     switch (type) {
       case 'delete':
         return 'critical';
       case 'rename':
-        return 'high';
       case 'modify':
         return 'high';
       case 'add':
-        return 'medium';
       default:
         return 'medium';
     }
   }
 
-  /**
-   * Calculate severity for transitive impact
-   */
   private calculateTransitiveSeverity(distance: number, isTest: boolean): ImpactSeverity {
     if (isTest) {
       return 'low';
@@ -317,54 +316,48 @@ export class ImpactAnalyzer implements IImpactAnalyzer {
     return 'low';
   }
 
-  /**
-   * Merge two impact categories (prefer more specific)
-   */
   private mergeCategory(a: ImpactCategory, b: ImpactCategory): ImpactCategory {
     const priority: ImpactCategory[] = ['direct', 'transitive', 'test', 'type-only', 'dynamic'];
-    const aIdx = priority.indexOf(a);
-    const bIdx = priority.indexOf(b);
-    return priority[Math.min(aIdx, bIdx)];
+    return priority[Math.min(priority.indexOf(a), priority.indexOf(b))] ?? a;
   }
 
-  /**
-   * Return the higher severity
-   */
   private higherSeverity(a: ImpactSeverity, b: ImpactSeverity): ImpactSeverity {
     const order: ImpactSeverity[] = ['critical', 'high', 'medium', 'low', 'none'];
-    return order[Math.min(order.indexOf(a), order.indexOf(b))];
+    return order[Math.min(order.indexOf(a), order.indexOf(b))] ?? a;
   }
 
-  /**
-   * Check if a file is a test file
-   */
+  private severityRank(severity: ImpactSeverity): number {
+    return ['critical', 'high', 'medium', 'low', 'none'].indexOf(severity);
+  }
+
   private isTestFile(path: string): boolean {
-    return this.options.testPatterns.some(pattern => {
-      // Simple glob matching - real implementation would use proper glob
-      const regex = pattern
-        .replace(/\*\*/g, '.*')
-        .replace(/\*/g, '[^/]*')
-        .replace(/\?/g, '.');
-      return new RegExp(regex).test(path);
-    });
+    return this.options.testPatterns.some((pattern) => this.matchPattern(path, pattern));
   }
 
-  /**
-   * Find tests that cover a given source file
-   * Stub implementation - should integrate with test mapping
-   */
   private findCoveringTests(sourcePath: string): string[] {
-    // This would integrate with a test coverage mapping system
-    // For now, return empty - real implementation would:
-    // 1. Check coverage data if available
-    // 2. Look for tests in same directory
-    // 3. Check test file naming conventions
-    return [];
+    const normalizedSourcePath = this.normalizePath(sourcePath);
+    const sourceBase = normalizedSourcePath.replace(/\.[^.]+$/, '');
+    const sourceFileName = sourceBase.split('/').pop() ?? sourceBase;
+    const tests = new Set<string>();
+
+    for (const [candidatePath, node] of this.dependencyGraph.entries()) {
+      if (!this.isTestFile(candidatePath)) {
+        continue;
+      }
+
+      const normalizedCandidate = this.normalizePath(candidatePath);
+      const candidateBase = normalizedCandidate.replace(/\.[^.]+$/, '');
+      if (
+        candidateBase.includes(sourceFileName) ||
+        node.imports.some((imp) => this.resolveImportPath(imp.source, node.path) === normalizedSourcePath)
+      ) {
+        tests.add(normalizedCandidate);
+      }
+    }
+
+    return Array.from(tests);
   }
 
-  /**
-   * Calculate test priority based on impacted file
-   */
   private calculateTestPriority(file: ImpactedFile): 'critical' | 'high' | 'normal' {
     if (file.severity === 'critical') {
       return 'critical';
@@ -375,32 +368,34 @@ export class ImpactAnalyzer implements IImpactAnalyzer {
     return 'normal';
   }
 
-  /**
-   * Infer test scope from test file path
-   */
+  private higherTestPriority(
+    a: 'critical' | 'high' | 'normal',
+    b: 'critical' | 'high' | 'normal'
+  ): 'critical' | 'high' | 'normal' {
+    const order = ['critical', 'high', 'normal'] as const;
+    return order[Math.min(order.indexOf(a), order.indexOf(b))] ?? a;
+  }
+
   private inferTestScope(testPath: string): 'unit' | 'integration' | 'e2e' {
     const lower = testPath.toLowerCase();
-    if (lower.includes('e2e') || lower.includes('end-to-end') || lower.includes('integration')) {
+    if (lower.includes('e2e') || lower.includes('end-to-end')) {
       return 'e2e';
     }
-    if (lower.includes('integration')) {
+    if (lower.includes('integration') || lower.includes('__integration__')) {
       return 'integration';
     }
     return 'unit';
   }
 
-  /**
-   * Calculate summary statistics
-   */
   private calculateSummary(
     impactedFiles: Map<string, ImpactedFile>,
     affectedTests: AffectedTest[]
   ): ImpactReport['summary'] {
     const files = Array.from(impactedFiles.values());
-    const directImpacts = files.filter(f => f.category === 'direct').length;
-    const transitiveImpacts = files.filter(f => f.category === 'transitive').length;
-    const testFilesImpacted = files.filter(f => f.category === 'test').length;
-    const maxDistance = files.length > 0 ? Math.max(...files.map(f => f.distance)) : 0;
+    const directImpacts = files.filter((f) => f.category === 'direct').length;
+    const transitiveImpacts = files.filter((f) => f.category === 'transitive').length;
+    const testFilesImpacted = files.filter((f) => f.category === 'test').length + affectedTests.length;
+    const maxDistance = files.length > 0 ? Math.max(...files.map((f) => f.distance)) : 0;
 
     return {
       totalFilesImpacted: files.length,
@@ -411,27 +406,21 @@ export class ImpactAnalyzer implements IImpactAnalyzer {
     };
   }
 
-  /**
-   * Assess overall risk level
-   */
   private assessRiskLevel(
     impactedFiles: Map<string, ImpactedFile>,
-    affectedTests: AffectedTest[]
+    _affectedTests: AffectedTest[]
   ): 'low' | 'medium' | 'high' {
     const files = Array.from(impactedFiles.values());
 
-    // Critical severity found
-    if (files.some(f => f.severity === 'critical')) {
+    if (files.some((f) => f.severity === 'critical')) {
       return 'high';
     }
 
-    // Many high severity or transitive impacts
-    const highSeverityCount = files.filter(f => f.severity === 'high').length;
+    const highSeverityCount = files.filter((f) => f.severity === 'high').length;
     if (highSeverityCount > 5 || files.length > 20) {
       return 'high';
     }
 
-    // Moderate impact
     if (highSeverityCount > 0 || files.length > 5) {
       return 'medium';
     }
@@ -439,9 +428,6 @@ export class ImpactAnalyzer implements IImpactAnalyzer {
     return 'low';
   }
 
-  /**
-   * Generate recommendations based on impact
-   */
   private generateRecommendations(
     impactedFiles: Map<string, ImpactedFile>,
     affectedTests: AffectedTest[],
@@ -455,7 +441,11 @@ export class ImpactAnalyzer implements IImpactAnalyzer {
       recommendations.push('Consider incremental rollout or feature flags');
     }
 
-    if (files.some(f => f.category === 'transitive' && f.distance > 3)) {
+    if (files.some((f) => f.reasons.some((reason) => reason.includes('circular dependency')))) {
+      recommendations.push('Circular dependency detected - review import boundaries before merging');
+    }
+
+    if (files.some((f) => f.category === 'transitive' && f.distance > 3)) {
       recommendations.push('Deep dependency chain detected - review for potential circular dependencies');
     }
 
@@ -463,7 +453,7 @@ export class ImpactAnalyzer implements IImpactAnalyzer {
       recommendations.push('No tests detected for changed files - consider adding test coverage');
     }
 
-    const criticalFiles = files.filter(f => f.severity === 'critical');
+    const criticalFiles = files.filter((f) => f.severity === 'critical');
     if (criticalFiles.length > 0) {
       recommendations.push(`Review ${criticalFiles.length} critical impact(s) before merging`);
     }
@@ -471,69 +461,68 @@ export class ImpactAnalyzer implements IImpactAnalyzer {
     return recommendations;
   }
 
-  // Public API methods
-
-  /**
-   * Invalidate cached dependency data for specific paths
-   */
   invalidateCache(paths?: string[]): void {
     if (paths) {
       for (const path of paths) {
-        this.dependencyGraph.delete(path);
+        this.dependencyGraph.delete(this.normalizePath(path));
       }
-    } else {
-      this.dependencyGraph.clear();
+      return;
     }
-  }
 
-  /**
-   * Rebuild the entire dependency graph
-   * Stub - requires integration with repo scanner and symbol index
-   */
-  async rebuildGraph(): Promise<void> {
-    // This would integrate with:
-    // 1. RepoScanner to find all source files
-    // 2. SymbolIndex to parse imports/exports
-    // For now, clear the cache
     this.dependencyGraph.clear();
   }
 
-  /**
-   * Get the dependency node for a file
-   */
-  getNode(path: string): DependencyNode | undefined {
-    return this.dependencyGraph.get(path);
+  async rebuildGraph(): Promise<void> {
+    this.dependencyGraph.clear();
   }
 
-  /**
-   * Check if a file depends on another
-   */
+  getNode(path: string): DependencyNode | undefined {
+    return this.dependencyGraph.get(this.normalizePath(path));
+  }
+
   hasDependency(from: string, to: string): boolean {
-    const fromNode = this.dependencyGraph.get(from);
+    const normalizedFrom = this.normalizePath(from);
+    const normalizedTo = this.normalizePath(to);
+    const fromNode = this.dependencyGraph.get(normalizedFrom);
     if (!fromNode) {
       return false;
     }
-    return fromNode.imports.some(imp => this.resolveImportPath(imp.source, from) === to);
+    return fromNode.imports.some((imp) => this.resolveImportPath(imp.source, normalizedFrom) === normalizedTo);
   }
 
-  /**
-   * Add or update a node in the dependency graph
-   * Called by external systems (symbol index, repo scanner)
-   */
   updateNode(node: DependencyNode): void {
-    this.dependencyGraph.set(node.path, node);
+    const normalizedNode: DependencyNode = {
+      ...node,
+      path: this.normalizePath(node.path),
+      dependents: node.dependents.map((p) => this.normalizePath(p)),
+      imports: node.imports.map((imp) => ({ ...imp })),
+      exports: node.exports.map((exp) => ({ ...exp })),
+    };
+
+    this.dependencyGraph.set(normalizedNode.path, normalizedNode);
   }
 
-  /**
-   * Get all registered nodes
-   */
   getAllNodes(): Map<string, DependencyNode> {
     return new Map(this.dependencyGraph);
   }
+
+  private normalizePath(filePath: string): string {
+    return normalize(filePath).replace(/\\/g, '/');
+  }
+
+  private matchPattern(value: string, pattern: string): boolean {
+    const normalizedValue = this.normalizePath(value);
+    const escapedPattern = this.normalizePath(pattern).replace(/[.+^${}()|[\]\\]/g, '\\$&');
+    const regexPattern = escapedPattern
+      .replace(/\*\*/g, '::GLOBSTAR::')
+      .replace(/\*/g, '[^/]*')
+      .replace(/\?/g, '.')
+      .replace(/::GLOBSTAR::/g, '.*');
+
+    return new RegExp(`^${regexPattern}$`).test(normalizedValue);
+  }
 }
 
-// Factory function for creating analyzer instances
 export function createImpactAnalyzer(options?: Partial<ImpactAnalyzerOptions>): ImpactAnalyzer {
   return new ImpactAnalyzer(options);
 }
-
