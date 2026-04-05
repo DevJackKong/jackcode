@@ -47,7 +47,7 @@ USER: Write tests for examples/add-tests/src/utils.ts, including edge cases.
 ASSISTANT: One-shot mode received: Write tests for examples/add-tests/src/utils.ts, including edge cases.
 ```
 
-## Demo 3: Fix a bug in execute mode
+## Demo 3: Execute mode without approval stays dry-run
 
 ```bash
 node dist/cli/index.js --model qwen-3.6 --execute "Fix examples/fix-bug/src/buggy.ts and explain the bug fixes."
@@ -56,10 +56,25 @@ node dist/cli/index.js --model qwen-3.6 --execute "Fix examples/fix-bug/src/bugg
 ### Sample output
 
 ```text
-JackCode Execute | Model: qwen-3.6
---------------------------------------------------
-USER: Fix examples/fix-bug/src/buggy.ts and explain the bug fixes.
-ASSISTANT: Execute mode staged task: Fix examples/fix-bug/src/buggy.ts and explain the bug fixes.
+Workflow: dry-run
+...
+Result: approval missing. No files were changed. Re-run with --execute --approve to apply these pending changes.
+```
+
+## Demo 4: Approved execute mode applies changes
+
+```bash
+node dist/cli/index.js --model qwen-3.6 --execute --approve "Fix examples/fix-bug/src/buggy.ts and explain the bug fixes."
+```
+
+### Sample output
+
+```text
+Workflow: applied
+...
+Applied changes:
+  - examples/fix-bug/src/buggy.ts
+Result: applied 1 patch(es) across 1 file(s).
 ```
 
 ## Interactive demo
@@ -74,6 +89,7 @@ Then try:
 /model qwen-3.6
 /plan Refactor examples/simple-refactor/src/calculator.ts
 /execute Fix examples/fix-bug/src/buggy.ts
+/execute --approve Fix examples/fix-bug/src/buggy.ts
 /review
 /status
 ```

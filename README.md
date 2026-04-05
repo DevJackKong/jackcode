@@ -42,7 +42,9 @@ jackcode --model gpt-5.4 "review pending patch"
 ### Current CLI behavior
 
 - `jackcode "..."` runs a real planner/verifier-style CLI flow and prints a structured summary
-- `jackcode --execute "..."` is currently a **truthful dry-run**: it shows the inferred plan, files likely touched, and verification status, but does **not** claim to have modified files yet
+- `jackcode --execute "..."` stays safe by default: it shows the inferred plan and pending diffs, and clearly reports that **no files were changed** without approval
+- `jackcode --execute --approve "..."` performs a real patch apply using the built-in patch engine
+- `jackcode --execute --approve --verify-cmd "<command>" "..."` runs post-apply verification; if verification fails, JackCode rolls the applied changes back and reports the final state truthfully
 - Interactive `chat` uses the same workflow summary path for normal prompts
 
 ## Architecture

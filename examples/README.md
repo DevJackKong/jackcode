@@ -41,8 +41,16 @@ node dist/cli/index.js --model qwen-3.6 "Review examples/simple-refactor/src/cal
 
 ### 3. Run execute mode
 
+Dry-run first:
+
 ```bash
 node dist/cli/index.js --model qwen-3.6 --execute "Fix the bug in examples/fix-bug/src/buggy.ts and explain the change."
+```
+
+Then apply for real only when you approve it:
+
+```bash
+node dist/cli/index.js --model qwen-3.6 --execute --approve "Fix the bug in examples/fix-bug/src/buggy.ts and explain the change."
 ```
 
 ### 4. Try interactive mode
@@ -61,7 +69,7 @@ Then inside the REPL:
 
 ## Expected output
 
-In the current demo build, the CLI returns scaffolded responses that confirm the selected model and requested task. Typical output looks like this:
+The current CLI now distinguishes between planning, dry-run execute, approved execute, applied, and rolled-back states. Typical output looks like this:
 
 ```text
 JackCode | Model: qwen-3.6
@@ -71,13 +79,22 @@ USER: Review examples/simple-refactor/src/calculator.ts and refactor it to use p
 ASSISTANT: One-shot mode received: Review examples/simple-refactor/src/calculator.ts and refactor it to use proper error handling.
 ```
 
-Execute mode produces a staged task summary:
+Execute mode without approval produces a truthful dry-run summary:
 
 ```text
-JackCode Execute | Model: qwen-3.6
---------------------------------------------------
-USER: Fix the bug in examples/fix-bug/src/buggy.ts and explain the change.
-ASSISTANT: Execute mode staged task: Fix the bug in examples/fix-bug/src/buggy.ts and explain the change.
+Workflow: dry-run
+...
+Result: approval missing. No files were changed.
+```
+
+Approved execute mode applies a real patch:
+
+```text
+Workflow: applied
+...
+Applied changes:
+  - examples/fix-bug/src/buggy.ts
+Result: applied 1 patch(es) across 1 file(s).
 ```
 
 ## Tips

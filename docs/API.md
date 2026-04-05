@@ -44,6 +44,8 @@ Parses command-line arguments into a normalized structure.
 - `--save`
 - `--export`
 - `--execute`, `-e`
+- `--approve`
+- `--verify-cmd`
 
 #### Returns
 
