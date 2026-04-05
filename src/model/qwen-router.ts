@@ -77,6 +77,10 @@ export interface PolicyAdapter {
     failureCount?: number;
     urgency?: 'low' | 'normal' | 'high' | 'critical';
     requiresReasoning?: boolean;
+    qwenConfidence?: number;
+    qwenHistoricalSuccessRate?: number;
+    architectureChange?: boolean;
+    escalationAttemptCount?: number;
   }): RoutingDecision;
   checkBudget?(cost: number): { allowed: boolean; reason: string };
 }
@@ -115,6 +119,9 @@ export interface QwenRouterConfig extends RouterConfig {
   fallbackModel: QwenModelId;
   latencySensitiveThresholdMs: number;
   outputTokenReserve: number;
+  confidenceThreshold: number;
+  escalationFileCountThreshold: number;
+  minHistoricalSuccessRate: number;
 }
 
 export interface ExtendedQwenRouteRequest extends QwenRouteRequest {
@@ -153,6 +160,9 @@ const DEFAULT_QWEN_ROUTER_CONFIG: QwenRouterConfig = {
   fallbackModel: 'qwen-3.6-fast',
   latencySensitiveThresholdMs: 2_500,
   outputTokenReserve: 2048,
+  confidenceThreshold: 0.7,
+  escalationFileCountThreshold: 5,
+  minHistoricalSuccessRate: 0.6,
 };
 
 const MODEL_PROFILES: Record<QwenModelId, ModelProfile> = {
@@ -267,7 +277,8 @@ export class QwenExecutorRouter {
   prepareRequest(request: ExtendedQwenRouteRequest): QwenPreparedRequest {
     const contextTokens = request.context.stats?.finalTokens ?? estimateTokens(request.context.content);
     const policyDecision = this.getPolicyDecision(request, contextTokens);
-    const model = this.selectModel(request, contextTokens, policyDecision);
+    const qwenCapability = this.assessQwenCapability(request, contextTokens, policyDecision);
+    const model = this.selectModel(request, contextTokens, policyDecision, qwenCapability);
     const profile = MODEL_PROFILES[model];
     const trimmedContext = this.optimizeContext(request, profile.contextWindow, request.maxOutputTokens);
     const systemPrompt = request.systemPrompt?.trim() || this.buildSystemPrompt(request, policyDecision);
@@ -290,6 +301,7 @@ export class QwenExecutorRouter {
         operationCount: request.operations.length,
         contextTokens,
         policyDecision: policyDecision?.selectedModel,
+        qwenCapability,
       },
     };
   }
@@ -355,18 +367,24 @@ export class QwenExecutorRouter {
       failureCount: Number(request.metadata?.failureCount ?? 0),
       urgency: request.priority === 'critical' ? 'critical' : request.priority,
       requiresReasoning: false,
+      qwenConfidence: this.estimateQwenConfidence(request, contextTokens),
+      qwenHistoricalSuccessRate: undefined,
+      architectureChange: this.isArchitectureChange(request),
+      escalationAttemptCount: Number(request.metadata?.escalationAttemptCount ?? 0),
     });
     if (decision) this.policyDecisionCache.set(key, decision);
     return decision;
   }
 
-  private selectModel(request: ExtendedQwenRouteRequest, contextTokens: number, policyDecision?: RoutingDecision): QwenModelId {
-    if (policyDecision?.selectedModel && policyDecision.selectedModel !== 'qwen') {
-      if (policyDecision.fallbackOnFailure === false) return 'qwen-3.6-fast';
-      return contextTokens > MODEL_PROFILES['qwen-coder'].contextWindow ? 'qwen-3.6' : 'qwen-coder';
+  private selectModel(request: ExtendedQwenRouteRequest, contextTokens: number, policyDecision: RoutingDecision | undefined, qwenCapability: ReturnType<QwenExecutorRouter['assessQwenCapability']>): QwenModelId {
+    if (policyDecision?.selectedModel === 'deepseek') {
+      return qwenCapability.contextFits ? 'qwen-3.6' : this.config.fallbackModel;
     }
     if (policyDecision?.selectedModel === 'qwen' && policyDecision.budgetStatus?.allowed === false) {
       return 'qwen-3.6-fast';
+    }
+    if (!qwenCapability.canHandle && qwenCapability.contextFits) {
+      return 'qwen-3.6';
     }
     if (this.requiresCoderModel(request)) {
       return contextTokens > MODEL_PROFILES['qwen-coder'].contextWindow ? 'qwen-3.6' : 'qwen-coder';
@@ -379,6 +397,62 @@ export class QwenExecutorRouter {
     if (contextTokens > MODEL_PROFILES['qwen-3.6-fast'].contextWindow) return 'qwen-3.6';
     const cheapCandidate: QwenModelId = request.priority === 'normal' ? 'qwen-3.6-fast' : this.config.defaultModel;
     return this.isCostAllowed(cheapCandidate, contextTokens, request.maxOutputTokens) ? cheapCandidate : this.config.defaultModel;
+  }
+
+
+  private assessQwenCapability(
+    request: ExtendedQwenRouteRequest,
+    contextTokens: number,
+    policyDecision?: RoutingDecision
+  ): {
+    canHandle: boolean;
+    confidence: number;
+    contextFits: boolean;
+    historicalSuccessRate: number | null;
+    shouldEscalate: boolean;
+    reasons: string[];
+  } {
+    const confidence = this.estimateQwenConfidence(request, contextTokens);
+    const contextFits = contextTokens <= this.config.maxContextTokens;
+    const historicalSuccessRate = policyDecision?.qwenAssessment?.historicalSuccessRate ?? null;
+    const fileCount = request.operations.map((operation) => operation.targetFile).filter(Boolean).length;
+    const repeatedFailures = Number(request.metadata?.failureCount ?? 0) >= this.config.retryLimit;
+    const architectureChange = this.isArchitectureChange(request);
+    const reasons: string[] = [];
+
+    if (confidence < this.config.confidenceThreshold) reasons.push('confidence_below_threshold');
+    if (!contextFits) reasons.push('context_window_exceeded');
+    if (fileCount > this.config.escalationFileCountThreshold) reasons.push('multi_file_change');
+    if (repeatedFailures) reasons.push('repeated_failures');
+    if (architectureChange) reasons.push('architecture_change');
+    if (historicalSuccessRate !== null && historicalSuccessRate < this.config.minHistoricalSuccessRate) {
+      reasons.push('historical_success_below_threshold');
+    }
+
+    return {
+      canHandle: contextFits,
+      confidence,
+      contextFits,
+      historicalSuccessRate,
+      shouldEscalate: reasons.length > 0,
+      reasons,
+    };
+  }
+
+  private estimateQwenConfidence(request: ExtendedQwenRouteRequest, contextTokens: number): number {
+    let confidence = 0.9;
+    const fileCount = request.operations.map((operation) => operation.targetFile).filter(Boolean).length;
+    if (contextTokens > MODEL_PROFILES['qwen-coder'].contextWindow) confidence -= 0.08;
+    if (fileCount > this.config.escalationFileCountThreshold) confidence -= 0.15;
+    if (Number(request.metadata?.failureCount ?? 0) >= this.config.retryLimit) confidence -= 0.18;
+    if (this.isArchitectureChange(request)) confidence -= 0.2;
+    if (request.operations.some((operation) => operation.type === 'refactor')) confidence -= 0.05;
+    return Math.max(0, Math.min(1, confidence));
+  }
+
+  private isArchitectureChange(request: ExtendedQwenRouteRequest): boolean {
+    const corpus = [request.userPrompt, request.systemPrompt, ...request.operations.map((operation) => operation.description)].join(' ').toLowerCase();
+    return /architecture|design|migration|boundary|dependency graph|service contract/.test(corpus);
   }
 
   private requiresCoderModel(request: ExtendedQwenRouteRequest): boolean {

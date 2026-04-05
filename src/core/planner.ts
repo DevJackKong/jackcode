@@ -1,5 +1,5 @@
 /**
- * Pre-execution planning with DeepSeek-backed strategy selection.
+ * Pre-execution planning with Qwen-first strategy selection and optional DeepSeek review.
  */
 
 import type { TaskContext as RuntimeTaskContext, ExecutionPlan, PlanStep } from './runtime.js';
@@ -26,8 +26,8 @@ export class WorkflowPlanner {
     const riskLevel = this.assessRisk(task, affectedFiles, reasoningRequired);
     const contextBudgetTokens = compressedContext?.stats.finalTokens ?? estimateTokens(task.intent);
 
-    const deepseekHints = this.deepseek ? await this.safeAnalyze(task, compressedContext) : null;
-    const selectedModel: ModelTier = reasoningRequired || riskLevel === 'critical' ? 'deepseek' : 'qwen';
+    const deepseekHints = this.deepseek && (reasoningRequired || riskLevel === 'critical') ? await this.safeAnalyze(task, compressedContext) : null;
+    const selectedModel: ModelTier = 'qwen';
     const steps = this.buildSteps(task, affectedFiles, deepseekHints?.planHints ?? []);
 
     return {
@@ -35,7 +35,7 @@ export class WorkflowPlanner {
       intent: task.intent,
       strategy: reasoningRequired ? 'plan_then_execute' : 'direct_execute',
       selectedModel,
-      escalationTarget: riskLevel === 'critical' ? 'gpt54' : undefined,
+      escalationTarget: reasoningRequired || riskLevel === 'critical' ? 'deepseek' : undefined,
       contextBudgetTokens,
       reasoningRequired,
       multiFile,
@@ -58,6 +58,7 @@ export class WorkflowPlanner {
       metadata: {
         deepseekEscalated: deepseekHints?.escalated ?? false,
         dossierSummary: deepseekHints?.summary,
+        plannerMode: 'qwen-first',
       },
     };
   }

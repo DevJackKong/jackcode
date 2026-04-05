@@ -470,22 +470,34 @@ export class ModelPolicyEngine {
 
   private registerDefaultRules(): void {
     this.addRule({
-      name: 'critical_path_prefer_cheap',
+      name: 'qwen_primary_default',
+      priority: 110,
+      condition: () => true,
+      action: () => ({ modelPreference: ['qwen', 'deepseek', 'gpt54'] }),
+    });
+    this.addRule({
+      name: 'verification_requires_gpt54',
+      priority: 105,
+      condition: (task) => task.taskType === 'final_verification',
+      action: () => ({ modelPreference: ['gpt54'], forceModel: true }),
+    });
+    this.addRule({
+      name: 'qwen_build_and_test_first',
       priority: 100,
       condition: (task) => task.taskType === 'build_fix' || task.taskType === 'test_fix',
       action: () => ({ modelPreference: ['qwen', 'deepseek', 'gpt54'] }),
     });
     this.addRule({
-      name: 'verification_requires_gpt54',
+      name: 'architecture_change_escalates_to_deepseek_guidance',
       priority: 95,
-      condition: (task) => task.taskType === 'final_verification',
-      action: () => ({ modelPreference: ['gpt54'], forceModel: true }),
+      condition: (task) => this.isArchitectureTask(task),
+      action: () => ({ modelPreference: ['deepseek', 'qwen'], forceModel: true }),
     });
     this.addRule({
-      name: 'complex_tasks_require_reasoning',
-      priority: 90,
-      condition: (task) => task.complexity === 'high' || task.requiresReasoning === true,
-      action: () => ({ modelPreference: ['deepseek', 'gpt54'] }),
+      name: 'deepseek_escalation_from_qwen',
+      priority: 92,
+      condition: (task) => this.shouldEscalateFromQwen(task),
+      action: () => ({ modelPreference: ['deepseek', 'qwen'] }),
     });
     this.addRule({
       name: 'batch_prefer_qwen',
@@ -494,22 +506,10 @@ export class ModelPolicyEngine {
       action: () => ({ modelPreference: ['qwen', 'deepseek'], optimizations: ['batching'] }),
     });
     this.addRule({
-      name: 'failure_escalation',
-      priority: 85,
-      condition: (task) => (task.failureCount ?? 0) >= 2,
-      action: () => ({ modelPreference: ['deepseek', 'gpt54'] }),
-    });
-    this.addRule({
-      name: 'urgent_tasks_prefer_accuracy',
+      name: 'urgent_tasks_keep_qwen_then_verify',
       priority: 70,
-      condition: (task) => task.urgency === 'critical',
-      action: () => ({ modelPreference: ['gpt54', 'deepseek'] }),
-    });
-    this.addRule({
-      name: 'architecture_change_prefers_reasoning',
-      priority: 88,
-      condition: (task) => /architecture|design|migration|dependency/i.test(task.intent ?? '') || task.taskType === 'refactor',
-      action: () => ({ modelPreference: ['deepseek', 'gpt54'] }),
+      condition: (task) => task.urgency === 'critical' && task.taskType !== 'final_verification',
+      action: () => ({ modelPreference: ['qwen', 'deepseek', 'gpt54'] }),
     });
   }
 
@@ -542,13 +542,52 @@ export class ModelPolicyEngine {
     }
 
     if (task.requiresReasoning) score += 2;
-    if ((task.failureCount ?? 0) >= 2) score += 1;
+    if ((task.failureCount ?? 0) >= this.config.policy.escalationRules.retryThreshold) score += 1;
     if (task.urgency === 'critical') score += 1;
+    if (this.isArchitectureTask(task)) score += 2;
     if ((task.estimatedTokens ?? 0) > MODEL_CAPABILITIES.deepseek.maxContextTokens * 0.8) score += 1;
 
     if (score <= 4) return 'low';
     if (score <= 8) return 'medium';
     return 'high';
+  }
+
+
+  private shouldEscalateFromQwen(task: TaskContext): boolean {
+    const fileCount = task.files?.length ?? 0;
+    const confidence = task.qwenConfidence ?? 1;
+    const historicalSuccess = task.qwenHistoricalSuccessRate ?? this.getModelSuccessRate(task.taskType, 'qwen') ?? 1;
+    const retryThreshold = this.config.policy.escalationRules.retryThreshold;
+    const fileThreshold = this.config.policy.escalationRules.fileCountThreshold;
+    const maxEscalations = this.config.policy.escalationRules.maxEscalationAttempts;
+    const escalationAttempts = task.escalationAttemptCount ?? 0;
+
+    if (task.taskType === 'final_verification') return false;
+    if (escalationAttempts >= maxEscalations) return false;
+    if (this.isArchitectureTask(task)) return true;
+    if (confidence < this.config.policy.escalationRules.qwenConfidenceThreshold) return true;
+    if (fileCount > fileThreshold) return true;
+    if ((task.failureCount ?? 0) >= retryThreshold) return true;
+    if (historicalSuccess < 0.6) return true;
+    return false;
+  }
+
+  private isArchitectureTask(task: TaskContext): boolean {
+    if (task.architectureChange) return true;
+    const haystack = `${task.intent ?? ''} ${task.taskType}`.toLowerCase();
+    return this.config.policy.escalationRules.architectureKeywords.some((keyword) => haystack.includes(keyword.toLowerCase()));
+  }
+
+  private buildQwenAssessment(task: TaskContext): RoutingDecision['qwenAssessment'] {
+    const contextFits = (task.estimatedTokens ?? 0) <= MODEL_CAPABILITIES.qwen.maxContextTokens;
+    const historicalSuccessRate = task.qwenHistoricalSuccessRate ?? this.getModelSuccessRate(task.taskType, 'qwen');
+    const canHandleComplexity = !this.isArchitectureTask(task) && (task.files?.length ?? 0) <= Math.max(this.config.policy.escalationRules.fileCountThreshold + 1, 6);
+    return {
+      confidence: task.qwenConfidence ?? 0.85,
+      canHandleComplexity,
+      contextFits,
+      historicalSuccessRate: historicalSuccessRate ?? null,
+    };
   }
 
   private pickModelTier(task: TaskContext, complexity: ComplexityScore, rules: RuleResult[]): ModelTier {
@@ -573,10 +612,23 @@ export class ModelPolicyEngine {
 
     let candidate: ModelTier;
     switch (complexity) {
-      case 'low': candidate = 'qwen'; break;
-      case 'medium': candidate = underBudgetPressure ? 'qwen' : 'deepseek'; break;
-      case 'high': candidate = task.requiresReasoning === false ? 'deepseek' : (underBudgetPressure ? 'deepseek' : 'gpt54'); break;
-      default: candidate = this.config.policy.defaultModel;
+      case 'low':
+        candidate = 'qwen';
+        break;
+      case 'medium':
+        candidate = this.shouldEscalateFromQwen(task) ? this.config.policy.escalationModel : 'qwen';
+        break;
+      case 'high':
+        if (task.taskType === 'final_verification') {
+          candidate = this.config.policy.verificationModel;
+        } else if (this.shouldEscalateFromQwen(task)) {
+          candidate = this.config.policy.escalationModel;
+        } else {
+          candidate = underBudgetPressure ? 'qwen' : this.config.policy.defaultModel;
+        }
+        break;
+      default:
+        candidate = this.config.policy.defaultModel;
     }
     return this.applyPerformanceBias(task, candidate, ['qwen', 'deepseek', 'gpt54']);
   }
@@ -604,7 +656,7 @@ export class ModelPolicyEngine {
   private estimateTokenUsage(task: TaskContext, model: ModelTier): number {
     const baseTokens = Math.max(1, task.estimatedTokens ?? 2000);
     switch (model) {
-      case 'qwen': return Math.ceil(baseTokens);
+      case 'qwen': return Math.ceil(baseTokens * 0.95);
       case 'deepseek': return Math.ceil(baseTokens * 1.1);
       case 'gpt54': return Math.ceil(baseTokens * 1.05);
       default: return baseTokens;
@@ -689,6 +741,11 @@ export class ModelPolicyEngine {
       cacheHit: false,
       batched: optimizations.includes('batching'),
       earlyTerminationSuggested: optimizations.includes('early_termination'),
+      escalationModel: this.config.policy.escalationModel,
+      verificationModel: this.config.policy.verificationModel,
+      escalationAttemptsRemaining: Math.max(0, this.config.policy.escalationRules.maxEscalationAttempts - (task.escalationAttemptCount ?? 0)),
+      retryWithGuidance: model === 'deepseek' && task.taskType !== 'final_verification',
+      qwenAssessment: this.buildQwenAssessment(task),
     };
   }
 

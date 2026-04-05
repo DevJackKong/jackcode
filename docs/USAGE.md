@@ -224,27 +224,58 @@ These defaults are currently hard-coded in `src/cli/index.ts`:
 }
 ```
 
+### Model routing defaults
+
+Operationally, JackCode now follows this routing order:
+
+1. **Qwen 3.6** for default coding and planning work
+2. **DeepSeek Reasoner** only when Qwen confidence is low, the task spans many files, retries are exhausted, or the change is architectural
+3. **GPT-5.4** for final verification and audit workflows
+
+This routing strategy is intended to cut cost while preserving quality on edge cases and review-critical tasks.
+
+
 ### `.jackcode.json` format
 
-The repository defines the config shape, but does **not** currently auto-load a `.jackcode.json` file in the CLI entrypoint. If you want a project-local config file, this is the sensible format to use in your own wrapper or future integration:
+JackCode now uses `.jackcode.json` as the canonical project-local model-routing config surface for Qwen-first orchestration. A typical file looks like this:
 
 ```json
 {
   "defaultModel": "qwen-3.6",
+  "escalationModel": "deepseek-reasoner",
+  "verificationModel": "gpt-5.4",
   "theme": "auto",
   "streaming": true,
   "showTokenCount": true,
-  "historyFile": ".jackcode/history"
+  "historyFile": ".jackcode/history",
+  "routing": {
+    "qwen": {
+      "confidenceThreshold": 0.7,
+      "maxPrimaryRetries": 2,
+      "maxContextTokens": 128000,
+      "minHistoricalSuccessRate": 0.6
+    },
+    "escalation": {
+      "maxAttempts": 1,
+      "fileCountThreshold": 5
+    },
+    "verification": {
+      "enabled": true,
+      "sampleRate": 0.01
+    }
+  }
 }
 ```
 
 Recommended field meanings:
 
-- `defaultModel`: model tier used for replies and metadata
-- `theme`: terminal color mode
-- `streaming`: whether responses should stream progressively
-- `showTokenCount`: whether UI should expose token metrics
-- `historyFile`: readline history path
+- `defaultModel`: main coding model, now `qwen-3.6`
+- `escalationModel`: reasoning-only escalation target, usually `deepseek-reasoner`
+- `verificationModel`: audit/review model, usually `gpt-5.4`
+- `routing.qwen.confidenceThreshold`: escalate when Qwen confidence falls below this threshold
+- `routing.escalation.fileCountThreshold`: escalate planning for broader multi-file work
+- `routing.verification.sampleRate`: control how often expensive audit paths run by default
+- `theme`, `streaming`, `showTokenCount`, `historyFile`: CLI UX settings
 
 ### Overriding config from the CLI
 
@@ -554,8 +585,8 @@ console.log(result.success);
 A few things are worth knowing when using the current codebase:
 
 - The help text prints `jackcode ...`, but `package.json` does not yet define a `bin` field.
-- `.jackcode.json` is not auto-read by the CLI yet; the config shape exists, but loading it would need to be added.
-- Current one-shot and execute flows are scaffolding-oriented and return staged responses rather than a full model-backed coding loop.
-- Session persistence and REPL behavior are more complete than model execution plumbing at this stage.
+- The architecture is now Qwen-first: Qwen handles implementation, DeepSeek provides escalation guidance, and GPT-5.4 is reserved for verification.
+- One-shot and execute flows still contain scaffolding in parts of the CLI, even though the model-routing layer now reflects the new architecture.
+- Session persistence and REPL behavior are still more complete than end-to-end live model execution plumbing.
 
 If you want the exact callable API surface, see [API.md](./API.md).

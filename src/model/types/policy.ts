@@ -29,6 +29,8 @@ export type PolicyDecisionMode = 'normal' | 'forced' | 'overridden' | 'downgrade
 /** Core model policy configuration */
 export interface ModelPolicy {
   defaultModel: ModelTier;
+  escalationModel: Extract<ModelTier, 'deepseek'>;
+  verificationModel: Extract<ModelTier, 'gpt54'>;
   complexityThresholds: {
     low: number;
     medium: number;
@@ -42,6 +44,13 @@ export interface ModelPolicy {
     perMonth: number;
   };
   escalationChain: ModelTier[];
+  escalationRules: {
+    qwenConfidenceThreshold: number;
+    fileCountThreshold: number;
+    retryThreshold: number;
+    maxEscalationAttempts: number;
+    architectureKeywords: string[];
+  };
 }
 
 export interface PolicyConfig {
@@ -65,6 +74,8 @@ export interface PolicyConfig {
 export const DEFAULT_POLICY_CONFIG: PolicyConfig = {
   policy: {
     defaultModel: 'qwen',
+    escalationModel: 'deepseek',
+    verificationModel: 'gpt54',
     complexityThresholds: {
       low: 1000,
       medium: 10000,
@@ -78,6 +89,13 @@ export const DEFAULT_POLICY_CONFIG: PolicyConfig = {
       perMonth: 350.0,
     },
     escalationChain: ['qwen', 'deepseek', 'gpt54'],
+    escalationRules: {
+      qwenConfidenceThreshold: 0.7,
+      fileCountThreshold: 5,
+      retryThreshold: 2,
+      maxEscalationAttempts: 1,
+      architectureKeywords: ['architecture', 'design', 'migration', 'boundary', 'dependency'],
+    },
   },
   cacheTtlMs: 300000,
   enableAutoDowngrade: true,
@@ -118,6 +136,10 @@ export interface TaskContext {
   preferCached?: boolean;
   overrideModel?: ModelTier;
   metadata?: Record<string, unknown>;
+  qwenConfidence?: number;
+  qwenHistoricalSuccessRate?: number;
+  architectureChange?: boolean;
+  escalationAttemptCount?: number;
 }
 
 export interface RoutingDecision {
@@ -136,6 +158,16 @@ export interface RoutingDecision {
   cacheHit?: boolean;
   batched?: boolean;
   earlyTerminationSuggested?: boolean;
+  escalationModel?: Extract<ModelTier, 'deepseek'>;
+  verificationModel?: Extract<ModelTier, 'gpt54'>;
+  escalationAttemptsRemaining?: number;
+  retryWithGuidance?: boolean;
+  qwenAssessment?: {
+    confidence: number;
+    canHandleComplexity: boolean;
+    contextFits: boolean;
+    historicalSuccessRate: number | null;
+  };
 }
 
 export interface CostTracker {
@@ -322,12 +354,12 @@ export const MODEL_CAPABILITIES: Record<ModelTier, ModelCapabilities> = {
   qwen: {
     tier: 'qwen',
     maxContextTokens: 128000,
-    supportsReasoning: false,
+    supportsReasoning: true,
     supportsBatching: true,
     averageLatencyMs: 2000,
-    accuracyScore: 0.85,
-    preferredComplexity: ['low', 'medium'],
-    idealTaskTypes: ['simple_edit', 'build_fix', 'test_fix', 'batch_operation'],
+    accuracyScore: 0.9,
+    preferredComplexity: ['low', 'medium', 'high'],
+    idealTaskTypes: ['simple_edit', 'build_fix', 'test_fix', 'batch_operation', 'multi_file_change', 'refactor'],
   },
   deepseek: {
     tier: 'deepseek',
@@ -335,7 +367,7 @@ export const MODEL_CAPABILITIES: Record<ModelTier, ModelCapabilities> = {
     supportsReasoning: true,
     supportsBatching: true,
     averageLatencyMs: 5000,
-    accuracyScore: 0.90,
+    accuracyScore: 0.9,
     preferredComplexity: ['medium', 'high'],
     idealTaskTypes: ['debug', 'refactor', 'multi_file_change', 'batch_operation'],
   },

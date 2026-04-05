@@ -1,6 +1,6 @@
 /**
  * Thread 17: Executor with Developer Workflow UX
- * Workflow presentation, summary output, and approval boundaries
+ * Qwen-first execution workflow, summary output, and approval boundaries
  */
 
 import path from 'node:path';

@@ -1,0 +1,27 @@
+{
+  "defaultModel": "qwen-3.6",
+  "escalationModel": "deepseek-reasoner",
+  "verificationModel": "gpt-5.4",
+  "theme": "auto",
+  "streaming": true,
+  "showTokenCount": true,
+  "historyFile": ".jackcode/history",
+  "routing": {
+    "qwen": {
+      "confidenceThreshold": 0.7,
+      "maxPrimaryRetries": 2,
+      "maxContextTokens": 128000,
+      "minHistoricalSuccessRate": 0.6
+    },
+    "escalation": {
+      "maxAttempts": 1,
+      "fileCountThreshold": 5,
+      "architectureKeywords": ["architecture", "design", "migration", "boundary", "dependency graph"]
+    },
+    "verification": {
+      "enabled": true,
+      "sampleRate": 0.01,
+      "alwaysVerifyTaskTypes": ["final_verification", "security_review", "breaking_change_review"]
+    }
+  }
+}
