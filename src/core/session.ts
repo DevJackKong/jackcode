@@ -8,8 +8,11 @@ import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
-import { ContextCompressor, estimateTokens } from '../repo/context-compressor.js';
-import type { ContextFragment } from '../types/context.js';
+import { ContextCompressor, estimateTokens } from '../repo/context-compressor.ts';
+import type { ContextFragment } from '../types/context.ts';
+import type { Patch } from '../types/patch.ts';
+import type { FileIndex } from '../types/scanner.ts';
+import type { RunResult } from '../types/test-runner.ts';
 import type {
   Checkpoint,
   CheckpointCreateOptions,
@@ -19,21 +22,34 @@ import type {
   MemorySyncDetails,
   ModelUsage,
   ModelUsageTotals,
+  RuntimeQueueSnapshot,
+  RuntimeTaskSnapshot,
   Session,
+  SessionContextSelection,
   SessionCreateOptions,
   SessionEvents,
+  SessionPatchRecord,
   SessionPersistenceConfig,
   SessionRecoveryResult,
+  SessionRepoSnapshotRecord,
   SessionSnapshot,
   SessionState,
+  SessionTestResultRecord,
   SessionContextWindow,
   TaskContext,
   TaskCreateOptions,
   TaskStatus,
-} from '../types/session.js';
-import type { JackClawMemoryAdapter, MemoryEntryType, SyncResult } from '../types/memory-adapter.js';
+} from '../types/session.ts';
+import type { JackClawMemoryAdapter, MemoryEntryType, SyncResult } from '../types/memory-adapter.ts';
 
 type EventHandler<T> = (payload: T) => void;
+
+type RuntimeLike = {
+  on?: (event: string, handler: (payload: unknown) => void) => void;
+  off?: (event: string, handler: (payload: unknown) => void) => void;
+  getQueue?: () => Array<Record<string, unknown>>;
+  getActiveTask?: () => Record<string, unknown> | undefined;
+};
 
 const DEFAULT_CONTEXT_WINDOW: SessionContextWindow = {
   maxTokens: 128000,
@@ -112,11 +128,48 @@ interface SerializedCheckpoint {
   tag: string | null;
   timestamp: string;
   fileHashes: Array<[string, string]>;
-  cursorPositions: Array<[string, { line: number; column: number }]>;
+  cursorPositions: Array<[string, { line: number; column: number }]>
   taskContextId: string;
   notes: string;
   auto: boolean;
   snapshot: SerializedSessionSnapshot;
+}
+
+interface SerializedRuntimeTaskSnapshot {
+  id: string;
+  state: string;
+  status: string;
+  intent: string;
+  priority?: string;
+  updatedAt?: number;
+}
+
+interface SerializedRuntimeQueueSnapshot {
+  activeTaskId: string | null;
+  queue: SerializedRuntimeTaskSnapshot[];
+  activeTask: SerializedRuntimeTaskSnapshot | null;
+  lastSyncedAt: string | null;
+}
+
+interface SerializedSessionPatchRecord {
+  id: string;
+  file: string;
+  patch: Patch;
+  taskId: string | null;
+  version: number;
+  timestamp: string;
+}
+
+interface SerializedSessionTestResultRecord {
+  id: string;
+  taskId: string | null;
+  timestamp: string;
+  result: RunResult;
+}
+
+interface SerializedSessionRepoSnapshotRecord {
+  snapshot: SerializedFileIndex;
+  updatedAt: string;
 }
 
 interface SerializedSessionSnapshot {
@@ -128,6 +181,16 @@ interface SerializedSessionSnapshot {
   modelUsage: SerializedModelUsage[];
   contextWindow: SerializedSessionContextWindow;
   metadata: Record<string, unknown>;
+}
+
+interface SerializedFileIndex {
+  rootDir: string;
+  files: Array<[string, unknown]>;
+  directories: Array<[string, unknown]>;
+  languages: Array<[string, unknown]>;
+  generatedAt: number;
+  gitInfo?: unknown;
+  [key: string]: unknown;
 }
 
 interface SerializedSession {
@@ -149,6 +212,11 @@ interface SerializedSession {
   contextFragments: SerializedContextFragment[];
   contextWindow: SerializedSessionContextWindow;
   lastMemorySyncAt: string | null;
+  runtimeQueue: SerializedRuntimeQueueSnapshot;
+  patchHistory: SerializedSessionPatchRecord[];
+  fileVersions: Record<string, number>;
+  testResults: SerializedSessionTestResultRecord[];
+  repoSnapshot: SerializedSessionRepoSnapshotRecord | null;
   recoveryState: {
     recoveredFromCheckpointId: string | null;
     recoveredAt: string | null;
@@ -198,9 +266,7 @@ export class SessionManager {
 
   createSession(options: SessionCreateOptions): Session {
     const rootGoal = options.rootGoal.trim();
-    if (!rootGoal) {
-      throw new Error('rootGoal is required');
-    }
+    if (!rootGoal) throw new Error('rootGoal is required');
 
     const now = new Date();
     const rootTaskId = randomUUID();
@@ -230,8 +296,6 @@ export class SessionManager {
       children: [],
     };
 
-    const contextWindow = this.buildContextWindow(options.contextWindow);
-
     const session: Session = {
       id: randomUUID(),
       state: 'created',
@@ -249,14 +313,25 @@ export class SessionManager {
       parentSessionId: options.parentSessionId ?? null,
       metadata: { ...(options.metadata ?? {}) },
       contextFragments: [],
-      contextWindow,
+      contextWindow: this.buildContextWindow(options.contextWindow),
       lastMemorySyncAt: null,
+      runtimeQueue: {
+        activeTaskId: null,
+        queue: [],
+        activeTask: null,
+        lastSyncedAt: null,
+      },
+      patchHistory: [],
+      fileVersions: {},
+      testResults: [],
+      repoSnapshot: null,
       recoveryState: {
         recoveredFromCheckpointId: null,
         recoveredAt: null,
       },
     };
 
+    this.bindSessionMethods(session);
     this.sessions.set(session.id, session);
     this.events.emit('session-created', { session: this.cloneSession(session) });
     this.setState(session, 'active');
@@ -274,11 +349,146 @@ export class SessionManager {
     return Array.from(this.sessions.values()).map((session) => this.cloneSession(session));
   }
 
+  attachToRuntime(sessionId: string, runtime: unknown): boolean {
+    const session = this.sessions.get(sessionId);
+    if (!session) return false;
+    const runtimeLike = runtime as RuntimeLike;
+
+    const sync = () => {
+      const queue = (runtimeLike.getQueue?.() ?? []).map((task) => this.toRuntimeTaskSnapshot(task));
+      const activeTaskRaw = runtimeLike.getActiveTask?.();
+      const activeTask = activeTaskRaw ? this.toRuntimeTaskSnapshot(activeTaskRaw) : null;
+      session.runtimeQueue = {
+        activeTaskId: activeTask?.id ?? null,
+        queue,
+        activeTask,
+        lastSyncedAt: new Date(),
+      };
+      this.touchSession(session, 'runtime-synced');
+      this.events.emit('runtime-updated', { sessionId, runtimeQueue: this.cloneRuntimeQueue(session.runtimeQueue) });
+    };
+
+    for (const event of ['task-created', 'task-enqueued', 'task-started', 'state-changed', 'task-completed', 'task-failed', 'task-cancelled', 'queue-drained', 'task-restored']) {
+      runtimeLike.on?.(event, sync);
+    }
+
+    sync();
+    this.events.emit('runtime-attached', { sessionId });
+    return true;
+  }
+
+  addPatch(sessionId: string, file: string, patch: Patch): SessionPatchRecord | null {
+    const session = this.sessions.get(sessionId);
+    const normalizedFile = file.trim();
+    if (!session || !normalizedFile) return null;
+
+    const version = (session.fileVersions[normalizedFile] ?? 0) + 1;
+    session.fileVersions[normalizedFile] = version;
+    const record: SessionPatchRecord = {
+      id: randomUUID(),
+      file: normalizedFile,
+      patch: structuredClone(patch),
+      taskId: session.currentTask?.id ?? null,
+      version,
+      timestamp: new Date(),
+    };
+    session.patchHistory.push(record);
+
+    if (session.repoSnapshot) {
+      const cloned = this.cloneFileIndex(session.repoSnapshot.snapshot);
+      cloned.generatedAt = Date.now();
+      const existing = cloned.files.get(normalizedFile) as Record<string, unknown> | undefined;
+      if (existing) {
+        cloned.files.set(normalizedFile, {
+          ...existing,
+          modifiedAt: Date.now(),
+        });
+      }
+      session.repoSnapshot = { snapshot: cloned, updatedAt: new Date() };
+    }
+
+    this.touchSession(session, 'patch-added');
+    this.events.emit('patch-added', { sessionId, patch: this.clonePatchRecord(record) });
+    return this.clonePatchRecord(record);
+  }
+
+  addTestResult(sessionId: string, result: RunResult): SessionTestResultRecord | null {
+    const session = this.sessions.get(sessionId);
+    if (!session) return null;
+
+    const record: SessionTestResultRecord = {
+      id: randomUUID(),
+      taskId: session.currentTask?.id ?? null,
+      timestamp: new Date(),
+      result: structuredClone(result),
+    };
+    session.testResults.push(record);
+
+    const task = session.currentTask;
+    if (task) {
+      const history = Array.isArray(task.metadata.testHistory) ? task.metadata.testHistory as unknown[] : [];
+      task.metadata.testHistory = [...history, structuredClone(result)];
+      task.updatedAt = new Date();
+      this.events.emit('task-update', { sessionId, task: this.cloneTask(task) });
+    }
+
+    this.touchSession(session, 'test-result-added');
+    this.events.emit('test-result-added', { sessionId, result: this.cloneTestResult(record) });
+    return this.cloneTestResult(record);
+  }
+
+  setRepoSnapshot(sessionId: string, snapshot: FileIndex): boolean {
+    const session = this.sessions.get(sessionId);
+    if (!session) return false;
+    session.repoSnapshot = {
+      snapshot: this.cloneFileIndex(snapshot),
+      updatedAt: new Date(),
+    };
+    this.touchSession(session, 'repo-snapshot-updated');
+    this.events.emit('repo-snapshot-updated', { sessionId, snapshot: this.cloneRepoSnapshot(session.repoSnapshot) });
+    return true;
+  }
+
+  selectContext(sessionId: string, budget: number): SessionContextSelection | null {
+    const session = this.sessions.get(sessionId);
+    if (!session || budget <= 0) return null;
+
+    if (this.shouldCompressContext(sessionId) || session.contextWindow.currentTokens > budget) {
+      this.compressContext(sessionId, budget);
+    }
+
+    const sorted = [...session.contextFragments].sort((a, b) => {
+      const priorityDelta = (b.metadata.priority ?? 0) - (a.metadata.priority ?? 0);
+      if (priorityDelta !== 0) return priorityDelta;
+      return (b.timestamp ?? 0) - (a.timestamp ?? 0);
+    });
+
+    const selected: ContextFragment[] = [];
+    let totalTokens = 0;
+    for (const fragment of sorted) {
+      const tokenCount = fragment.tokenCount ?? estimateTokens(fragment.content);
+      if (selected.length > 0 && totalTokens + tokenCount > budget) continue;
+      if (selected.length === 0 && tokenCount > budget) {
+        selected.push(this.cloneFragment(fragment));
+        totalTokens += tokenCount;
+        break;
+      }
+      if (totalTokens + tokenCount <= budget) {
+        selected.push(this.cloneFragment(fragment));
+        totalTokens += tokenCount;
+      }
+    }
+
+    return {
+      fragments: selected,
+      totalTokens,
+      truncated: selected.length < session.contextFragments.length,
+    };
+  }
+
   closeSession(id: string): boolean {
     const session = this.sessions.get(id);
-    if (!session || session.state === 'closed') {
-      return false;
-    }
+    if (!session || session.state === 'closed') return false;
 
     const now = new Date();
     session.closedAt = now;
@@ -294,30 +504,21 @@ export class SessionManager {
 
   pauseSession(id: string): boolean {
     const session = this.sessions.get(id);
-    if (!session || session.state !== 'active') {
-      return false;
-    }
-
+    if (!session || session.state !== 'active') return false;
     this.setState(session, 'paused');
     return true;
   }
 
   resumeSession(id: string): boolean {
     const session = this.sessions.get(id);
-    if (!session || session.state !== 'paused') {
-      return false;
-    }
-
+    if (!session || session.state !== 'paused') return false;
     this.setState(session, 'active');
     return true;
   }
 
   setErrorState(id: string, error: Error): boolean {
     const session = this.sessions.get(id);
-    if (!session) {
-      return false;
-    }
-
+    if (!session) return false;
     this.events.emit('error', { sessionId: id, error });
     this.setState(session, 'error');
     return true;
@@ -326,9 +527,7 @@ export class SessionManager {
   pushTask(sessionId: string, goal: string, options: TaskCreateOptions = {}): TaskContext | null {
     const session = this.sessions.get(sessionId);
     const normalizedGoal = goal.trim();
-    if (!session || session.state !== 'active' || !normalizedGoal) {
-      return null;
-    }
+    if (!session || session.state !== 'active' || !normalizedGoal) return null;
 
     const now = new Date();
     const parentTaskId = session.currentTask?.id ?? null;
@@ -377,14 +576,10 @@ export class SessionManager {
 
   popTask(sessionId: string): TaskContext | null {
     const session = this.sessions.get(sessionId);
-    if (!session || session.state !== 'active' || session.taskStack.length <= 1) {
-      return null;
-    }
+    if (!session || session.state !== 'active' || session.taskStack.length <= 1) return null;
 
     const task = session.taskStack.pop();
-    if (!task) {
-      return null;
-    }
+    if (!task) return null;
 
     const now = new Date();
     task.status = 'completed';
@@ -394,7 +589,6 @@ export class SessionManager {
 
     session.currentTask = session.taskStack.at(-1) ?? null;
     this.touchSession(session, 'task-popped');
-
     this.events.emit('task-pop', { sessionId, task: this.cloneTask(task) });
     this.events.emit('task-complete', { sessionId, task: this.cloneTask(task) });
     return this.cloneTask(task);
@@ -406,15 +600,11 @@ export class SessionManager {
 
   failTask(sessionId: string, taskId: string, error?: string): boolean {
     const updated = this.updateTaskStatus(sessionId, taskId, 'failed');
-    if (!updated) {
-      return false;
-    }
+    if (!updated) return false;
 
     const session = this.sessions.get(sessionId);
     const task = session?.tasks.find((candidate) => candidate.id === taskId);
-    if (!session || !task) {
-      return false;
-    }
+    if (!session || !task) return false;
 
     this.events.emit('task-fail', { sessionId, task: this.cloneTask(task), error });
     if (error) {
@@ -426,14 +616,10 @@ export class SessionManager {
 
   updateTaskStatus(sessionId: string, taskId: string, status: TaskStatus): boolean {
     const session = this.sessions.get(sessionId);
-    if (!session) {
-      return false;
-    }
+    if (!session) return false;
 
     const task = session.tasks.find((candidate) => candidate.id === taskId);
-    if (!task) {
-      return false;
-    }
+    if (!task) return false;
 
     const now = new Date();
     task.status = status;
@@ -442,11 +628,7 @@ export class SessionManager {
     this.updateGoalNodeStatus(session, taskId, status, now);
     this.touchSession(session, 'task-status-updated');
     this.events.emit('task-update', { sessionId, task: this.cloneTask(task) });
-
-    if (status === 'completed') {
-      this.events.emit('task-complete', { sessionId, task: this.cloneTask(task) });
-    }
-
+    if (status === 'completed') this.events.emit('task-complete', { sessionId, task: this.cloneTask(task) });
     return true;
   }
 
@@ -462,14 +644,10 @@ export class SessionManager {
 
   addTaskNote(sessionId: string, taskId: string, note: string): boolean {
     const session = this.sessions.get(sessionId);
-    if (!session || !note.trim()) {
-      return false;
-    }
+    if (!session || !note.trim()) return false;
 
     const task = session.tasks.find((candidate) => candidate.id === taskId);
-    if (!task) {
-      return false;
-    }
+    if (!task) return false;
 
     task.notes.push(note.trim());
     task.updatedAt = new Date();
@@ -480,33 +658,31 @@ export class SessionManager {
 
   addContextFragment(sessionId: string, fragment: ContextFragment, taskId?: string): boolean {
     const session = this.sessions.get(sessionId);
-    if (!session) {
-      return false;
-    }
+    if (!session) return false;
 
     const normalizedFragment = this.normalizeFragment(fragment);
     session.contextFragments.push(normalizedFragment);
     session.contextWindow.currentTokens = this.calculateTokens(session.contextFragments);
 
-    const targetTask = taskId
-      ? session.tasks.find((candidate) => candidate.id === taskId)
-      : session.currentTask;
+    const targetTask = taskId ? session.tasks.find((candidate) => candidate.id === taskId) : session.currentTask;
     if (targetTask) {
       targetTask.contextFragments.push(normalizedFragment);
       targetTask.updatedAt = new Date();
       this.events.emit('task-update', { sessionId, task: this.cloneTask(targetTask) });
     }
 
-    this.touchSession(session, 'context-fragment-added');
+    if (this.shouldCompressContext(sessionId)) {
+      this.compressContext(sessionId);
+    } else {
+      this.touchSession(session, 'context-fragment-added');
+    }
     return true;
   }
 
   addContextFragments(sessionId: string, fragments: ContextFragment[], taskId?: string): number {
     let added = 0;
     for (const fragment of fragments) {
-      if (this.addContextFragment(sessionId, fragment, taskId)) {
-        added += 1;
-      }
+      if (this.addContextFragment(sessionId, fragment, taskId)) added += 1;
     }
     return added;
   }
@@ -523,26 +699,20 @@ export class SessionManager {
 
   shouldCompressContext(sessionId: string): boolean {
     const session = this.sessions.get(sessionId);
-    if (!session) {
-      return false;
-    }
-    const ratio = session.contextWindow.maxTokens > 0
-      ? session.contextWindow.currentTokens / session.contextWindow.maxTokens
-      : 0;
+    if (!session) return false;
+    const ratio = session.contextWindow.maxTokens > 0 ? session.contextWindow.currentTokens / session.contextWindow.maxTokens : 0;
     return ratio >= session.contextWindow.compressionThreshold;
   }
 
   compressContext(sessionId: string, targetBudget?: number): ContextCompressionResult | null {
     const session = this.sessions.get(sessionId);
-    if (!session) {
-      return null;
-    }
+    if (!session) return null;
 
     const beforeTokens = session.contextWindow.currentTokens;
     const packed = this.compressor.pack(session.contextFragments);
     const compressed = this.compressor.compress(
       packed,
-      targetBudget ?? Math.floor(session.contextWindow.maxTokens * session.contextWindow.warningThreshold)
+      targetBudget ?? Math.floor(session.contextWindow.maxTokens * session.contextWindow.warningThreshold),
     );
 
     session.contextFragments = compressed.fragments.map((fragment) => this.normalizeFragment(fragment));
@@ -562,28 +732,19 @@ export class SessionManager {
     return result;
   }
 
-  async createCheckpoint(
-    sessionId: string,
-    files: string[],
-    options: CheckpointCreateOptions = {}
-  ): Promise<Checkpoint | null> {
+  async createCheckpoint(sessionId: string, files: string[], options: CheckpointCreateOptions = {}): Promise<Checkpoint | null> {
     const session = this.sessions.get(sessionId);
-    if (!session || !session.currentTask) {
-      return null;
-    }
+    if (!session || !session.currentTask) return null;
 
     const fileHashes = new Map<string, string>();
     const cursorPositions = new Map<string, { line: number; column: number }>();
-
     for (const filePath of files) {
       try {
         const content = readFileSync(filePath, 'utf-8');
-        const hash = createHash('sha256').update(content).digest('hex');
-        fileHashes.set(filePath, hash);
+        fileHashes.set(filePath, createHash('sha256').update(content).digest('hex'));
       } catch {
         continue;
       }
-
       const cursor = options.cursorPositions?.[filePath] ?? { line: 1, column: 1 };
       cursorPositions.set(filePath, { ...cursor });
     }
@@ -620,16 +781,10 @@ export class SessionManager {
 
   restoreCheckpoint(sessionId: string, checkpointIdOrTag: string): boolean {
     const session = this.sessions.get(sessionId);
-    if (!session) {
-      return false;
-    }
+    if (!session) return false;
 
-    const checkpoint = session.checkpoints.find(
-      (candidate) => candidate.id === checkpointIdOrTag || candidate.tag === checkpointIdOrTag
-    );
-    if (!checkpoint) {
-      return false;
-    }
+    const checkpoint = session.checkpoints.find((candidate) => candidate.id === checkpointIdOrTag || candidate.tag === checkpointIdOrTag);
+    if (!checkpoint) return false;
 
     this.applySnapshot(session, checkpoint.snapshot);
     session.recoveryState.recoveredFromCheckpointId = checkpoint.id;
@@ -644,31 +799,22 @@ export class SessionManager {
     fromModel: string,
     toModel: string,
     relevantFiles: Array<{ path: string; content: string; relevance: 'high' | 'medium' | 'low' }>,
-    expectedActions: string[]
+    expectedActions: string[],
   ): HandoffPayload | null {
     const session = this.sessions.get(sessionId);
-    if (!session || !session.currentTask) {
-      return null;
-    }
+    if (!session || !session.currentTask) return null;
 
-    const progress = session.tasks
-      .filter((task) => task.status === 'completed')
-      .map((task) => task.goal);
-
-    const blockers = session.tasks
-      .filter((task) => task.status === 'blocked' || task.status === 'failed')
-      .map((task) => task.goal);
-
-    const summaryParts = [
-      `Root goal: ${session.rootGoal}`,
-      `Current task: ${session.currentTask.goal}`,
-      progress.length > 0 ? `Completed: ${progress.join('; ')}` : 'Completed: none yet',
-      blockers.length > 0 ? `Blockers: ${blockers.join('; ')}` : 'Blockers: none',
-    ];
+    const progress = session.tasks.filter((task) => task.status === 'completed').map((task) => task.goal);
+    const blockers = session.tasks.filter((task) => task.status === 'blocked' || task.status === 'failed').map((task) => task.goal);
 
     const payload: HandoffPayload = {
       sessionId,
-      summary: summaryParts.join(' | '),
+      summary: [
+        `Root goal: ${session.rootGoal}`,
+        `Current task: ${session.currentTask.goal}`,
+        progress.length > 0 ? `Completed: ${progress.join('; ')}` : 'Completed: none yet',
+        blockers.length > 0 ? `Blockers: ${blockers.join('; ')}` : 'Blockers: none',
+      ].join(' | '),
       progress,
       blockers,
       decisions: this.extractDecisions(session),
@@ -680,10 +826,7 @@ export class SessionManager {
       toModel,
       timestamp: new Date(),
       compressedContext: this.shouldCompressContext(sessionId)
-        ? this.compressor.compress(
-            this.compressor.pack(session.contextFragments),
-            Math.floor(session.contextWindow.maxTokens * session.contextWindow.warningThreshold)
-          )
+        ? this.compressor.compress(this.compressor.pack(session.contextFragments), Math.floor(session.contextWindow.maxTokens * session.contextWindow.warningThreshold))
         : undefined,
     };
 
@@ -697,13 +840,11 @@ export class SessionManager {
     tokensIn: number,
     tokensOut: number,
     cost: number,
-    options: { latencyMs?: number; success?: boolean; taskId?: string } = {}
+    options: { latencyMs?: number; success?: boolean; taskId?: string } = {},
   ): boolean {
     const session = this.sessions.get(sessionId);
     const metrics = [tokensIn, tokensOut, cost, options.latencyMs ?? 0];
-    if (!session || metrics.some((value) => !Number.isFinite(value) || value < 0) || !model.trim()) {
-      return false;
-    }
+    if (!session || metrics.some((value) => !Number.isFinite(value) || value < 0) || !model.trim()) return false;
 
     const usage: ModelUsage = {
       model: model.trim(),
@@ -741,53 +882,33 @@ export class SessionManager {
 
     let latencyCount = 0;
     let successCount = 0;
-
     for (const item of usage) {
       totals.totalTokensIn += item.tokensIn;
       totals.totalTokensOut += item.tokensOut;
       totals.totalTokens += item.totalTokens;
       totals.totalCost += item.cost;
-      if (item.success) {
-        successCount += 1;
-      }
+      if (item.success) successCount += 1;
       if (typeof item.latencyMs === 'number') {
         totals.averageLatencyMs += item.latencyMs;
         latencyCount += 1;
       }
-
-      const bucket = totals.byModel[item.model] ?? {
-        calls: 0,
-        tokensIn: 0,
-        tokensOut: 0,
-        totalTokens: 0,
-        cost: 0,
-        averageLatencyMs: 0,
-        successRate: 0,
-      };
-
+      const bucket = totals.byModel[item.model] ?? { calls: 0, tokensIn: 0, tokensOut: 0, totalTokens: 0, cost: 0, averageLatencyMs: 0, successRate: 0 };
       bucket.calls += 1;
       bucket.tokensIn += item.tokensIn;
       bucket.tokensOut += item.tokensOut;
       bucket.totalTokens += item.totalTokens;
       bucket.cost += item.cost;
-      if (typeof item.latencyMs === 'number') {
-        bucket.averageLatencyMs += item.latencyMs;
-      }
-      if (item.success) {
-        bucket.successRate += 1;
-      }
-
+      if (typeof item.latencyMs === 'number') bucket.averageLatencyMs += item.latencyMs;
+      if (item.success) bucket.successRate += 1;
       totals.byModel[item.model] = bucket;
     }
 
     totals.averageLatencyMs = latencyCount > 0 ? totals.averageLatencyMs / latencyCount : 0;
     totals.successRate = usage.length > 0 ? successCount / usage.length : 0;
-
     for (const bucket of Object.values(totals.byModel)) {
       bucket.averageLatencyMs = bucket.calls > 0 ? bucket.averageLatencyMs / bucket.calls : 0;
       bucket.successRate = bucket.calls > 0 ? bucket.successRate / bucket.calls : 0;
     }
-
     return totals;
   }
 
@@ -797,10 +918,7 @@ export class SessionManager {
 
   saveSession(sessionId: string): string | null {
     const session = this.sessions.get(sessionId);
-    if (!session) {
-      return null;
-    }
-
+    if (!session) return null;
     const filePath = this.getSessionFilePath(sessionId);
     mkdirSync(this.persistence.baseDir, { recursive: true });
     writeFileSync(filePath, JSON.stringify(this.serializeSession(session), null, 2), 'utf-8');
@@ -809,10 +927,7 @@ export class SessionManager {
 
   recoverSession(sessionId: string): SessionRecoveryResult | null {
     const filePath = this.getSessionFilePath(sessionId);
-    if (!existsSync(filePath)) {
-      return null;
-    }
-
+    if (!existsSync(filePath)) return null;
     const raw = JSON.parse(readFileSync(filePath, 'utf-8')) as SerializedSession;
     const session = this.deserializeSession(raw);
     this.sessions.set(session.id, session);
@@ -820,50 +935,24 @@ export class SessionManager {
     return { session: this.cloneSession(session), source: 'persistence' };
   }
 
-  async pushMemory(
-    sessionId: string,
-    options: {
-      tags?: string[];
-      types?: MemoryEntryType[];
-    } = {}
-  ): Promise<MemorySyncDetails | null> {
+  async pushMemory(sessionId: string, options: { tags?: string[]; types?: MemoryEntryType[] } = {}): Promise<MemorySyncDetails | null> {
     const session = this.sessions.get(sessionId);
-    if (!session || !this.memoryAdapter) {
-      return null;
-    }
+    if (!session || !this.memoryAdapter) return null;
 
     const fragments = this.buildMemoryFragments(session, options.tags ?? [], options.types ?? DEFAULT_MEMORY_ENTRY_TYPES);
     const result = await this.memoryAdapter.push(fragments, sessionId);
     session.lastMemorySyncAt = new Date(result.timestamp);
     this.touchSession(session, 'memory-pushed');
-
     const details: MemorySyncDetails = { result };
     this.events.emit('memory-synced', { sessionId, details });
     return details;
   }
 
-  async pullMemory(
-    sessionId: string,
-    options: {
-      tags?: string[];
-      types?: MemoryEntryType[];
-      since?: number;
-      limit?: number;
-    } = {}
-  ): Promise<MemorySyncDetails | null> {
+  async pullMemory(sessionId: string, options: { tags?: string[]; types?: MemoryEntryType[]; since?: number; limit?: number } = {}): Promise<MemorySyncDetails | null> {
     const session = this.sessions.get(sessionId);
-    if (!session || !this.memoryAdapter) {
-      return null;
-    }
+    if (!session || !this.memoryAdapter) return null;
 
-    const entries = await this.memoryAdapter.pull({
-      sessionId,
-      tags: options.tags,
-      types: options.types,
-      since: options.since,
-      limit: options.limit,
-    });
-
+    const entries = await this.memoryAdapter.pull({ sessionId, tags: options.tags, types: options.types, since: options.since, limit: options.limit });
     this.addContextFragments(sessionId, entries);
 
     const result: SyncResult = {
@@ -876,36 +965,37 @@ export class SessionManager {
     };
     session.lastMemorySyncAt = new Date(result.timestamp);
     this.touchSession(session, 'memory-pulled');
-
     const details: MemorySyncDetails = { result };
     this.events.emit('memory-synced', { sessionId, details });
     return details;
   }
 
-  private buildMemoryFragments(
-    session: Session,
-    tags: string[],
-    types: MemoryEntryType[]
-  ): ContextFragment[] {
+  private bindSessionMethods(session: Session): void {
+    session.attachToRuntime = (runtime: unknown) => {
+      this.attachToRuntime(session.id, runtime);
+    };
+    session.addPatch = (file: string, patch: Patch) => this.addPatch(session.id, file, patch);
+    session.addTestResult = (result: RunResult) => this.addTestResult(session.id, result);
+    session.setRepoSnapshot = (snapshot: FileIndex) => {
+      this.setRepoSnapshot(session.id, snapshot);
+    };
+    session.selectContext = (budget: number) => this.selectContext(session.id, budget) ?? { fragments: [], totalTokens: 0, truncated: false };
+  }
+
+  private buildMemoryFragments(session: Session, tags: string[], types: MemoryEntryType[]): ContextFragment[] {
     const now = Date.now();
     const sharedTags = Array.from(new Set(['session', ...tags]));
     const fragments: ContextFragment[] = [];
 
     if (types.includes('decision')) {
-      const decisions = this.extractDecisions(session);
-      for (const decision of decisions) {
+      for (const decision of this.extractDecisions(session)) {
         fragments.push({
           id: randomUUID(),
           type: 'system',
           content: `${decision.decision}\nReason: ${decision.reason}`,
           source: `session:${session.id}`,
           timestamp: now,
-          metadata: {
-            accessCount: 0,
-            lastAccess: now,
-            priority: 0.9,
-            tags: [...sharedTags, 'decision'],
-          },
+          metadata: { accessCount: 0, lastAccess: now, priority: 0.9, tags: [...sharedTags, 'decision'] },
         });
       }
     }
@@ -919,12 +1009,7 @@ export class SessionManager {
             content: note,
             source: `task:${task.id}`,
             timestamp: now,
-            metadata: {
-              accessCount: 0,
-              lastAccess: now,
-              priority: 0.6,
-              tags: [...sharedTags, 'learning'],
-            },
+            metadata: { accessCount: 0, lastAccess: now, priority: 0.6, tags: [...sharedTags, 'learning'] },
           });
         }
       }
@@ -933,10 +1018,7 @@ export class SessionManager {
     if (types.includes('context')) {
       fragments.push(...session.contextFragments.map((fragment) => ({
         ...this.cloneFragment(fragment),
-        metadata: {
-          ...fragment.metadata,
-          tags: Array.from(new Set([...fragment.metadata.tags, ...sharedTags, 'context'])),
-        },
+        metadata: { ...fragment.metadata, tags: Array.from(new Set([...fragment.metadata.tags, ...sharedTags, 'context'])) },
       })));
     }
 
@@ -966,12 +1048,7 @@ export class SessionManager {
           content: task.notes.at(-1) ?? `Task failed: ${task.goal}`,
           source: `task:${task.id}`,
           timestamp: now,
-          metadata: {
-            accessCount: 0,
-            lastAccess: now,
-            priority: 1,
-            tags: [...sharedTags, 'error'],
-          },
+          metadata: { accessCount: 0, lastAccess: now, priority: 1, tags: [...sharedTags, 'error'] },
         });
       }
     }
@@ -1024,12 +1101,8 @@ export class SessionManager {
 
   private mergeTasks(existing: TaskContext[], fromStack: TaskContext[]): TaskContext[] {
     const merged = new Map<string, TaskContext>();
-    for (const task of existing) {
-      merged.set(task.id, this.cloneTask(task));
-    }
-    for (const task of fromStack) {
-      merged.set(task.id, this.cloneTask(task));
-    }
+    for (const task of existing) merged.set(task.id, this.cloneTask(task));
+    for (const task of fromStack) merged.set(task.id, this.cloneTask(task));
     return Array.from(merged.values());
   }
 
@@ -1062,33 +1135,37 @@ export class SessionManager {
     return fragments.reduce((sum, fragment) => sum + (fragment.tokenCount ?? estimateTokens(fragment.content)), 0);
   }
 
+  private toRuntimeTaskSnapshot(task: Record<string, unknown>): RuntimeTaskSnapshot {
+    return {
+      id: String(task.id ?? ''),
+      state: String(task.state ?? 'unknown'),
+      status: String(task.status ?? 'unknown'),
+      intent: String(task.intent ?? ''),
+      priority: typeof task.priority === 'string' ? task.priority : undefined,
+      updatedAt: typeof task.updatedAt === 'number' ? task.updatedAt : undefined,
+    };
+  }
+
   private findGoalNodeByTaskId(session: Session, taskId: string | null): GoalNode | undefined {
     return session.goalTree.find((node) => node.taskId === taskId);
   }
 
   private updateGoalNodeStatus(session: Session, taskId: string, status: TaskStatus, when: Date): void {
     const node = this.findGoalNodeByTaskId(session, taskId);
-    if (!node) {
-      return;
-    }
+    if (!node) return;
     node.status = status;
     node.updatedAt = when;
   }
 
   private touchSession(session: Session, reason: string): void {
     session.updatedAt = new Date();
-    if (this.persistence.autoSave) {
-      this.saveSession(session.id);
-    }
+    if (this.persistence.autoSave) this.saveSession(session.id);
     this.events.emit('session-updated', { session: this.cloneSession(session), reason });
   }
 
   private setState(session: Session, newState: SessionState): void {
     const oldState = session.state;
-    if (oldState === newState) {
-      return;
-    }
-
+    if (oldState === newState) return;
     session.state = newState;
     this.touchSession(session, `state:${oldState}->${newState}`);
     this.events.emit('state-change', { sessionId: session.id, from: oldState, to: newState });
@@ -1118,6 +1195,11 @@ export class SessionManager {
       contextFragments: session.contextFragments.map((fragment) => this.serializeFragment(fragment)),
       contextWindow: this.serializeContextWindow(session.contextWindow),
       lastMemorySyncAt: session.lastMemorySyncAt?.toISOString() ?? null,
+      runtimeQueue: this.serializeRuntimeQueue(session.runtimeQueue),
+      patchHistory: session.patchHistory.map((record) => this.serializePatchRecord(record)),
+      fileVersions: { ...session.fileVersions },
+      testResults: session.testResults.map((record) => this.serializeTestResult(record)),
+      repoSnapshot: session.repoSnapshot ? this.serializeRepoSnapshot(session.repoSnapshot) : null,
       recoveryState: {
         recoveredFromCheckpointId: session.recoveryState.recoveredFromCheckpointId,
         recoveredAt: session.recoveryState.recoveredAt?.toISOString() ?? null,
@@ -1130,7 +1212,7 @@ export class SessionManager {
     const taskMap = new Map(tasks.map((task) => [task.id, task]));
     const taskStack = raw.taskStack.map((task) => taskMap.get(task.id) ?? this.deserializeTask(task));
 
-    return {
+    const session: Session = {
       id: raw.id,
       state: raw.state,
       createdAt: new Date(raw.createdAt),
@@ -1149,11 +1231,18 @@ export class SessionManager {
       contextFragments: raw.contextFragments.map((fragment) => this.deserializeFragment(fragment)),
       contextWindow: this.deserializeContextWindow(raw.contextWindow),
       lastMemorySyncAt: raw.lastMemorySyncAt ? new Date(raw.lastMemorySyncAt) : null,
+      runtimeQueue: this.deserializeRuntimeQueue(raw.runtimeQueue),
+      patchHistory: raw.patchHistory.map((record) => this.deserializePatchRecord(record)),
+      fileVersions: { ...(raw.fileVersions ?? {}) },
+      testResults: raw.testResults.map((record) => this.deserializeTestResult(record)),
+      repoSnapshot: raw.repoSnapshot ? this.deserializeRepoSnapshot(raw.repoSnapshot) : null,
       recoveryState: {
         recoveredFromCheckpointId: raw.recoveryState.recoveredFromCheckpointId,
         recoveredAt: raw.recoveryState.recoveredAt ? new Date(raw.recoveryState.recoveredAt) : null,
       },
     };
+    this.bindSessionMethods(session);
+    return session;
   }
 
   private serializeTask(task: TaskContext): SerializedTaskContext {
@@ -1189,69 +1278,35 @@ export class SessionManager {
   }
 
   private serializeGoalNode(node: GoalNode): SerializedGoalNode {
-    return {
-      ...node,
-      createdAt: node.createdAt.toISOString(),
-      updatedAt: node.updatedAt.toISOString(),
-      children: [...node.children],
-    };
+    return { ...node, createdAt: node.createdAt.toISOString(), updatedAt: node.updatedAt.toISOString(), children: [...node.children] };
   }
 
   private deserializeGoalNode(raw: SerializedGoalNode): GoalNode {
-    return {
-      ...raw,
-      createdAt: new Date(raw.createdAt),
-      updatedAt: new Date(raw.updatedAt),
-      children: [...raw.children],
-    };
+    return { ...raw, createdAt: new Date(raw.createdAt), updatedAt: new Date(raw.updatedAt), children: [...raw.children] };
   }
 
   private serializeModelUsage(usage: ModelUsage): SerializedModelUsage {
-    return {
-      ...usage,
-      timestamp: usage.timestamp.toISOString(),
-    };
+    return { ...usage, timestamp: usage.timestamp.toISOString() };
   }
 
   private deserializeModelUsage(raw: SerializedModelUsage): ModelUsage {
-    return {
-      ...raw,
-      timestamp: new Date(raw.timestamp),
-    };
+    return { ...raw, timestamp: new Date(raw.timestamp) };
   }
 
   private serializeFragment(fragment: ContextFragment): SerializedContextFragment {
-    return {
-      ...fragment,
-      metadata: {
-        ...fragment.metadata,
-        tags: [...fragment.metadata.tags],
-      },
-    };
+    return { ...fragment, metadata: { ...fragment.metadata, tags: [...fragment.metadata.tags] } };
   }
 
   private deserializeFragment(raw: SerializedContextFragment): ContextFragment {
-    return {
-      ...raw,
-      metadata: {
-        ...raw.metadata,
-        tags: [...raw.metadata.tags],
-      },
-    };
+    return { ...raw, metadata: { ...raw.metadata, tags: [...raw.metadata.tags] } };
   }
 
   private serializeContextWindow(window: SessionContextWindow): SerializedSessionContextWindow {
-    return {
-      ...window,
-      lastCompressedAt: window.lastCompressedAt?.toISOString() ?? null,
-    };
+    return { ...window, lastCompressedAt: window.lastCompressedAt?.toISOString() ?? null };
   }
 
   private deserializeContextWindow(raw: SerializedSessionContextWindow): SessionContextWindow {
-    return {
-      ...raw,
-      lastCompressedAt: raw.lastCompressedAt ? new Date(raw.lastCompressedAt) : null,
-    };
+    return { ...raw, lastCompressedAt: raw.lastCompressedAt ? new Date(raw.lastCompressedAt) : null };
   }
 
   private serializeCheckpoint(checkpoint: Checkpoint): SerializedCheckpoint {
@@ -1310,33 +1365,87 @@ export class SessionManager {
     };
   }
 
+  private serializeRuntimeQueue(runtimeQueue: RuntimeQueueSnapshot): SerializedRuntimeQueueSnapshot {
+    return {
+      activeTaskId: runtimeQueue.activeTaskId,
+      queue: runtimeQueue.queue.map((task) => ({ ...task })),
+      activeTask: runtimeQueue.activeTask ? { ...runtimeQueue.activeTask } : null,
+      lastSyncedAt: runtimeQueue.lastSyncedAt?.toISOString() ?? null,
+    };
+  }
+
+  private deserializeRuntimeQueue(raw: SerializedRuntimeQueueSnapshot): RuntimeQueueSnapshot {
+    return {
+      activeTaskId: raw.activeTaskId,
+      queue: raw.queue.map((task) => ({ ...task })),
+      activeTask: raw.activeTask ? { ...raw.activeTask } : null,
+      lastSyncedAt: raw.lastSyncedAt ? new Date(raw.lastSyncedAt) : null,
+    };
+  }
+
+  private serializePatchRecord(record: SessionPatchRecord): SerializedSessionPatchRecord {
+    return { ...record, patch: structuredClone(record.patch), timestamp: record.timestamp.toISOString() };
+  }
+
+  private deserializePatchRecord(raw: SerializedSessionPatchRecord): SessionPatchRecord {
+    return { ...raw, patch: structuredClone(raw.patch), timestamp: new Date(raw.timestamp) };
+  }
+
+  private serializeTestResult(record: SessionTestResultRecord): SerializedSessionTestResultRecord {
+    return { ...record, result: structuredClone(record.result), timestamp: record.timestamp.toISOString() };
+  }
+
+  private deserializeTestResult(raw: SerializedSessionTestResultRecord): SessionTestResultRecord {
+    return { ...raw, result: structuredClone(raw.result), timestamp: new Date(raw.timestamp) };
+  }
+
+  private serializeRepoSnapshot(snapshot: SessionRepoSnapshotRecord): SerializedSessionRepoSnapshotRecord {
+    return { snapshot: this.serializeFileIndex(snapshot.snapshot), updatedAt: snapshot.updatedAt.toISOString() };
+  }
+
+  private deserializeRepoSnapshot(raw: SerializedSessionRepoSnapshotRecord): SessionRepoSnapshotRecord {
+    return { snapshot: this.deserializeFileIndex(raw.snapshot), updatedAt: new Date(raw.updatedAt) };
+  }
+
+  private serializeFileIndex(index: FileIndex): SerializedFileIndex {
+    const raw = index as FileIndex & Record<string, unknown>;
+    return {
+      ...raw,
+      rootDir: index.rootDir,
+      files: Array.from(index.files.entries()),
+      directories: Array.from(index.directories.entries()),
+      languages: Array.from(index.languages.entries()),
+      generatedAt: index.generatedAt,
+      gitInfo: raw.gitInfo,
+    };
+  }
+
+  private deserializeFileIndex(raw: SerializedFileIndex): FileIndex {
+    return {
+      ...(raw as Record<string, unknown>),
+      rootDir: raw.rootDir,
+      files: new Map(raw.files) as FileIndex['files'],
+      directories: new Map(raw.directories) as FileIndex['directories'],
+      languages: new Map(raw.languages) as FileIndex['languages'],
+      generatedAt: raw.generatedAt,
+      gitInfo: raw.gitInfo as FileIndex['gitInfo'],
+    };
+  }
+
   private cloneSession(session: Session): Session {
     return this.deserializeSession(this.serializeSession(session));
   }
-
-  private cloneTask(task: TaskContext): TaskContext {
-    return this.deserializeTask(this.serializeTask(task));
-  }
-
-  private cloneGoalNode(node: GoalNode): GoalNode {
-    return this.deserializeGoalNode(this.serializeGoalNode(node));
-  }
-
-  private cloneModelUsage(usage: ModelUsage): ModelUsage {
-    return this.deserializeModelUsage(this.serializeModelUsage(usage));
-  }
-
-  private cloneCheckpoint(checkpoint: Checkpoint): Checkpoint {
-    return this.deserializeCheckpoint(this.serializeCheckpoint(checkpoint));
-  }
-
-  private cloneFragment(fragment: ContextFragment): ContextFragment {
-    return this.deserializeFragment(this.serializeFragment(fragment));
-  }
-
-  private cloneContextWindow(window: SessionContextWindow): SessionContextWindow {
-    return this.deserializeContextWindow(this.serializeContextWindow(window));
-  }
+  private cloneTask(task: TaskContext): TaskContext { return this.deserializeTask(this.serializeTask(task)); }
+  private cloneGoalNode(node: GoalNode): GoalNode { return this.deserializeGoalNode(this.serializeGoalNode(node)); }
+  private cloneModelUsage(usage: ModelUsage): ModelUsage { return this.deserializeModelUsage(this.serializeModelUsage(usage)); }
+  private cloneCheckpoint(checkpoint: Checkpoint): Checkpoint { return this.deserializeCheckpoint(this.serializeCheckpoint(checkpoint)); }
+  private cloneFragment(fragment: ContextFragment): ContextFragment { return this.deserializeFragment(this.serializeFragment(fragment)); }
+  private cloneContextWindow(window: SessionContextWindow): SessionContextWindow { return this.deserializeContextWindow(this.serializeContextWindow(window)); }
+  private cloneRuntimeQueue(runtimeQueue: RuntimeQueueSnapshot): RuntimeQueueSnapshot { return this.deserializeRuntimeQueue(this.serializeRuntimeQueue(runtimeQueue)); }
+  private clonePatchRecord(record: SessionPatchRecord): SessionPatchRecord { return this.deserializePatchRecord(this.serializePatchRecord(record)); }
+  private cloneTestResult(record: SessionTestResultRecord): SessionTestResultRecord { return this.deserializeTestResult(this.serializeTestResult(record)); }
+  private cloneRepoSnapshot(snapshot: SessionRepoSnapshotRecord): SessionRepoSnapshotRecord { return this.deserializeRepoSnapshot(this.serializeRepoSnapshot(snapshot)); }
+  private cloneFileIndex(index: FileIndex): FileIndex { return this.deserializeFileIndex(this.serializeFileIndex(index)); }
 }
 
 export const sessionManager = new SessionManager();

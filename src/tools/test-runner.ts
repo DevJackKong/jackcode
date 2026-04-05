@@ -13,8 +13,15 @@ import {
   statSync,
   writeFileSync,
 } from 'node:fs';
-import { basename, dirname, join, resolve } from 'node:path';
+import { basename, dirname, extname, join, resolve } from 'node:path';
 import { promisify } from 'node:util';
+
+import type { SessionManager } from '../core/session.ts';
+import type { RuntimeStateMachine, TaskContext } from '../core/runtime.ts';
+import type { RepoScanner } from '../core/scanner.ts';
+import type { ImpactAnalyzer } from '../repo/impact-analyzer.ts';
+import type { Patch, PatchPlan } from '../types/patch.ts';
+import type { ChangeDescriptor } from '../types/impact-analyzer.ts';
 
 const execFileAsync = promisify(execFile);
 
@@ -81,6 +88,22 @@ export interface CoverageTrendEntry {
   statements: number;
 }
 
+export interface TestCompletionEvent {
+  result: RunResult;
+  selectedTests: string[];
+  changedFiles?: string[];
+  trigger: 'manual' | 'patch' | 'affected' | 'loop';
+}
+
+export interface TestRunnerIntegrations {
+  runtime?: RuntimeStateMachine;
+  session?: SessionManager;
+  scanner?: RepoScanner;
+  impactAnalyzer?: ImpactAnalyzer;
+  sessionId?: string;
+  taskId?: string;
+}
+
 export interface CacheEntry {
   hash: string;
   mtime: number;
@@ -118,6 +141,7 @@ export interface OrchestratorOptions {
   retryAttempts?: number;
   retryDelayMs?: number;
   coverageThresholds?: CoverageThresholds;
+  integrations?: TestRunnerIntegrations;
 }
 
 export interface ExecResult {
@@ -559,14 +583,23 @@ export class TestRunner {
   private readonly environment: ProjectEnvironment;
   private readonly executor: CommandExecutor;
   private readonly coverageTracker: CoverageTracker;
+  private readonly integrations: TestRunnerIntegrations;
+  private readonly completionCallbacks = new Set<(event: TestCompletionEvent) => void>();
 
   constructor(
     environment = new ProjectEnvironment(),
-    executor: CommandExecutor = defaultExecutor
+    executor: CommandExecutor = defaultExecutor,
+    integrations: TestRunnerIntegrations = {}
   ) {
     this.environment = environment;
     this.executor = executor;
     this.coverageTracker = new CoverageTracker(environment);
+    this.integrations = integrations;
+  }
+
+  onComplete(callback: (event: TestCompletionEvent) => void): () => void {
+    this.completionCallbacks.add(callback);
+    return () => this.completionCallbacks.delete(callback);
   }
 
   detectTestRunner(): TestRunnerName {
@@ -683,29 +716,80 @@ export class TestRunner {
     options: TestRunnerOptions = {},
     thresholds?: CoverageThresholds
   ): Promise<RunResult> {
+    return this.runWithSelection({
+      options,
+      thresholds,
+      selectedTests: this.resolveSelectedTests(options.pattern),
+      trigger: 'manual',
+    });
+  }
+
+  async runAffectedTests(changedFiles: string[], thresholds?: CoverageThresholds): Promise<RunResult> {
+    const selectedTests = await this.selectAffectedTests(changedFiles);
+    return this.runWithSelection({
+      options: {
+        pattern: selectedTests.length > 0 ? selectedTests.join(' ') : 'src/**/*.test.ts',
+        coverage: true,
+        failFast: true,
+        parallel: 4,
+      },
+      thresholds,
+      selectedTests,
+      changedFiles,
+      trigger: 'affected',
+    });
+  }
+
+  async runForPatch(patch: Patch | PatchPlan, thresholds?: CoverageThresholds): Promise<RunResult> {
+    const changedFiles = 'patches' in patch
+      ? patch.patches.map((entry) => entry.targetPath)
+      : [patch.targetPath];
+
+    return this.runWithSelection({
+      options: {
+        pattern: undefined,
+        coverage: true,
+        failFast: true,
+        parallel: 4,
+      },
+      thresholds,
+      selectedTests: await this.selectAffectedTests(changedFiles),
+      changedFiles,
+      trigger: 'patch',
+    });
+  }
+
+  private async runWithSelection(params: {
+    options: TestRunnerOptions;
+    thresholds?: CoverageThresholds;
+    selectedTests: string[];
+    changedFiles?: string[];
+    trigger: TestCompletionEvent['trigger'];
+  }): Promise<RunResult> {
     const start = Date.now();
     const normalizedOptions: Required<TestRunnerOptions> = {
-      pattern: options.pattern ?? 'src/**/*.test.ts',
-      watch: options.watch ?? false,
-      parallel: Math.max(1, options.parallel ?? 4),
-      coverage: options.coverage ?? false,
-      verbose: options.verbose ?? false,
-      failFast: options.failFast ?? false,
+      pattern: params.options.pattern ?? (params.selectedTests.length > 0 ? params.selectedTests.join(' ') : 'src/**/*.test.ts'),
+      watch: params.options.watch ?? false,
+      parallel: Math.max(1, params.options.parallel ?? 4),
+      coverage: params.options.coverage ?? false,
+      verbose: params.options.verbose ?? false,
+      failFast: params.options.failFast ?? false,
     };
 
     const command = this.createTestCommand(normalizedOptions);
+    this.markRuntimeBusy(params.trigger, params.changedFiles);
 
     try {
       const { stdout, stderr } = await this.executor(command);
       const output = combineOutput(stdout, stderr);
       const coverage = normalizedOptions.coverage ? this.coverageTracker.parseCoverage(output) : undefined;
-      const thresholdErrors = coverage ? checkCoverageThresholds(coverage, thresholds) : [];
+      const thresholdErrors = coverage ? checkCoverageThresholds(coverage, params.thresholds) : [];
 
       if (coverage) {
         this.coverageTracker.record(coverage);
       }
 
-      return {
+      const result: RunResult = {
         success: thresholdErrors.length === 0,
         durationMs: Date.now() - start,
         output,
@@ -716,8 +800,12 @@ export class TestRunner {
         meta: {
           runner: this.detectTestRunner(),
           latestTrend: this.coverageTracker.latestTrend(),
+          selectedTests: params.selectedTests,
+          changedFiles: params.changedFiles,
         },
       };
+      this.completeRun(result, params.selectedTests, params.changedFiles, params.trigger);
+      return result;
     } catch (error: unknown) {
       const details = error as ExecResult;
       const output = combineOutput(details.stdout, details.stderr);
@@ -725,7 +813,7 @@ export class TestRunner {
       if (coverage) {
         this.coverageTracker.record(coverage);
       }
-      return {
+      const result: RunResult = {
         success: false,
         durationMs: Date.now() - start,
         output,
@@ -733,9 +821,146 @@ export class TestRunner {
         coverage,
         command,
         classification: classifyFailure(output, [normalizeError(error)]),
+        meta: {
+          selectedTests: params.selectedTests,
+          changedFiles: params.changedFiles,
+        },
       };
+      this.completeRun(result, params.selectedTests, params.changedFiles, params.trigger);
+      return result;
     }
   }
+
+  private completeRun(
+    result: RunResult,
+    selectedTests: string[],
+    changedFiles: string[] | undefined,
+    trigger: TestCompletionEvent['trigger']
+  ): void {
+    this.integrations.session?.recordTestResult(this.integrations.sessionId ?? '', {
+      success: result.success,
+      durationMs: result.durationMs,
+      classification: result.classification,
+      coverage: result.coverage,
+      errors: result.errors,
+    });
+
+    if (this.integrations.session && this.integrations.sessionId && this.integrations.taskId) {
+      this.integrations.session.addTaskNote(
+        this.integrations.sessionId,
+        this.integrations.taskId,
+        `Test run (${trigger}) ${result.success ? 'passed' : 'failed'}${result.coverage ? ` | coverage ${result.coverage.lines}% lines` : ''}`
+      );
+    }
+
+    for (const callback of this.completionCallbacks) {
+      callback({ result, selectedTests, changedFiles, trigger });
+    }
+  }
+
+  private markRuntimeBusy(trigger: TestCompletionEvent['trigger'], changedFiles?: string[]): void {
+    const runtime = this.integrations.runtime as (RuntimeStateMachine & { transition?: (taskId: string, state: string) => unknown; getTask?: (taskId: string) => TaskContext | undefined }) | undefined;
+    const taskId = this.integrations.taskId;
+    if (!runtime || !taskId || typeof runtime.transition !== 'function') {
+      return;
+    }
+
+    try {
+      runtime.transition(taskId, 'executing');
+    } catch {
+      // Best-effort integration only.
+    }
+
+    if (this.integrations.session && this.integrations.sessionId && taskId && changedFiles?.length) {
+      this.integrations.session.addTaskNote(
+        this.integrations.sessionId,
+        taskId,
+        `Running ${trigger} tests for: ${changedFiles.join(', ')}`
+      );
+    }
+  }
+
+  private async selectAffectedTests(changedFiles: string[]): Promise<string[]> {
+    const fromImpact = await this.selectTestsFromImpactAnalyzer(changedFiles);
+    if (fromImpact.length > 0) {
+      return fromImpact;
+    }
+
+    const discoveredTests = this.discoverTestFiles();
+    if (changedFiles.length === 0) {
+      return discoveredTests;
+    }
+
+    const mapped = new Set<string>();
+    for (const changedFile of changedFiles) {
+      const sourceBase = changedFile.replace(/\.[^.]+$/, '');
+      const sourceName = basename(sourceBase);
+      for (const testFile of discoveredTests) {
+        const normalized = testFile.replace(/\\/g, '/');
+        if (normalized.includes(sourceName) || normalized.includes(sourceBase)) {
+          mapped.add(testFile);
+        }
+      }
+    }
+
+    return Array.from(mapped).sort();
+  }
+
+  private async selectTestsFromImpactAnalyzer(changedFiles: string[]): Promise<string[]> {
+    if (!this.integrations.impactAnalyzer) {
+      return [];
+    }
+
+    const changes: ChangeDescriptor[] = changedFiles.map((path) => ({
+      path,
+      type: 'modify',
+      scope: 'file',
+    }));
+    const report = await this.integrations.impactAnalyzer.analyze(changes);
+    return report.affectedTests.map((test) => test.path);
+  }
+
+  private discoverTestFiles(): string[] {
+    const scanner = this.integrations.scanner;
+    if (scanner?.getIndex()) {
+      return Array.from(scanner.getIndex()!.files.values())
+        .filter((entry) => Boolean((entry as FileSystemEntryWithFlags).isTest))
+        .map((entry) => entry.path)
+        .sort();
+    }
+
+    const collected: string[] = [];
+    const walk = (dir: string): void => {
+      for (const entry of safeReadDir(dir)) {
+        const full = join(dir, entry);
+        try {
+          const stats = statSync(full);
+          if (stats.isDirectory()) {
+            walk(full);
+          } else if (/(?:\.|-|_)(test|spec)\.[^.]+$/.test(full) || full.includes(`${resolve(this.environment.rootDir, 'src')}/__tests__/`)) {
+            collected.push(full.replace(`${this.environment.rootDir}/`, ''));
+          }
+        } catch {
+          // ignore unreadable entries
+        }
+      }
+    };
+    walk(this.environment.rootDir);
+    return collected.sort();
+  }
+
+  private resolveSelectedTests(pattern?: string): string[] {
+    if (!pattern || pattern.includes('*')) {
+      return this.discoverTestFiles();
+    }
+
+    return pattern.split(/\s+/).filter(Boolean);
+  }
+}
+
+interface FileSystemEntryWithFlags {
+  path: string;
+  isTest?: boolean;
 }
 
 export class Linter {
@@ -865,7 +1090,7 @@ export class BuildTestLoopOrchestrator {
     executor: CommandExecutor = defaultExecutor
   ) {
     this.buildRunner = new BuildRunner(environment, executor);
-    this.testRunner = new TestRunner(environment, executor);
+    this.testRunner = new TestRunner(environment, executor, options.integrations);
     this.linter = new Linter(environment, executor);
     this.retryAttempts = options.retryAttempts ?? DEFAULT_RETRY_ATTEMPTS;
     this.retryDelayMs = options.retryDelayMs ?? DEFAULT_RETRY_DELAY_MS;
@@ -908,8 +1133,8 @@ export class BuildTestLoopOrchestrator {
         return this.finalizeLoop(start, stages, attempt, true, false);
       }
 
-      const testResult = await this.testRunner.run(
-        { pattern: 'src/**/*.test.ts', parallel: 4, failFast: true, coverage: true },
+      const testResult = await this.testRunner.runAffectedTests(
+        [],
         this.coverageThresholds
       );
       stages.push({ stage: 'test', result: testResult });
