@@ -6,7 +6,7 @@
  */
 
 import { createChatSession, startRepl } from './chat.js';
-import { CLIConfig, CLIMode, ParseResult } from '../types/cli.js';
+import type { CLIConfig, ModelTier, ParseResult, Theme } from '../types/cli.js';
 
 export { createChatSession, startRepl };
 
@@ -42,27 +42,52 @@ export function parseArgs(args: string[]): ParseResult {
         result.mode = 'version';
         break;
       case '--model':
-      case '-m':
-        result.config.defaultModel = args[++i] as any;
+      case '-m': {
+        const value = args[i + 1];
+        if (!isModelTier(value)) {
+          throw new Error(`Invalid model tier: ${value ?? '(missing)'}`);
+        }
+        result.config.defaultModel = value;
+        i++;
         break;
+      }
       case '--no-stream':
         result.config.streaming = false;
         break;
-      case '--theme':
-        result.config.theme = args[++i] as any;
+      case '--theme': {
+        const value = args[i + 1];
+        if (!isTheme(value)) {
+          throw new Error(`Invalid theme: ${value ?? '(missing)'}`);
+        }
+        result.config.theme = value;
+        i++;
         break;
+      }
       case '--execute':
       case '-e':
         result.mode = 'execute';
         break;
       default:
+        if (arg === 'chat') {
+          result.mode = 'chat';
+          break;
+        }
+
         if (!arg.startsWith('-')) {
           // Positional argument is the prompt
           result.prompt = args.slice(i).join(' ');
-          result.mode = 'oneshot';
+          if (result.mode !== 'execute') {
+            result.mode = 'oneshot';
+          }
           i = args.length;
         } else {
-          result.flags[arg] = args[++i] || true;
+          const next = args[i + 1];
+          if (!next || next.startsWith('-')) {
+            result.flags[arg] = true;
+          } else {
+            result.flags[arg] = next;
+            i++;
+          }
         }
     }
   }
@@ -74,7 +99,15 @@ export function parseArgs(args: string[]): ParseResult {
  * Main CLI entry point
  */
 export async function main(args: string[] = process.argv.slice(2)): Promise<void> {
-  const parsed = parseArgs(args);
+  let parsed: ParseResult;
+
+  try {
+    parsed = parseArgs(args);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`Argument error: ${message}`);
+    process.exit(1);
+  }
 
   switch (parsed.mode) {
     case 'help':
@@ -138,6 +171,14 @@ Interactive Commands:
  */
 function printVersion(): void {
   console.log('JackCode v0.1.0');
+}
+
+function isModelTier(value: string | undefined): value is ModelTier {
+  return value === 'qwen-3.6' || value === 'deepseek' || value === 'gpt54';
+}
+
+function isTheme(value: string | undefined): value is Theme {
+  return value === 'dark' || value === 'light' || value === 'auto';
 }
 
 /**

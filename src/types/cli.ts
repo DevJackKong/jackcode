@@ -103,6 +103,7 @@ export interface RenderOptions {
 
 export interface ChatState {
   isProcessing: boolean;
-  currentStream?: AbortController;
+  currentStream: AbortController | null;
   lastActivity: number;
+  lastError?: string;
 }

@@ -3,9 +3,15 @@
  * Workflow presentation, summary output, and approval boundaries
  */
 
-import type { TaskContext, TaskState, Artifact } from './runtime.js';
-import type { PatchResult, PatchPlan, FileSummary } from '../types/patch.js';
-import type { VerificationResult, IssueSeverity } from '../types/reviewer.js';
+import path from 'node:path';
+
+import type { TaskContext, Artifact } from './runtime.js';
+import type { PatchResult } from '../types/patch.js';
+import type {
+  VerificationResult,
+  IssueSeverity,
+  VerificationDecision,
+} from '../types/reviewer.js';
 
 // =============================================================================
 // Types
@@ -308,7 +314,6 @@ export class SummaryGenerator {
     verification?: VerificationResult,
     options: { level?: SummaryLevel; intent?: string } = {}
   ): TaskSummary {
-    const level = options.level || 'standard';
     const intent = options.intent || 'Task';
 
     const filesChanged: FileChangeSummary[] = [];
@@ -494,6 +499,18 @@ export class ApprovalController {
       };
     }
 
+    if (userOverrides?.autoReject?.length) {
+      const rejectedPaths = new Set(userOverrides.autoReject);
+      const rejectedFile = files.find((file) => rejectedPaths.has(file.path));
+      if (rejectedFile) {
+        return {
+          requiresApproval: true,
+          action: 'block',
+          reason: `User rejected changes to ${rejectedFile.path}`,
+        };
+      }
+    }
+
     // Check for blocked patterns first
     for (const rule of this.rules) {
       if (rule.action === 'block' && this.matchesCondition(rule.condition, files, riskLevel, workspacePath)) {
@@ -572,7 +589,15 @@ export class ApprovalController {
 
       case 'outside_workspace': {
         if (!condition.enabled) return false;
-        return files.some((f) => !f.path.startsWith(workspacePath));
+
+        const normalizedWorkspace = path.resolve(workspacePath);
+        return files.some((file) => {
+          const candidatePath = path.isAbsolute(file.path)
+            ? path.resolve(file.path)
+            : path.resolve(normalizedWorkspace, file.path);
+          const relativePath = path.relative(normalizedWorkspace, candidatePath);
+          return relativePath.startsWith('..') || path.isAbsolute(relativePath);
+        });
       }
 
       default:
@@ -583,11 +608,189 @@ export class ApprovalController {
   /**
    * Simple glob matching
    */
-  private matchGlob(path: string, pattern: string): boolean {
+  private matchGlob(filePath: string, pattern: string): boolean {
+    const escapedPattern = pattern.replace(/[|\{}()[]^$+?.]/g, '\\$&');
     const regex = new RegExp(
-      '^' + pattern.replace(/\./g, '\\.').replace(/\*/g, '.*').replace(/\?/g, '.') + '$'
+      '^' + escapedPattern.replace(/\\*/g, '.*').replace(/\\?/g, '.') + '$'
     );
-    return regex.test(path);
+    return regex.test(filePath);
+  }
+
+  /**
+   * Build approval prompt from matching rules
+   */
+  private buildPrompt(
+    files: FileChangeSummary[],
+    riskLevel: RiskLevel,
+    rules: ApprovalRule[]
+  ): ApprovalPrompt {
+    const changes: ChangePreview[] = files.map((f) => ({
+      path: f.path,
+      changeType: f.changeType,
+      linesAdded: f.linesAdded,
+      linesRemoved: f.linesRemoved,
+    }));
+
+    const totalLines = files.reduce((sum, f) => sum + f.linesAdded + f.linesRemoved, 0);
+    const fileCount = files.length;
+
+    return {
+      title: 'Approval Required',
+      description: `This operation will modify ${fileCount} files (${totalLines} lines changed).\n\n` +
+        `Triggered rules: ${rules.map((r) => r.name).join(', ')}`,
+      changes,
+      riskLevel,
+      estimatedImpact: `${fileCount} files, +${files.reduce((sum, f) => sum + f.linesAdded, 0)} -${files.reduce((sum, f) => sum + f.linesRemoved, 0)} lines`,
+    };
+  }
+}
+
+// =============================================================================
+// Executor Integration
+// =============================================================================
+
+/**
+ * Main executor class integrating workflow UX components
+ */
+export class WorkflowExecutor {
+  private presenter: WorkflowPresenter;
+  private approval: ApprovalController;
+
+  constructor(
+    presenterConfig?: Partial<WorkflowPresenterConfig>,
+    approvalRules?: ApprovalRule[]
+  ) {
+    this.presenter = new WorkflowPresenter(presenterConfig);
+    this.approval = new ApprovalController(approvalRules);
+  }
+
+  /**
+   * Execute with full workflow UX
+   */
+  async execute(
+    task: TaskContext,
+    operation: () => Promise<{ patchResult: PatchResult; verification?: VerificationResult }>,
+    options: {
+      workspacePath: string;
+      onApprovalRequest?: (prompt: ApprovalPrompt) => Promise<boolean>;
+    }
+  ): Promise<{ approved: boolean; result?: PatchResult; summary?: TaskSummary }> {
+    // Build initial workflow state
+    const state: WorkflowSessionState = {
+      sessionId: task.id,
+      intent: task.intent,
+      steps: [
+        { id: '1', label: 'Planning', status: 'completed' },
+        { id: '2', label: 'Executing', status: 'running', startTime: Date.now() },
+        { id: '3', label: 'Verifying', status: 'pending' },
+      ],
+      currentStepId: '2',
+      startTime: Date.now(),
+    };
+
+    try {
+      const { patchResult, verification } = await operation();
+
+      state.steps[1].status = patchResult.success ? 'completed' : 'failed';
+      state.steps[1].endTime = Date.now();
+      state.steps[2].status = verification ? 'running' : 'skipped';
+      state.steps[2].startTime = verification ? Date.now() : undefined;
+      state.currentStepId = verification ? '3' : undefined;
+
+      const summary = SummaryGenerator.create(patchResult, verification, {
+        level: 'standard',
+        intent: task.intent,
+      });
+
+      const decision = this.approval.evaluate({
+        files: summary.filesChanged,
+        riskLevel: this.calculateRiskLevel(summary),
+        workspacePath: options.workspacePath,
+      });
+
+      if (decision.action === 'block') {
+        state.steps[2].status = 'failed';
+        state.steps[2].endTime = Date.now();
+        state.endTime = Date.now();
+        return { approved: false, summary };
+      }
+
+      if (decision.requiresApproval) {
+        if (!decision.prompt || !options.onApprovalRequest) {
+          state.steps[2].status = 'failed';
+          state.steps[2].endTime = Date.now();
+          state.endTime = Date.now();
+          return { approved: false, summary };
+        }
+
+        const approved = await options.onApprovalRequest(decision.prompt);
+        if (!approved) {
+          state.steps[2].status = 'failed';
+          state.steps[2].endTime = Date.now();
+          state.endTime = Date.now();
+          return { approved: false, summary };
+        }
+      }
+
+      state.steps[2].status = this.getVerificationStepStatus(verification?.decision);
+      state.steps[2].endTime = Date.now();
+      state.currentStepId = undefined;
+      state.endTime = Date.now();
+
+      return { approved: true, result: patchResult, summary };
+    } catch {
+      state.steps[1].status = 'failed';
+      state.steps[1].endTime = Date.now();
+      state.steps[2].status = 'skipped';
+      state.currentStepId = undefined;
+      state.endTime = Date.now();
+      throw;
+    }
+  }
+
+  private getVerificationStepStatus(
+    decision?: VerificationDecision
+  ): WorkflowStep['status'] {
+    switch (decision) {
+      case 'approve':
+        return 'completed';
+      case 'repair':
+        return 'running';
+      case 'reject':
+        return 'failed';
+      default:
+        return 'skipped';
+    }
+  }
+
+  /**
+   * Render current workflow state
+   */
+  renderState(state: WorkflowSessionState): string {
+    return this.presenter.render(state);
+  }
+
+  /**
+   * Calculate risk level from summary
+   */
+  private calculateRiskLevel(summary: TaskSummary): RiskLevel {
+    const fileCount = summary.filesChanged.length;
+    const totalLines = summary.totalLinesAdded + summary.totalLinesRemoved;
+    const errorCount = summary.issues.filter((i) => i.severity === 'error').length;
+
+    if (errorCount > 0 || totalLines > 500 || fileCount > 50) return 'critical';
+    if (totalLines > 200 || fileCount > 20) return 'high';
+    if (totalLines > 50 || fileCount > 5) return 'medium';
+    return 'low';
+  }
+}
+
+// Export singleton for convenience
+export const workflowExecutor = new WorkflowExecutor();
+
+
+    );
+    return regex.test(filePath);
   }
 
   /**

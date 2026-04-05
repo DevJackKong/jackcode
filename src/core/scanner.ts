@@ -1,755 +1,962 @@
 /**
  * Thread 05: Repo Scanner
- * Repository traversal, indexing, language detection, dependency summaries,
- * git metadata extraction, and repository statistics.
+ * Repository scanning and analysis module
+ * 
+ * Provides file system traversal, language detection, dependency analysis,
+ * and Git metadata extraction for comprehensive codebase understanding.
  */
 
 import { createHash } from 'crypto';
-import { readFile, readdir, stat } from 'fs/promises';
-import { basename, extname, join, relative, resolve } from 'path';
-import { execFile } from 'child_process';
-import { promisify } from 'util';
+import { promises as fs, constants } from 'fs';
+import { join, relative, extname, basename, dirname, sep, posix } from 'path';
+import type {
+  ScannerConfig,
+  ScanOptions,
+  FileIndex,
+  FileEntry,
+  DirectoryEntry,
+  LanguageStats,
+  GitInfo,
+  GitFileStatus,
+  Commit,
+  RepoStats,
+  FileStats,
+  FileChange,
+  FileChangeCallback,
+  DependencyInfo,
+  LanguageDetection,
+  ScanResult,
+  ScanError,
+  IgnoreConfig,
+} from '../types/scanner.js';
 
-const execFileAsync = promisify(execFile);
-
-export interface ScannerConfig {
-  rootDir: string;
-  include?: string[];
-  exclude?: string[];
-  ignorePatterns?: string[];
-  respectGitignore?: boolean;
-  followSymlinks?: boolean;
-  maxDepth?: number;
-  maxFileSizeBytes?: number;
-  hashFiles?: boolean;
-  includeGitMetadata?: boolean;
-  commitLimit?: number;
-}
-
-export interface ScanOptions {
-  paths?: string[];
-  refreshGit?: boolean;
-  includeStats?: boolean;
-  includeDependencies?: boolean;
-}
-
-export interface FileStats {
-  totalLines: number;
-  codeLines: number;
-  commentLines: number;
-  blankLines: number;
-}
-
-export interface FileEntry {
-  path: string;
-  absolutePath: string;
-  extension: string;
-  language: string | null;
-  size: number;
-  modifiedAt: number;
-  hash?: string;
-  isBinary: boolean;
-  stats?: FileStats;
-  dependencyManifest?: boolean;
-}
-
-export interface DirectoryEntry {
-  path: string;
-  fileCount: number;
-  directoryCount: number;
-}
-
-export interface LanguageSummary {
-  language: string;
-  fileCount: number;
-  totalLines: number;
-  extensions: string[];
-}
-
-export interface DependencyEntry {
-  name: string;
-  version: string;
-  kind: 'production' | 'development' | 'peer' | 'optional' | 'unknown';
-}
-
-export interface DependencySummary {
-  manifestPath: string;
-  ecosystem: 'npm' | 'python' | 'rust' | 'go' | 'unknown';
-  packages: DependencyEntry[];
-}
-
-export interface GitCommit {
-  hash: string;
-  shortHash: string;
-  author: string;
-  subject: string;
-  timestamp: number;
-}
-
-export interface GitMetadata {
-  rootDir: string;
-  branch: string | null;
-  head: string | null;
-  recentCommits: GitCommit[];
-  branches: string[];
-  isDirty: boolean;
-}
-
-export interface RepoStats {
-  totalFiles: number;
-  totalDirectories: number;
-  totalSize: number;
-  totalLines: number;
-  filesByExtension: Map<string, number>;
-  filesByLanguage: Map<string, number>;
-}
-
-export interface FileIndex {
-  rootDir: string;
-  generatedAt: number;
-  files: Map<string, FileEntry>;
-  directories: Map<string, DirectoryEntry>;
-  languages: Map<string, LanguageSummary>;
-  dependencies: DependencySummary[];
-  stats: RepoStats;
-  git: GitMetadata | null;
-  ignoredPatterns: string[];
-}
-
-export interface RepoScanResult {
-  index: FileIndex;
-  warnings: string[];
-}
-
-export interface IgnoreRuleSet {
-  patterns: string[];
-  sources: Array<'default' | '.gitignore' | 'custom'>;
-}
-
-const DEFAULT_EXCLUDES = ['.git', 'node_modules', 'dist', 'build', 'coverage'];
-
-const LANGUAGE_BY_EXTENSION: Record<string, string> = {
-  '.ts': 'typescript',
-  '.tsx': 'typescript',
-  '.js': 'javascript',
-  '.jsx': 'javascript',
-  '.mjs': 'javascript',
-  '.cjs': 'javascript',
-  '.py': 'python',
-  '.rs': 'rust',
-  '.go': 'go',
-  '.java': 'java',
-  '.kt': 'kotlin',
-  '.swift': 'swift',
-  '.rb': 'ruby',
-  '.php': 'php',
-  '.sh': 'shell',
-  '.bash': 'shell',
-  '.zsh': 'shell',
-  '.json': 'json',
-  '.yaml': 'yaml',
-  '.yml': 'yaml',
-  '.toml': 'toml',
-  '.md': 'markdown',
-  '.css': 'css',
-  '.scss': 'scss',
-  '.html': 'html',
-  '.sql': 'sql',
+// Default configuration values
+const DEFAULT_CONFIG: Partial<ScannerConfig> = {
+  include: ['**/*'],
+  exclude: [],
+  respectGitignore: true,
+  maxFileSize: 10 * 1024 * 1024, // 10MB
+  followSymlinks: false,
+  maxDepth: 50,
 };
 
-const SPECIAL_FILENAMES: Record<string, string> = {
-  Dockerfile: 'dockerfile',
-  Makefile: 'makefile',
-};
+// Language mapping by extension
+const EXTENSION_TO_LANGUAGE: Map<string, string> = new Map([
+  ['ts', 'typescript'], ['tsx', 'typescript'],
+  ['js', 'javascript'], ['jsx', 'javascript'], ['mjs', 'javascript'], ['cjs', 'javascript'],
+  ['py', 'python'],
+  ['rb', 'ruby'],
+  ['go', 'go'],
+  ['rs', 'rust'],
+  ['java', 'java'],
+  ['kt', 'kotlin'],
+  ['swift', 'swift'],
+  ['cpp', 'cpp'], ['cc', 'cpp'], ['cxx', 'cpp'], ['hpp', 'cpp'], ['h', 'c'],
+  ['c', 'c'],
+  ['cs', 'csharp'],
+  ['php', 'php'],
+  ['sh', 'shell'], ['bash', 'shell'], ['zsh', 'shell'],
+  ['ps1', 'powershell'],
+  ['pl', 'perl'], ['pm', 'perl'],
+  ['lua', 'lua'],
+  ['r', 'r'],
+  ['scala', 'scala'], ['sc', 'scala'],
+  ['groovy', 'groovy'],
+  ['dart', 'dart'],
+  ['elm', 'elm'],
+  ['erl', 'erlang'], ['hrl', 'erlang'],
+  ['ex', 'elixir'], ['exs', 'elixir'],
+  ['fs', 'fsharp'], ['fsx', 'fsharp'],
+  ['hs', 'haskell'], ['lhs', 'haskell'],
+  ['jl', 'julia'],
+  ['ml', 'ocaml'], ['mli', 'ocaml'],
+  ['nim', 'nim'],
+  ['cr', 'crystal'],
+  ['clj', 'clojure'], ['cljs', 'clojure'],
+  ['coffee', 'coffeescript'],
+  ['purs', 'purescript'],
+  ['re', 'reason'], ['rei', 'reason'],
+  ['v', 'v'],
+  ['zig', 'zig'],
+  ['md', 'markdown'], ['mdx', 'markdown'],
+  ['json', 'json'], ['jsonc', 'json'],
+  ['yaml', 'yaml'], ['yml', 'yaml'],
+  ['toml', 'toml'],
+  ['xml', 'xml'],
+  ['sql', 'sql'],
+  ['html', 'html'], ['htm', 'html'],
+  ['css', 'css'], ['scss', 'scss'], ['sass', 'sass'], ['less', 'less'],
+  ['vue', 'vue'],
+  ['svelte', 'svelte'],
+  ['astro', 'astro'],
+  ['sol', 'solidity'],
+  ['vy', 'vyper'],
+]);
 
-export function detectLanguage(filePath: string, content?: string): string | null {
-  const name = basename(filePath);
-  if (SPECIAL_FILENAMES[name]) {
-    return SPECIAL_FILENAMES[name];
-  }
-
-  const extension = extname(filePath).toLowerCase();
-  if (extension && LANGUAGE_BY_EXTENSION[extension]) {
-    return LANGUAGE_BY_EXTENSION[extension];
-  }
-
-  if (content) {
-    const firstLine = content.split('\n', 1)[0] ?? '';
-    return detectLanguageFromShebang(firstLine);
-  }
-
-  return null;
+// Language to extensions mapping (computed from above)
+const LANGUAGE_TO_EXTENSIONS: Map<string, string[]> = new Map();
+for (const [ext, lang] of EXTENSION_TO_LANGUAGE) {
+  const exts = LANGUAGE_TO_EXTENSIONS.get(lang) || [];
+  exts.push(ext);
+  LANGUAGE_TO_EXTENSIONS.set(lang, exts);
 }
 
-export function detectLanguageFromShebang(firstLine: string): string | null {
-  if (!firstLine.startsWith('#!')) {
+/**
+ * Language detection utility class
+ */
+export class LanguageDetector {
+  /**
+   * Detect language from file path and optional content
+   */
+  detect(filePath: string, content?: string): LanguageDetection {
+    const ext = extname(filePath).toLowerCase().slice(1);
+    
+    // Try extension-based detection first
+    if (ext) {
+      const lang = EXTENSION_TO_LANGUAGE.get(ext);
+      if (lang) {
+        return { language: lang, confidence: 0.9, method: 'extension' };
+      }
+    }
+    
+    // Try content-based detection if content provided
+    if (content) {
+      const contentLang = this.detectByContent(content);
+      if (contentLang) {
+        return { language: contentLang, confidence: 0.8, method: 'content' };
+      }
+      
+      // Try shebang detection
+      const shebangLang = this.detectByShebang(content);
+      if (shebangLang) {
+        return { language: shebangLang, confidence: 0.85, method: 'shebang' };
+      }
+    }
+    
+    return { language: null, confidence: 0, method: 'none' };
+  }
+  
+  /**
+   * Detect language by file extension only
+   */
+  detectByExtension(extension: string): string | null {
+    const ext = extension.toLowerCase().replace(/^\./, '');
+    return EXTENSION_TO_LANGUAGE.get(ext) || null;
+  }
+  
+  /**
+   * Detect language by content analysis
+   */
+  detectByContent(content: string): string | null {
+    // Simple heuristics for common patterns
+    if (content.includes('<?php')) return 'php';
+    if (content.includes('#!/usr/bin/env python') || content.includes('#!/usr/bin/python')) return 'python';
+    if (content.includes('#!/usr/bin/env ruby') || content.includes('#!/usr/bin/ruby')) return 'ruby';
+    if (content.includes('#!/bin/bash') || content.includes('#!/bin/sh')) return 'shell';
+    if (content.includes('<?xml')) return 'xml';
+    if (content.trimStart().startsWith('{') || content.trimStart().startsWith('[')) {
+      try {
+        JSON.parse(content);
+        return 'json';
+      } catch {
+        // Not valid JSON
+      }
+    }
     return null;
   }
-
-  if (firstLine.includes('python')) return 'python';
-  if (firstLine.includes('node')) return 'javascript';
-  if (firstLine.includes('bash') || firstLine.includes('sh') || firstLine.includes('zsh')) {
-    return 'shell';
+  
+  /**
+   * Detect language from shebang line
+   */
+  private detectByShebang(content: string): string | null {
+    const firstLine = content.split('\n')[0].trim();
+    if (!firstLine.startsWith('#!')) return null;
+    
+    const shebang = firstLine.toLowerCase();
+    if (shebang.includes('python')) return 'python';
+    if (shebang.includes('node')) return 'javascript';
+    if (shebang.includes('ruby')) return 'ruby';
+    if (shebang.includes('bash') || shebang.includes('sh')) return 'shell';
+    if (shebang.includes('perl')) return 'perl';
+    if (shebang.includes('lua')) return 'lua';
+    return null;
   }
-
-  return null;
+  
+  /**
+   * Get all extensions for a language
+   */
+  getExtensions(language: string): string[] {
+    return LANGUAGE_TO_EXTENSIONS.get(language.toLowerCase()) || [];
+  }
+  
+  /**
+   * Check if file is a text file (not binary)
+   */
+  isTextFile(filePath: string, sample?: Buffer): boolean {
+    const binaryExtensions = [
+      'exe', 'dll', 'so', 'dylib', 'bin',
+      'jpg', 'jpeg', 'png', 'gif', 'bmp', 'svg', 'ico', 'webp',
+      'mp3', 'mp4', 'wav', 'ogg', 'webm',
+      'zip', 'tar', 'gz', 'bz2', '7z', 'rar',
+      'pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx',
+      'db', 'sqlite', 'sqlite3',
+      'woff', 'woff2', 'ttf', 'otf', 'eot',
+      'wasm', 'class', 'o', 'a', 'lib',
+    ];
+    
+    const ext = extname(filePath).toLowerCase().slice(1);
+    if (binaryExtensions.includes(ext)) return false;
+    
+    // Check for null bytes in sample
+    if (sample) {
+      for (let i = 0; i < Math.min(sample.length, 8000); i++) {
+        if (sample[i] === 0) return false;
+      }
+    }
+    
+    return true;
+  }
 }
 
-export function isDependencyManifest(filePath: string): boolean {
-  const name = basename(filePath);
-  return [
-    'package.json',
-    'requirements.txt',
-    'Cargo.toml',
-    'go.mod',
-  ].includes(name);
-}
-
-export class RepoScanner {
-  private config: Required<Omit<ScannerConfig, 'include' | 'exclude' | 'ignorePatterns'>> & {
-    include: string[];
-    exclude: string[];
-    ignorePatterns: string[];
+/**
+ * Calculate file statistics (lines, comments, etc.)
+ */
+function calculateFileStats(content: string, language: string | null): FileStats {
+  const lines = content.split('\n');
+  let codeLines = 0;
+  let commentLines = 0;
+  let blankLines = 0;
+  
+  let inBlockComment = false;
+  
+  for (const line of lines) {
+    const trimmed = line.trim();
+    
+    if (trimmed === '') {
+      blankLines++;
+      continue;
+    }
+    
+    // Simple comment detection for common languages
+    const lang = language || '';
+    const isCStyle = ['typescript', 'javascript', 'java', 'c', 'cpp', 'csharp', 'go', 'rust', 'swift', 'kotlin'].includes(lang);
+    const isScript = ['python', 'shell', 'ruby', 'perl', 'yaml'].includes(lang);
+    
+    if (isCStyle) {
+      if (inBlockComment) {
+        commentLines++;
+        if (trimmed.includes('*/')) inBlockComment = false;
+      } else if (trimmed.startsWith('//')) {
+        commentLines++;
+      } else if (trimmed.startsWith('/*')) {
+        commentLines++;
+        if (!trimmed.includes('*/')) inBlockComment = true;
+      } else {
+        codeLines++;
+      }
+    } else if (isScript) {
+      if (trimmed.startsWith('#')) {
+        commentLines++;
+      } else {
+        codeLines++;
+      }
+    } else {
+      codeLines++;
+    }
+  }
+  
+  return {
+    totalLines: lines.length,
+    codeLines,
+    commentLines,
+    blankLines,
   };
+}
 
+/**
+ * Parse .gitignore patterns
+ */
+async function parseGitignore(dirPath: string): Promise<string[]> {
+  const gitignorePath = join(dirPath, '.gitignore');
+  try {
+    const content = await fs.readFile(gitignorePath, 'utf-8');
+    return content
+      .split('\n')
+      .map(line => line.trim())
+      .filter(line => line && !line.startsWith('#'));
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Check if a path matches any pattern in the ignore list
+ */
+function matchesIgnorePatterns(filePath: string, patterns: string[], rootDir: string): boolean {
+  // Simple pattern matching - can be enhanced with minimatch library
+  for (const pattern of patterns) {
+    // Convert gitignore-style patterns to simple checks
+    const normalizedPattern = pattern.replace(/\*/g, '.*').replace(/\?/g, '.');
+    const regex = new RegExp(normalizedPattern);
+    if (regex.test(filePath)) return true;
+    if (filePath.includes(pattern)) return true;
+  }
+  return false;
+}
+
+/**
+ * Main RepoScanner class
+ */
+export class RepoScanner {
+  private config: Required<ScannerConfig>;
   private index: FileIndex | null = null;
+  private languageDetector: LanguageDetector;
+  private ignorePatterns: string[] = [];
+  private watchCallbacks: Set<FileChangeCallback> = new Set();
+  private isWatching = false;
 
   constructor(config: ScannerConfig) {
-    this.config = {
-      rootDir: resolve(config.rootDir),
-      include: config.include ?? [],
-      exclude: config.exclude ?? DEFAULT_EXCLUDES,
-      ignorePatterns: config.ignorePatterns ?? [],
-      respectGitignore: config.respectGitignore ?? true,
-      followSymlinks: config.followSymlinks ?? false,
-      maxDepth: config.maxDepth ?? Number.POSITIVE_INFINITY,
-      maxFileSizeBytes: config.maxFileSizeBytes ?? 1024 * 1024,
-      hashFiles: config.hashFiles ?? false,
-      includeGitMetadata: config.includeGitMetadata ?? true,
-      commitLimit: config.commitLimit ?? 10,
-    };
+    this.config = { ...DEFAULT_CONFIG, ...config } as Required<ScannerConfig>;
+    this.languageDetector = new LanguageDetector();
   }
 
-  async scan(options: ScanOptions = {}): Promise<RepoScanResult> {
-    const warnings: string[] = [];
-    const files = new Map<string, FileEntry>();
-    const directories = new Map<string, DirectoryEntry>();
-    const languages = new Map<string, LanguageSummary>();
-    const dependencies: DependencySummary[] = [];
-    const ignoreRules = await this.loadIgnoreRules();
+  /**
+   * Perform full repository scan
+   */
+  async scan(options: ScanOptions = {}): Promise<ScanResult> {
+    const startTime = Date.now();
+    const errors: ScanError[] = [];
 
-    await this.walk(this.config.rootDir, {
-      depth: 0,
-      files,
-      directories,
-      languages,
-      dependencies,
-      warnings,
-      includeStats: options.includeStats ?? true,
-      includeDependencies: options.includeDependencies ?? true,
-      ignoreRules,
-    });
+    try {
+      // Load ignore patterns if respecting gitignore
+      if (this.config.respectGitignore) {
+        this.ignorePatterns = await parseGitignore(this.config.rootDir);
+      }
+      this.ignorePatterns = [...this.ignorePatterns, ...this.config.exclude];
 
-    const stats = this.buildRepoStats(files, directories);
-    const git = this.config.includeGitMetadata
-      ? await this.safeGetGitMetadata(warnings)
-      : null;
+      // Initialize index
+      const files = new Map<string, FileEntry>();
+      const directories = new Map<string, DirectoryEntry>();
+      const languages = new Map<string, LanguageStats>();
 
-    const index: FileIndex = {
-      rootDir: this.config.rootDir,
-      generatedAt: Date.now(),
-      files,
-      directories,
-      languages,
-      dependencies,
-      stats,
-      git,
-      ignoredPatterns: ignoreRules.patterns,
-    };
+      // Scan directories recursively
+      await this.scanDirectory(
+        this.config.rootDir,
+        '',
+        files,
+        directories,
+        languages,
+        errors,
+        options,
+        0
+      );
 
-    this.index = index;
-    return { index, warnings };
+      // Try to get Git info
+      const gitInfo = await this.getGitInfo();
+
+      this.index = {
+        rootDir: this.config.rootDir,
+        files,
+        directories,
+        languages,
+        generatedAt: Date.now(),
+        gitInfo,
+      };
+
+      return {
+        success: true,
+        index: this.index,
+        filesProcessed: files.size,
+        durationMs: Date.now() - startTime,
+        errors,
+      };
+    } catch (error) {
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : String(error),
+        filesProcessed: 0,
+        durationMs: Date.now() - startTime,
+        errors,
+      };
+    }
   }
 
-  async rescan(paths: string[]): Promise<RepoScanResult> {
-    // Scaffold behavior: full scan fallback.
-    // Future work can replace this with a targeted incremental refresh.
-    void paths;
-    return this.scan();
+  /**
+   * Scan a directory recursively
+   */
+  private async scanDirectory(
+    absolutePath: string,
+    relativePath: string,
+    files: Map<string, FileEntry>,
+    directories: Map<string, DirectoryEntry>,
+    languages: Map<string, LanguageStats>,
+    errors: ScanError[],
+    options: ScanOptions,
+    depth: number
+  ): Promise<void> {
+    if (depth > (this.config.maxDepth || 50)) return;
+
+    // Check if directory should be ignored
+    if (matchesIgnorePatterns(relativePath, this.ignorePatterns, this.config.rootDir)) {
+      return;
+    }
+
+    try {
+      const entries = await fs.readdir(absolutePath, { withFileTypes: true });
+      const filePaths: string[] = [];
+      const subdirs: string[] = [];
+
+      for (const entry of entries) {
+        const entryName = entry.name;
+        const entryRelPath = relativePath ? `${relativePath}/${entryName}` : entryName;
+        const entryAbsPath = join(absolutePath, entryName);
+
+        // Skip hidden files and common non-source directories
+        if (entryName.startsWith('.') && entryName !== '.github' && entryName !== '.vscode') {
+          continue;
+        }
+
+        if (matchesIgnorePatterns(entryRelPath, this.ignorePatterns, this.config.rootDir)) {
+          continue;
+        }
+
+        if (entry.isDirectory()) {
+          if (this.config.followSymlinks || !entry.isSymbolicLink()) {
+            subdirs.push(entryRelPath);
+            await this.scanDirectory(
+              entryAbsPath,
+              entryRelPath,
+              files,
+              directories,
+              languages,
+              errors,
+              options,
+              depth + 1
+            );
+          }
+        } else if (entry.isFile()) {
+          if (!this.config.followSymlinks && entry.isSymbolicLink()) {
+            continue;
+          }
+          filePaths.push(entryRelPath);
+          await this.processFile(
+            entryAbsPath,
+            entryRelPath,
+            files,
+            languages,
+            errors,
+            options
+          );
+        }
+      }
+
+      // Calculate directory size
+      let dirSize = 0;
+      for (const filePath of filePaths) {
+        const file = files.get(filePath);
+        if (file) dirSize += file.size;
+      }
+
+      // Store directory entry
+      const stats = await fs.stat(absolutePath);
+      directories.set(relativePath, {
+        path: relativePath,
+        absolutePath,
+        files: filePaths,
+        subdirectories: subdirs,
+        size: dirSize,
+        modifiedAt: stats.mtimeMs,
+      });
+    } catch (error) {
+      errors.push({
+        path: relativePath,
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
   }
 
+  /**
+   * Process a single file
+   */
+  private async processFile(
+    absolutePath: string,
+    relativePath: string,
+    files: Map<string, FileEntry>,
+    languages: Map<string, LanguageStats>,
+    errors: ScanError[],
+    options: ScanOptions
+  ): Promise<void> {
+    try {
+      const stats = await fs.stat(absolutePath);
+      
+      // Skip files larger than max size
+      if (this.config.maxFileSize && stats.size > this.config.maxFileSize) {
+        return;
+      }
+
+      // Read file content for analysis
+      const content = await fs.readFile(absolutePath, 'utf-8');
+      const contentHash = createHash('sha256').update(content).digest('hex');
+
+      // Detect language
+      const detection = this.languageDetector.detect(absolutePath, content);
+      const language = detection.language;
+
+      // Calculate file stats
+      const fileStats = calculateFileStats(content, language);
+
+      const fileEntry: FileEntry = {
+        path: relativePath,
+        absolutePath,
+        name: basename(relativePath),
+        extension: extname(relativePath).toLowerCase().slice(1),
+        language,
+        size: stats.size,
+        modifiedAt: stats.mtimeMs,
+        createdAt: stats.ctimeMs,
+        contentHash,
+        lines: fileStats.totalLines,
+        stats: fileStats,
+      };
+
+      files.set(relativePath, fileEntry);
+
+      // Update language stats
+      if (language) {
+        const langStats = languages.get(language) || {
+          language,
+          fileCount: 0,
+          totalLines: 0,
+          codeLines: 0,
+          commentLines: 0,
+          blankLines: 0,
+          extensions: this.languageDetector.getExtensions(language),
+          totalSize: 0,
+        };
+        langStats.fileCount++;
+        langStats.totalLines += fileStats.totalLines;
+        langStats.codeLines += fileStats.codeLines;
+        langStats.commentLines += fileStats.commentLines;
+        langStats.blankLines += fileStats.blankLines;
+        langStats.totalSize += stats.size;
+        languages.set(language, langStats);
+      }
+    } catch (error) {
+      errors.push({
+        path: relativePath,
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  /**
+   * Get Git repository information
+   */
+  private async getGitInfo(): Promise<GitInfo | undefined> {
+    try {
+      // Check for .git directory
+      const gitPath = join(this.config.rootDir, '.git');
+      await fs.access(gitPath, constants.R_OK);
+
+      // TODO: Integrate with simple-git for full Git operations
+      // For now, return basic info
+      return {
+        isRepo: true,
+        rootPath: this.config.rootDir,
+        currentBranch: 'main', // Placeholder
+        untrackedFiles: [],
+        modifiedFiles: [],
+        stagedFiles: [],
+        conflictFiles: [],
+      };
+    } catch {
+      return {
+        isRepo: false,
+        currentBranch: '',
+        untrackedFiles: [],
+        modifiedFiles: [],
+        stagedFiles: [],
+        conflictFiles: [],
+      };
+    }
+  }
+
+  /**
+   * Get current file index
+   */
   getIndex(): FileIndex | null {
     return this.index;
   }
 
+  /**
+   * Get a file entry by path
+   */
   getFile(path: string): FileEntry | undefined {
-    return this.index?.files.get(path);
+    if (!this.index) return undefined;
+    return this.index.files.get(path);
   }
 
+  /**
+   * Get all files for a specific language
+   */
   getFilesByLanguage(language: string): FileEntry[] {
     if (!this.index) return [];
-    return Array.from(this.index.files.values()).filter((file) => file.language === language);
+    return Array.from(this.index.files.values()).filter(
+      (f) => f.language === language.toLowerCase()
+    );
   }
 
-  getDependencySummaries(): DependencySummary[] {
-    return this.index?.dependencies ?? [];
+  /**
+   * Search files by pattern (simple substring match)
+   */
+  searchFiles(pattern: string): FileEntry[] {
+    if (!this.index) return [];
+    const lowerPattern = pattern.toLowerCase();
+    return Array.from(this.index.files.values()).filter(
+      (f) =>
+        f.path.toLowerCase().includes(lowerPattern) ||
+        f.name.toLowerCase().includes(lowerPattern)
+    );
   }
 
-  getStats(): RepoStats | null {
-    return this.index?.stats ?? null;
-  }
-
-  async getGitMetadata(): Promise<GitMetadata | null> {
-    const warnings: string[] = [];
-    return this.safeGetGitMetadata(warnings);
-  }
-
-  private async walk(
-    currentDir: string,
-    context: {
-      depth: number;
-      files: Map<string, FileEntry>;
-      directories: Map<string, DirectoryEntry>;
-      languages: Map<string, LanguageSummary>;
-      dependencies: DependencySummary[];
-      warnings: string[];
-      includeStats: boolean;
-      includeDependencies: boolean;
-      ignoreRules: IgnoreRuleSet;
-    }
-  ): Promise<void> {
-    if (context.depth > this.config.maxDepth) {
-      return;
-    }
-
-    const relativeDir = this.toRelativePath(currentDir);
-    if (relativeDir && this.shouldIgnore(relativeDir, true, context.ignoreRules)) {
-      return;
+  /**
+   * Get repository statistics
+   */
+  getStats(): RepoStats {
+    if (!this.index) {
+      return {
+        totalFiles: 0,
+        totalDirectories: 0,
+        totalSize: 0,
+        totalLines: 0,
+        languages: [],
+        byExtension: new Map(),
+      };
     }
 
-    const entries = await readdir(currentDir, { withFileTypes: true });
-    let fileCount = 0;
-    let directoryCount = 0;
-
-    for (const entry of entries) {
-      const absolutePath = join(currentDir, entry.name);
-      const relativePath = this.toRelativePath(absolutePath);
-
-      if (this.shouldIgnore(relativePath, entry.isDirectory(), context.ignoreRules)) {
-        continue;
-      }
-
-      if (entry.isDirectory()) {
-        directoryCount += 1;
-        await this.walk(absolutePath, {
-          ...context,
-          depth: context.depth + 1,
-        });
-        continue;
-      }
-
-      if (!entry.isFile()) {
-        continue;
-      }
-
-      fileCount += 1;
-      const fileEntry = await this.indexFile(absolutePath, relativePath, {
-        includeStats: context.includeStats,
-      });
-
-      context.files.set(relativePath, fileEntry);
-      this.updateLanguageSummary(context.languages, fileEntry);
-
-      if (context.includeDependencies && fileEntry.dependencyManifest) {
-        const dependencySummary = await this.parseDependencyManifest(absolutePath, relativePath);
-        if (dependencySummary) {
-          context.dependencies.push(dependencySummary);
-        }
-      }
+    const byExtension = new Map<string, number>();
+    for (const file of this.index.files.values()) {
+      const count = byExtension.get(file.extension) || 0;
+      byExtension.set(file.extension, count + 1);
     }
-
-    context.directories.set(relativeDir || '.', {
-      path: relativeDir || '.',
-      fileCount,
-      directoryCount,
-    });
-  }
-
-  private async indexFile(
-    absolutePath: string,
-    relativePath: string,
-    options: { includeStats: boolean }
-  ): Promise<FileEntry> {
-    const fileStat = await stat(absolutePath);
-    const extension = extname(relativePath).toLowerCase();
-    const size = fileStat.size;
-    const shouldReadContent = size <= this.config.maxFileSizeBytes;
-    const buffer = shouldReadContent ? await readFile(absolutePath) : null;
-    const content = buffer ? buffer.toString('utf8') : undefined;
-    const language = detectLanguage(relativePath, content);
-    const isBinary = buffer ? buffer.includes(0) : false;
-    const stats = !isBinary && options.includeStats && content
-      ? this.computeFileStats(content, language)
-      : undefined;
 
     return {
-      path: relativePath,
-      absolutePath,
-      extension,
-      language,
-      size,
-      modifiedAt: fileStat.mtimeMs,
-      hash: this.config.hashFiles && buffer ? createHash('sha1').update(buffer).digest('hex') : undefined,
-      isBinary,
-      stats,
-      dependencyManifest: isDependencyManifest(relativePath),
+      totalFiles: this.index.files.size,
+      totalDirectories: this.index.directories.size,
+      totalSize: Array.from(this.index.files.values()).reduce((sum, f) => sum + f.size, 0),
+      totalLines: Array.from(this.index.languages.values()).reduce(
+        (sum, l) => sum + l.totalLines,
+        0
+      ),
+      languages: Array.from(this.index.languages.values()),
+      byExtension,
     };
   }
 
-  private computeFileStats(content: string, language: string | null): FileStats {
-    const lines = content.split(/\r?\n/);
-    let blankLines = 0;
-    let commentLines = 0;
-    let codeLines = 0;
+  /**
+   * Get Git info (requires prior scan)
+   */
+  getGitInfoFromIndex(): GitInfo | undefined {
+    return this.index?.gitInfo;
+  }
+
+  /**
+   * Get recent commits for a file or all files
+   * TODO: Integrate with simple-git for full implementation
+   */
+  getRecentCommits(filePath?: string, limit = 10): Commit[] {
+    // Placeholder - implement with simple-git
+    return [];
+  }
+
+  /**
+   * Start watching for file changes
+   * TODO: Implement with fs.watch or chokidar
+   */
+  async watch(callback: FileChangeCallback): Promise<void> {
+    this.watchCallbacks.add(callback);
+    this.isWatching = true;
+    // TODO: Implement actual file watching
+  }
+
+  /**
+   * Stop watching for file changes
+   */
+  stopWatching(): void {
+    this.isWatching = false;
+    this.watchCallbacks.clear();
+  }
+
+  /**
+   * Perform incremental scan for changed files
+   */
+  async scanIncremental(changes: FileChange[]): Promise<FileIndex | null> {
+    if (!this.index) return null;
+
+    for (const change of changes) {
+      const absPath = join(this.config.rootDir, change.path);
+
+      if (change.type === 'deleted') {
+        this.index.files.delete(change.path);
+      } else {
+        // Re-scan the file
+        const errors: ScanError[] = [];
+        await this.processFile(
+          absPath,
+          change.path,
+          this.index.files,
+          this.index.languages,
+          errors,
+          {}
+        );
+      }
+    }
+
+    this.index.generatedAt = Date.now();
+    return this.index;
+  }
+
+  /**
+   * Force refresh the index
+   */
+  async refresh(): Promise<ScanResult> {
+    return this.scan({ force: true });
+  }
+}
+
+/**
+ * Dependency parser for various package managers
+ */
+export class DependencyParser {
+  /**
+   * Parse dependency file and extract dependencies
+   */
+  async parse(filePath: string): Promise<DependencyInfo[]> {
+    const ext = extname(filePath).toLowerCase();
+    const name = basename(filePath).toLowerCase();
+
+    try {
+      const content = await fs.readFile(filePath, 'utf-8');
+
+      if (name === 'package.json') {
+        return this.parsePackageJson(content, filePath);
+      }
+      if (name === 'cargo.toml') {
+        return this.parseCargoToml(content, filePath);
+      }
+      if (name === 'requirements.txt') {
+        return this.parseRequirementsTxt(content, filePath);
+      }
+      if (name === 'go.mod') {
+        return this.parseGoMod(content, filePath);
+      }
+      if (name === 'gemfile') {
+        return this.parseGemfile(content, filePath);
+      }
+
+      return [];
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Parse package.json dependencies
+   */
+  parsePackageJson(content: string, source: string): DependencyInfo[] {
+    const deps: DependencyInfo[] = [];
+    try {
+      const pkg = JSON.parse(content);
+
+      const addDeps = (obj: Record<string, string> | undefined, type: DependencyInfo['type']) => {
+        if (!obj) return;
+        for (const [name, version] of Object.entries(obj)) {
+          deps.push({ name, version, type, source });
+        }
+      };
+
+      addDeps(pkg.dependencies, 'production');
+      addDeps(pkg.devDependencies, 'development');
+      addDeps(pkg.peerDependencies, 'peer');
+      addDeps(pkg.optionalDependencies, 'optional');
+    } catch {
+      // Invalid JSON
+    }
+    return deps;
+  }
+
+  /**
+   * Parse Cargo.toml dependencies
+   */
+  parseCargoToml(content: string, source: string): DependencyInfo[] {
+    const deps: DependencyInfo[] = [];
+    // Simple line-based parsing for now
+    const lines = content.split('\n');
+    let inDepsSection = false;
 
     for (const line of lines) {
       const trimmed = line.trim();
-      if (!trimmed) {
-        blankLines += 1;
+      if (trimmed === '[dependencies]') {
+        inDepsSection = true;
         continue;
       }
-
-      if (this.isCommentLine(trimmed, language)) {
-        commentLines += 1;
+      if (trimmed.startsWith('[') && trimmed.endsWith(']')) {
+        inDepsSection = false;
         continue;
       }
-
-      codeLines += 1;
-    }
-
-    return {
-      totalLines: lines.length,
-      codeLines,
-      commentLines,
-      blankLines,
-    };
-  }
-
-  private isCommentLine(line: string, language: string | null): boolean {
-    if (line.startsWith('//') || line.startsWith('#') || line.startsWith('/*') || line.startsWith('*')) {
-      return true;
-    }
-
-    if (language === 'html' && line.startsWith('<!--')) {
-      return true;
-    }
-
-    return false;
-  }
-
-  private updateLanguageSummary(
-    languages: Map<string, LanguageSummary>,
-    file: FileEntry
-  ): void {
-    const language = file.language ?? 'unknown';
-    const existing = languages.get(language);
-    const totalLines = file.stats?.totalLines ?? 0;
-    const extension = file.extension || '<none>';
-
-    if (existing) {
-      existing.fileCount += 1;
-      existing.totalLines += totalLines;
-      if (!existing.extensions.includes(extension)) {
-        existing.extensions.push(extension);
-      }
-      return;
-    }
-
-    languages.set(language, {
-      language,
-      fileCount: 1,
-      totalLines,
-      extensions: [extension],
-    });
-  }
-
-  private buildRepoStats(
-    files: Map<string, FileEntry>,
-    directories: Map<string, DirectoryEntry>
-  ): RepoStats {
-    const filesByExtension = new Map<string, number>();
-    const filesByLanguage = new Map<string, number>();
-    let totalSize = 0;
-    let totalLines = 0;
-
-    for (const file of files.values()) {
-      totalSize += file.size;
-      totalLines += file.stats?.totalLines ?? 0;
-
-      const extension = file.extension || '<none>';
-      filesByExtension.set(extension, (filesByExtension.get(extension) ?? 0) + 1);
-
-      const language = file.language ?? 'unknown';
-      filesByLanguage.set(language, (filesByLanguage.get(language) ?? 0) + 1);
-    }
-
-    return {
-      totalFiles: files.size,
-      totalDirectories: directories.size,
-      totalSize,
-      totalLines,
-      filesByExtension,
-      filesByLanguage,
-    };
-  }
-
-  private async loadIgnoreRules(): Promise<IgnoreRuleSet> {
-    const patterns = [...DEFAULT_EXCLUDES, ...this.config.exclude, ...this.config.ignorePatterns];
-    const sources: Array<'default' | '.gitignore' | 'custom'> = [
-      ...DEFAULT_EXCLUDES.map(() => 'default' as const),
-      ...this.config.exclude.map(() => 'custom' as const),
-      ...this.config.ignorePatterns.map(() => 'custom' as const),
-    ];
-
-    if (this.config.respectGitignore) {
-      try {
-        const gitignorePath = join(this.config.rootDir, '.gitignore');
-        const gitignore = await readFile(gitignorePath, 'utf8');
-        for (const rawLine of gitignore.split(/\r?\n/)) {
-          const line = rawLine.trim();
-          if (!line || line.startsWith('#')) {
-            continue;
-          }
-          patterns.push(line);
-          sources.push('.gitignore');
+      if (inDepsSection && trimmed) {
+        const match = trimmed.match(/^([\w\-]+)\s*=\s*["']([^"']+)["']/);
+        if (match) {
+          deps.push({
+            name: match[1],
+            version: match[2],
+            type: 'production',
+            source,
+          });
         }
-      } catch {
-        // Optional file. Ignore read errors in scaffold implementation.
       }
     }
 
-    return { patterns, sources };
+    return deps;
   }
 
-  private shouldIgnore(path: string, isDirectory: boolean, rules: IgnoreRuleSet): boolean {
-    const normalized = path.replaceAll('\\', '/');
-    for (const pattern of rules.patterns) {
-      const candidate = pattern.replace(/\/$/, '');
-      if (!candidate) continue;
+  /**
+   * Parse requirements.txt dependencies
+   */
+  parseRequirementsTxt(content: string, source: string): DependencyInfo[] {
+    const deps: DependencyInfo[] = [];
+    const lines = content.split('\n');
 
-      if (normalized === candidate || normalized.startsWith(`${candidate}/`)) {
-        return true;
-      }
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('#') || trimmed.startsWith('-')) continue;
 
-      if (isDirectory && basename(normalized) === candidate) {
-        return true;
-      }
-    }
-    return false;
-  }
-
-  private async parseDependencyManifest(
-    absolutePath: string,
-    relativePath: string
-  ): Promise<DependencySummary | null> {
-    const name = basename(relativePath);
-    const content = await readFile(absolutePath, 'utf8');
-
-    switch (name) {
-      case 'package.json':
-        return this.parsePackageJson(relativePath, content);
-      case 'requirements.txt':
-        return this.parseRequirementsTxt(relativePath, content);
-      case 'Cargo.toml':
-        return this.parseCargoToml(relativePath, content);
-      case 'go.mod':
-        return this.parseGoMod(relativePath, content);
-      default:
-        return null;
-    }
-  }
-
-  private parsePackageJson(manifestPath: string, content: string): DependencySummary | null {
-    const parsed = JSON.parse(content) as {
-      dependencies?: Record<string, string>;
-      devDependencies?: Record<string, string>;
-      peerDependencies?: Record<string, string>;
-      optionalDependencies?: Record<string, string>;
-    };
-
-    const packages: DependencyEntry[] = [];
-    const pushEntries = (deps: Record<string, string> | undefined, kind: DependencyEntry['kind']) => {
-      if (!deps) return;
-      for (const [name, version] of Object.entries(deps)) {
-        packages.push({ name, version, kind });
-      }
-    };
-
-    pushEntries(parsed.dependencies, 'production');
-    pushEntries(parsed.devDependencies, 'development');
-    pushEntries(parsed.peerDependencies, 'peer');
-    pushEntries(parsed.optionalDependencies, 'optional');
-
-    return {
-      manifestPath,
-      ecosystem: 'npm',
-      packages,
-    };
-  }
-
-  private parseRequirementsTxt(manifestPath: string, content: string): DependencySummary {
-    const packages: DependencyEntry[] = content
-      .split(/\r?\n/)
-      .map((line) => line.trim())
-      .filter((line) => line && !line.startsWith('#'))
-      .map((line) => {
-        const [name, version = ''] = line.split(/==|>=|<=|~=|!=/);
-        return {
-          name: name.trim(),
-          version: version.trim(),
-          kind: 'production' as const,
-        };
-      });
-
-    return {
-      manifestPath,
-      ecosystem: 'python',
-      packages,
-    };
-  }
-
-  private parseCargoToml(manifestPath: string, content: string): DependencySummary {
-    const packages: DependencyEntry[] = [];
-    let inDependencies = false;
-    let inDevDependencies = false;
-
-    for (const rawLine of content.split(/\r?\n/)) {
-      const line = rawLine.trim();
-      if (!line || line.startsWith('#')) continue;
-      if (line === '[dependencies]') {
-        inDependencies = true;
-        inDevDependencies = false;
-        continue;
-      }
-      if (line === '[dev-dependencies]') {
-        inDependencies = false;
-        inDevDependencies = true;
-        continue;
-      }
-      if (line.startsWith('[')) {
-        inDependencies = false;
-        inDevDependencies = false;
-        continue;
-      }
-      if (!inDependencies && !inDevDependencies) continue;
-
-      const [name, version = ''] = line.split('=');
-      packages.push({
-        name: name.trim(),
-        version: version.trim().replaceAll('"', ''),
-        kind: inDevDependencies ? 'development' : 'production',
-      });
-    }
-
-    return {
-      manifestPath,
-      ecosystem: 'rust',
-      packages,
-    };
-  }
-
-  private parseGoMod(manifestPath: string, content: string): DependencySummary {
-    const packages: DependencyEntry[] = [];
-    let inRequireBlock = false;
-
-    for (const rawLine of content.split(/\r?\n/)) {
-      const line = rawLine.trim();
-      if (!line || line.startsWith('//')) continue;
-      if (line === 'require (') {
-        inRequireBlock = true;
-        continue;
-      }
-      if (inRequireBlock && line === ')') {
-        inRequireBlock = false;
-        continue;
-      }
-      if (line.startsWith('require ')) {
-        const [, name, version = ''] = line.split(/\s+/);
-        packages.push({ name, version, kind: 'production' });
-        continue;
-      }
-      if (inRequireBlock) {
-        const [name, version = ''] = line.split(/\s+/);
-        packages.push({ name, version, kind: 'production' });
+      // Parse package==version, package>=version, package~=version, etc.
+      const match = trimmed.match(/^([\w\-]+)\s*[=<>~!]+\s*([^\s;]+)/);
+      if (match) {
+        deps.push({
+          name: match[1],
+          version: match[2],
+          type: 'production',
+          source,
+        });
+      } else {
+        // Package without version specifier
+        const simpleMatch = trimmed.match(/^(\w[\w\-]*)/);
+        if (simpleMatch) {
+          deps.push({
+            name: simpleMatch[1],
+            version: '*',
+            type: 'production',
+            source,
+          });
+        }
       }
     }
 
-    return {
-      manifestPath,
-      ecosystem: 'go',
-      packages,
-    };
+    return deps;
   }
 
-  private async safeGetGitMetadata(warnings: string[]): Promise<GitMetadata | null> {
-    try {
-      return await this.readGitMetadata();
-    } catch (error) {
-      warnings.push(
-        `Git metadata unavailable: ${error instanceof Error ? error.message : String(error)}`
-      );
-      return null;
+  /**
+   * Parse go.mod dependencies
+   */
+  parseGoMod(content: string, source: string): DependencyInfo[] {
+    const deps: DependencyInfo[] = [];
+    const lines = content.split('\n');
+    let inRequire = false;
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (trimmed.startsWith('require (')) {
+        inRequire = true;
+        continue;
+      }
+      if (inRequire && trimmed === ')') {
+        inRequire = false;
+        continue;
+      }
+      if (inRequire || trimmed.startsWith('require ')) {
+        const match = trimmed.match(/require\s+(\S+)\s+(\S+)/);
+        if (match) {
+          deps.push({
+            name: match[1],
+            version: match[2],
+            type: 'production',
+            source,
+          });
+        }
+      }
     }
+
+    return deps;
   }
 
-  private async readGitMetadata(): Promise<GitMetadata | null> {
-    const rootDir = this.config.rootDir;
-    const branch = await this.git(['branch', '--show-current']);
-    const head = await this.git(['rev-parse', 'HEAD']);
-    const branchesOutput = await this.git(['branch', '--format=%(refname:short)']);
-    const statusOutput = await this.git(['status', '--porcelain']);
-    const recentOutput = await this.git([
-      'log',
-      `--max-count=${this.config.commitLimit}`,
-      '--pretty=format:%H%x09%h%x09%an%x09%s%x09%ct',
-    ]);
+  /**
+   * Parse Gemfile dependencies
+   */
+  parseGemfile(content: string, source: string): DependencyInfo[] {
+    const deps: DependencyInfo[] = [];
+    const lines = content.split('\n');
 
-    const recentCommits: GitCommit[] = recentOutput
-      .split(/\r?\n/)
-      .filter(Boolean)
-      .map((line) => {
-        const [hash, shortHash, author, subject, timestamp] = line.split('\t');
-        return {
-          hash,
-          shortHash,
-          author,
-          subject,
-          timestamp: Number(timestamp) * 1000,
-        };
-      });
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('#')) continue;
 
-    return {
-      rootDir,
-      branch: branch || null,
-      head: head || null,
-      recentCommits,
-      branches: branchesOutput.split(/\r?\n/).filter(Boolean),
-      isDirty: statusOutput.trim().length > 0,
-    };
-  }
+      // Match gem "name", "version" or gem 'name', 'version'
+      const match = trimmed.match(/gem\s+["']([^"']+)["']\s*(?:,\s*["']([^"']+)["'])?/);
+      if (match) {
+        deps.push({
+          name: match[1],
+          version: match[2] || '*',
+          type: 'production',
+          source,
+        });
+      }
+    }
 
-  private async git(args: string[]): Promise<string> {
-    const { stdout } = await execFileAsync('git', args, {
-      cwd: this.config.rootDir,
-    });
-    return stdout.trim();
-  }
-
-  private toRelativePath(absolutePath: string): string {
-    return relative(this.config.rootDir, absolutePath).replaceAll('\\', '/');
+    return deps;
   }
 }
 
+/**
+ * Create a new RepoScanner instance
+ */
 export function createRepoScanner(config: ScannerConfig): RepoScanner {
   return new RepoScanner(config);
 }
+
+/**
+ * Quick scan utility function
+ */
+export async function scanRepo(
+  rootDir: string,
+  options?: Partial<ScannerConfig>
+): Promise<ScanResult> {
+  const scanner = new RepoScanner({
+    rootDir,
+    ...options,
+  });
+  return scanner.scan();
+}
+
+// Re-export types
+export type {
+  ScannerConfig,
+  ScanOptions,
+  FileIndex,
+  FileEntry,
+  DirectoryEntry,
+  LanguageStats,
+  GitInfo,
+  GitFileStatus,
+  Commit,
+  RepoStats,
+  FileStats,
+  FileChange,
+  FileChangeCallback,
+  DependencyInfo,
+  LanguageDetection,
+  ScanResult,
+  ScanError,
+  IgnoreConfig,
+};
