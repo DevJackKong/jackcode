@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { GPT54VerifierRepairer, RetryManager, RecoveryEngine } from './repairer.ts';
+import { GPT54VerifierRepairer } from './repairer.ts';
+import { RetryManager, RecoveryEngine } from './recovery.ts';
 import type { ReviewContext } from '../types/reviewer.ts';
 import type { Patch } from '../types/patch.ts';
 
