@@ -15,6 +15,12 @@ export type ImpactSeverity = 'critical' | 'high' | 'medium' | 'low' | 'none';
 /** Categories of impacted code */
 export type ImpactCategory = 'direct' | 'transitive' | 'test' | 'type-only' | 'dynamic';
 
+/** Test execution priority */
+export type TestPriority = 'critical' | 'high' | 'normal';
+
+/** Estimated blast radius scope */
+export type ImpactScope = 'unit' | 'integration' | 'e2e';
+
 /**
  * Describes a single code change
  */
@@ -51,6 +57,12 @@ export interface ImpactedFile {
   distance: number;
   /** Specific symbols affected within this file */
   affectedSymbols?: string[];
+  /** Estimated verification scope required for this file */
+  scope?: ImpactScope;
+  /** Whether this file sits on a critical path */
+  criticalPath?: boolean;
+  /** Per-file risk score */
+  riskScore?: number;
 }
 
 /**
@@ -62,9 +74,48 @@ export interface AffectedTest {
   /** Source files this test covers */
   coversFiles: string[];
   /** Priority for test execution */
-  priority: 'critical' | 'high' | 'normal';
+  priority: TestPriority;
   /** Estimated scope of the test */
-  scope: 'unit' | 'integration' | 'e2e';
+  scope: ImpactScope;
+  /** Score used for ordering */
+  estimatedImpact?: number;
+  /** Why this test was selected */
+  reasons?: string[];
+}
+
+export interface SymbolUsageReference {
+  filePath: string;
+  distance: number;
+  importedAs?: string;
+  importKind?: SymbolImport['kind'];
+  isTypeOnly?: boolean;
+}
+
+export interface SymbolImpact {
+  symbolName: string;
+  exportedFrom: string;
+  references: SymbolUsageReference[];
+  rippleFiles: string[];
+  directReferenceCount: number;
+  transitiveReferenceCount: number;
+  isBreakingChange: boolean;
+  compatibility: 'backward-compatible' | 'potentially-breaking' | 'breaking';
+  reasons: string[];
+}
+
+export interface TestSelection {
+  minimal: AffectedTest[];
+  recommended: AffectedTest[];
+  byScope: Record<ImpactScope, AffectedTest[]>;
+}
+
+export interface RiskAssessment {
+  level: 'low' | 'medium' | 'high';
+  score: number;
+  complexityScore: number;
+  criticalPaths: string[];
+  highRiskFiles: Array<{ path: string; score: number; reasons: string[] }>;
+  mitigationSuggestions: string[];
 }
 
 /**
@@ -86,11 +137,20 @@ export interface ImpactReport {
     transitiveImpacts: number;
     testFilesImpacted: number;
     maxDistance: number;
+    scope: ImpactScope;
+    severity: ImpactSeverity;
+    breakingChanges: number;
   };
   /** Estimated risk level */
   riskLevel: 'low' | 'medium' | 'high';
   /** Recommendations based on impact */
   recommendations: string[];
+  /** Symbol-level usage and ripple information */
+  symbolImpacts: SymbolImpact[];
+  /** Structured test selection output */
+  testSelection: TestSelection;
+  /** Structured risk assessment output */
+  riskAssessment: RiskAssessment;
 }
 
 /**
@@ -155,6 +215,8 @@ export interface ImpactAnalyzerOptions {
   excludePatterns: string[];
   /** Test file patterns */
   testPatterns: string[];
+  /** Repository root for relative path normalization */
+  rootDir?: string;
 }
 
 /**
@@ -165,7 +227,8 @@ export const DEFAULT_ANALYZER_OPTIONS: ImpactAnalyzerOptions = {
   includeTests: true,
   includeTypeDependencies: true,
   excludePatterns: ['node_modules/**', 'dist/**', 'build/**', '.git/**'],
-  testPatterns: ['**/*.test.ts', '**/*.spec.ts', '**/__tests__/**'],
+  testPatterns: ['**/*.test.ts', '**/*.spec.ts', '**/__tests__/**', '**/*.test.js', '**/*.spec.js'],
+  rootDir: process.cwd(),
 };
 
 /**
