@@ -21,6 +21,11 @@ export type TaskType =
   | 'batch_operation'
   | string;
 
+export type BudgetWindow = 'session' | 'day' | 'week' | 'month' | 'task';
+export type OptimizationAction = 'cache_reuse' | 'batching' | 'early_termination' | 'compressed_context';
+export type AlertSeverity = 'info' | 'warning' | 'critical';
+export type PolicyDecisionMode = 'normal' | 'forced' | 'overridden' | 'downgraded' | 'blocked';
+
 /** Core model policy configuration */
 export interface ModelPolicy {
   /** Default model when no rules match */
@@ -36,6 +41,8 @@ export interface ModelPolicy {
     perTask: number;
     perSession: number;
     perDay: number;
+    perWeek: number;
+    perMonth: number;
   };
   /** Model escalation chain (cheapest to most expensive) */
   escalationChain: ModelTier[];
@@ -52,6 +59,14 @@ export interface PolicyConfig {
   warningThresholds: {
     session: number;
     daily: number;
+    weekly: number;
+    monthly: number;
+  };
+  optimization: {
+    cacheReuseThresholdTokens: number;
+    batchMinItems: number;
+    earlyTerminationTokenRatio: number;
+    compressionRatio: number;
   };
 }
 
@@ -68,6 +83,8 @@ export const DEFAULT_POLICY_CONFIG: PolicyConfig = {
       perTask: 0.5,
       perSession: 5.0,
       perDay: 20.0,
+      perWeek: 100.0,
+      perMonth: 350.0,
     },
     escalationChain: ['qwen', 'deepseek', 'gpt54'],
   },
@@ -76,6 +93,14 @@ export const DEFAULT_POLICY_CONFIG: PolicyConfig = {
   warningThresholds: {
     session: 0.7,
     daily: 0.8,
+    weekly: 0.85,
+    monthly: 0.9,
+  },
+  optimization: {
+    cacheReuseThresholdTokens: 4000,
+    batchMinItems: 3,
+    earlyTerminationTokenRatio: 0.35,
+    compressionRatio: 0.75,
   },
 };
 
@@ -104,6 +129,20 @@ export interface TaskContext {
   failureCount?: number;
   /** Urgency level */
   urgency?: 'low' | 'normal' | 'high' | 'critical';
+  /** Optional existing session id */
+  sessionId?: string;
+  /** Optional task-specific budget override */
+  maxCostUsd?: number;
+  /** Hint that similar tasks are batchable */
+  batchable?: boolean;
+  /** Approximate count of similar tasks in the batch */
+  batchSize?: number;
+  /** Prefer using cached outputs if possible */
+  preferCached?: boolean;
+  /** Optional model override request */
+  overrideModel?: ModelTier;
+  /** Extra metadata for custom policy rules */
+  metadata?: Record<string, unknown>;
 }
 
 /** Routing decision output */
@@ -118,6 +157,15 @@ export interface RoutingDecision {
   estimatedTokens: number;
   /** Whether fallback is allowed on failure */
   fallbackOnFailure: boolean;
+  mode?: PolicyDecisionMode;
+  appliedRules?: string[];
+  appliedOptimizations?: OptimizationAction[];
+  alerts?: PolicyAlert[];
+  budgetStatus?: BudgetStatus;
+  overrideApplied?: boolean;
+  cacheHit?: boolean;
+  batched?: boolean;
+  earlyTerminationSuggested?: boolean;
 }
 
 /** Cost tracking state */
@@ -126,7 +174,12 @@ export interface CostTracker {
   taskCosts: Map<string, TaskCost>;
   sessionTotal: number;
   dailyTotal: number;
+  weeklyTotal: number;
+  monthlyTotal: number;
   lastReset: number;
+  lastDailyReset: number;
+  lastWeeklyReset: number;
+  lastMonthlyReset: number;
 }
 
 /** Individual task cost record */
@@ -136,6 +189,12 @@ export interface TaskCost {
   outputTokens: number;
   costUsd: number;
   latencyMs: number;
+  taskType?: TaskType;
+  sessionId?: string;
+  timestamp?: number;
+  cached?: boolean;
+  batched?: boolean;
+  earlyTerminated?: boolean;
 }
 
 /** Token usage report */
@@ -144,12 +203,18 @@ export interface TokenUsage {
   inputTokens: number;
   outputTokens: number;
   latencyMs: number;
+  cached?: boolean;
+  sessionId?: string;
+  taskType?: TaskType;
+  terminatedEarly?: boolean;
 }
 
 /** Budget check result */
 export interface BudgetStatus {
   allowed: boolean;
   reason: string;
+  violatedWindow?: BudgetWindow;
+  projectedSpend?: number;
 }
 
 /** Budget allocation response */
@@ -159,6 +224,7 @@ export interface BudgetAllocation {
   taskType: TaskType;
   approved: boolean;
   reason: string;
+  window?: BudgetWindow;
 }
 
 /** Budget snapshot */
@@ -166,6 +232,8 @@ export interface BudgetSnapshot {
   perTask: number;
   perSession: number;
   perDay: number;
+  perWeek: number;
+  perMonth: number;
 }
 
 /** Policy rule definition */
@@ -184,6 +252,10 @@ export interface RuleAction {
   forceModel?: boolean;
   /** Additional cost multiplier */
   costMultiplier?: number;
+  /** Suggested optimization hints */
+  optimizations?: OptimizationAction[];
+  /** Override max task cost */
+  maxTaskCostUsd?: number;
 }
 
 /** Rule evaluation result */
@@ -191,6 +263,45 @@ export interface RuleResult {
   ruleName: string;
   priority: number;
   action: RuleAction;
+}
+
+export interface PolicyAlert {
+  severity: AlertSeverity;
+  code: string;
+  message: string;
+  window?: BudgetWindow;
+  createdAt: number;
+}
+
+export interface UsageTrendPoint {
+  period: string;
+  cost: number;
+  tokens: number;
+  tasks: number;
+}
+
+export interface UsageDashboard {
+  totals: {
+    sessionCost: number;
+    dailyCost: number;
+    weeklyCost: number;
+    monthlyCost: number;
+    totalTasks: number;
+    totalTokens: number;
+  };
+  burnRates: {
+    daily: number;
+    weekly: number;
+    monthly: number;
+  };
+  budgetUtilization: {
+    session: number;
+    daily: number;
+    weekly: number;
+    monthly: number;
+  };
+  topModels: Array<{ model: ModelTier; cost: number; tasks: number; tokens: number }>;
+  alerts: PolicyAlert[];
 }
 
 /** Cost report structure */
@@ -207,8 +318,29 @@ export interface CostReport {
     perTask: number;
     perSession: number;
     perDay: number;
+    perWeek: number;
+    perMonth: number;
   };
   remaining: BudgetSnapshot;
+  dashboard: UsageDashboard;
+  breakdown: {
+    byTaskType: Record<string, { count: number; cost: number; tokens: number }>;
+    bySession: Record<string, { count: number; cost: number; tokens: number }>;
+  };
+  trends: {
+    daily: UsageTrendPoint[];
+    weekly: UsageTrendPoint[];
+    monthly: UsageTrendPoint[];
+  };
+  forecast: {
+    day: number;
+    week: number;
+    month: number;
+  };
+  export: {
+    json: string;
+    csv: string;
+  };
   generatedAt: number;
 }
 
