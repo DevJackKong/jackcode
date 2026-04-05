@@ -8,6 +8,7 @@
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "test": "node --import tsx --test \"src/**/*.test.ts\"",
     "test:integration": "node --import tsx --test \"src/**/*.integration.test.ts\" \"tests/**/*.test.ts\"",
+    "test:e2e": "node --import tsx --test \"tests/e2e/**/*.test.ts\"",
     "clean": "rimraf dist",
     "lint": "eslint . --ext .ts",
     "format": "prettier --write ."
