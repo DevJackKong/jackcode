@@ -30,7 +30,6 @@ import type {
 } from '../types/scanner.js';
 
 const execFile = promisify(execFileCb);
-
 const DEFAULT_CONFIG: Partial<ScannerConfig> = {
   include: ['**/*'],
   exclude: [],
