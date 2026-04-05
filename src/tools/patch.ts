@@ -647,21 +647,29 @@ async function verifyPatchedFile(targetPath: string, content: string, config: Pa
 }
 
 async function runTypeScriptSyntaxCheck(content: string, targetPath: string): Promise<{ valid: boolean; errors: string[] }> {
-  const tempDir = join(process.cwd(), '.jackcode', 'syntax-check');
-  await ensureDir(tempDir);
-  const tempFile = join(tempDir, `${basename(targetPath).replace(/[^a-zA-Z0-9_.-]/g, '_')}.${randomUUID()}.ts`);
-  await fs.writeFile(tempFile, content, 'utf8');
-
   try {
-    const result = await runCommand('tsc', ['--noEmit', '--pretty', 'false', tempFile]);
+    const ts = await import('typescript');
+    const result = ts.transpileModule(content, {
+      fileName: basename(targetPath),
+      compilerOptions: {
+        target: ts.ScriptTarget.ES2022,
+        module: ts.ModuleKind.ESNext,
+        strict: false,
+        skipLibCheck: true,
+      },
+      reportDiagnostics: true,
+    });
+
+    const diagnostics = (result.diagnostics ?? [])
+      .filter((diagnostic) => diagnostic.category === ts.DiagnosticCategory.Error)
+      .map((diagnostic) => ts.flattenDiagnosticMessageText(diagnostic.messageText, '\n'));
+
     return {
-      valid: result.code === 0,
-      errors: result.code === 0 ? [] : [result.stderr || result.stdout || 'TypeScript syntax check failed'],
+      valid: diagnostics.length === 0,
+      errors: diagnostics,
     };
   } catch {
     return { valid: true, errors: [] };
-  } finally {
-    await fs.rm(tempFile, { force: true });
   }
 }
 
@@ -812,7 +820,7 @@ export async function applyPatch(
       if (!verification.valid) {
         throw Object.assign(
           new Error(`Verification failed: ${verification.errors.join('; ')}`),
-          { failureType: 'conflict' satisfies FailureType }
+          { failureType: (hadChecksumMismatch ? 'checksum_mismatch' : 'conflict') satisfies FailureType }
         );
       }
 
@@ -1095,7 +1103,7 @@ export function getActiveSnapshotIds(): string[] {
 
 export async function cleanupSnapshots(maxAgeDays?: number): Promise<string[]> {
   const retentionMs = (maxAgeDays ?? DEFAULT_CONFIG.snapshotRetentionDays) * 24 * 60 * 60 * 1000;
-  const cutoff = retentionMs < 0 ? Number.POSITIVE_INFINITY : Date.now() - retentionMs;
+  const cutoff = retentionMs < 0 ? Date.now() + Math.abs(retentionMs) : Date.now() - retentionMs;
   const removed: string[] = [];
 
   for (const [id, snapshot] of activeSnapshots) {

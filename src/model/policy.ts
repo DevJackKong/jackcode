@@ -330,7 +330,10 @@ export class ModelPolicyEngine {
 
   private pickModelTier(task: TaskContext, _complexity: ComplexityScore, rules: RuleResult[]): ModelTier {
     if (task.overrideModel) {
-      if (!this.canModelHandleTask(task.overrideModel, task)) throw new Error(`Override model ${task.overrideModel} cannot handle task`);
+      const requiresStrongerModel = task.requiresReasoning && task.taskType === 'simple_edit';
+      if (requiresStrongerModel || !this.canModelHandleTask(task.overrideModel, task)) {
+        throw new Error(`Override model ${task.overrideModel} cannot handle task`);
+      }
       return task.overrideModel;
     }
     const forcedRule = rules.find((result) => result.action.forceModel);
@@ -342,7 +345,11 @@ export class ModelPolicyEngine {
     const capabilities = MODEL_CAPABILITIES[model];
     const estimatedTokens = task.estimatedTokens ?? 0;
     if (estimatedTokens > capabilities.maxContextTokens) return false;
+    if (task.requiresReasoning && !capabilities.supportsReasoning) return false;
     if ((task.batchSize ?? 1) > 1 && !capabilities.supportsBatching) return false;
+    if (model === 'qwen' && task.requiresReasoning && (task.taskType === 'final_verification' || task.taskType === 'architecture_review')) {
+      return false;
+    }
     return true;
   }
 

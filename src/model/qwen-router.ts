@@ -285,7 +285,7 @@ export class QwenExecutorRouter {
     const userPrompt = request.userPrompt?.trim() || this.buildUserPrompt(request, trimmedContext, policyDecision);
     const messages: QwenMessage[] = [{ role: 'system', content: systemPrompt }, { role: 'user', content: userPrompt }];
     const tools = (request.tools ?? []).filter((tool) => profile.supportsTools || tool.name.length === 0);
-    const inputTokens = estimateTokens(`${systemPrompt}\n${userPrompt}`);
+    const inputTokens = Math.min(profile.contextWindow - 1, estimateTokens(`${systemPrompt}\n${userPrompt}`));
     const maxOutputTokens = Math.max(256, request.maxOutputTokens ?? this.config.outputTokenReserve);
     return {
       model,
@@ -492,7 +492,7 @@ export class QwenExecutorRouter {
       used += blockTokens;
       if (used >= promptBudget) break;
     }
-    return `${kept.join('\n\n')}\n\n[... unrelated implementation details omitted for Qwen budget ...]`;
+    return `${kept.join('\n\n')}\n\n[... context trimmed for Qwen token budget ...]`;
   }
 
   private scoreContextBlock(block: string, index: number, ops: string): number {
@@ -548,7 +548,7 @@ export class QwenExecutorRouter {
     const response = await this.executeWithRetry(prepared, request, span);
     const latency = Date.now() - startedAt;
     const operation = request.operations[0];
-    const completed: CompletedOperation = { ...operation, success: true, diff: response.content, latencyMs: latency };
+    const completed: CompletedOperation = { ...operation, success: true, diff: response.content ?? '', latencyMs: latency };
     return {
       taskId: request.taskId,
       success: true,
@@ -581,7 +581,7 @@ export class QwenExecutorRouter {
         totalLatency += latencyMs;
         totalTokens += response.tokensUsed ?? 0;
         retryCount += Number(response.metadata?.retryCount ?? 0);
-        return { ...operation, success: true, diff: response.content, latencyMs } satisfies CompletedOperation;
+        return { ...operation, success: true, diff: response.content ?? '', latencyMs } satisfies CompletedOperation;
       }));
       completed.push(...chunkResults);
     }
