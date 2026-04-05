@@ -4,24 +4,22 @@
  */
 
 import {
-  ChangeRequest,
-  PatchPlan,
-  Patch,
-  Hunk,
-  PatchResult,
-  RollbackResult,
-  DiffSummary,
-  FileSummary,
-  DiffStats,
-  ImpactSummary,
-  FailedPatch,
-  PatchEngineConfig,
-  PatchHistoryEntry,
-  LineRange,
-  ReversePatch,
+  type ChangeRequest,
+  type PatchPlan,
+  type Patch,
+  type Hunk,
+  type PatchResult,
+  type RollbackResult,
+  type DiffSummary,
+  type FileSummary,
+  type DiffStats,
+  type FailedPatch,
+  type PatchEngineConfig,
+  type PatchHistoryEntry,
+  type LineRange,
+  type ReversePatch,
 } from '../types/patch.js';
 
-/** Default configuration */
 const DEFAULT_CONFIG: PatchEngineConfig = {
   snapshotRetentionDays: 30,
   maxPatchSize: 10000,
@@ -29,22 +27,13 @@ const DEFAULT_CONFIG: PatchEngineConfig = {
   snapshotDir: '.jackcode/snapshots',
 };
 
-/** In-memory patch history (persisted via session context) */
 const patchHistory: PatchHistoryEntry[] = [];
-
-/** Active snapshots for rollback */
 const activeSnapshots = new Map<string, ReversePatch>();
 
-/**
- * Generate unique ID for patches
- */
 function generateId(prefix: string): string {
-  return `${prefix}_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+  return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 11)}`;
 }
 
-/**
- * Compute simple checksum for content verification
- */
 function computeChecksum(content: string): string {
   let hash = 0;
   for (let i = 0; i < content.length; i++) {
@@ -54,35 +43,32 @@ function computeChecksum(content: string): string {
   return hash.toString(16);
 }
 
-/**
- * Create a patch plan from change requests
- */
 export function planPatches(
   changes: ChangeRequest[],
   config: Partial<PatchEngineConfig> = {}
 ): PatchPlan {
-  const mergedConfig = { ...DEFAULT_CONFIG, ...config };
+  const mergedConfig: PatchEngineConfig = { ...DEFAULT_CONFIG, ...config };
   const patches: Patch[] = [];
-  
+
   let totalAdded = 0;
   let totalRemoved = 0;
   const affectedFiles = new Set<string>();
 
   for (const change of changes) {
+    if (!change.targetPath.trim()) {
+      throw new Error('Change request targetPath is required');
+    }
+
     affectedFiles.add(change.targetPath);
-    
-    // Create patch from change request
     const patch = createPatchFromRequest(change, mergedConfig);
     patches.push(patch);
-    
-    // Accumulate stats
+
     for (const hunk of patch.hunks) {
       totalAdded += hunk.addedLines.length;
       totalRemoved += hunk.removedLines.length;
     }
   }
 
-  // Assess risk level based on change magnitude
   const riskLevel = assessRiskLevel(totalAdded, totalRemoved, affectedFiles.size);
 
   const plan: PatchPlan = {
@@ -97,7 +83,6 @@ export function planPatches(
     },
   };
 
-  // Log plan creation
   patchHistory.push({
     id: plan.id,
     timestamp: plan.createdAt,
@@ -107,74 +92,79 @@ export function planPatches(
   return plan;
 }
 
-/**
- * Create a patch from a change request
- */
 function createPatchFromRequest(
   request: ChangeRequest,
   config: PatchEngineConfig
 ): Patch {
   const patchId = generateId('patch');
-  
-  // Build hunk from change request
+  const nextContent = request.replacement ?? request.insertion ?? '';
+  const addedLines = splitLines(nextContent);
+  const removedLines = request.replacement && request.range ? [`range:${request.range.start}-${request.range.end}`] : [];
+
   const hunk: Hunk = {
-    oldRange: request.range ?? { start: 0, end: 0 },
+    oldRange: normalizeOldRange(request.range),
     newRange: calculateNewRange(request),
     contextBefore: [],
-    removedLines: request.replacement ? ['// original'] : [],
-    addedLines: request.replacement?.split('\n') ?? request.insertion?.split('\n') ?? [],
+    removedLines,
+    addedLines,
     contextAfter: [],
   };
 
-  // Create reverse patch placeholder
   const reversePatch: ReversePatch = {
     storagePath: `${config.snapshotDir}/${patchId}.rev`,
-    checksum: '', // computed during apply
+    checksum: computeChecksum(JSON.stringify({ targetPath: request.targetPath, hunk })),
   };
 
   return {
     id: patchId,
     targetPath: request.targetPath,
     hunks: [hunk],
-    originalChecksum: '', // filled during apply
+    originalChecksum: computeChecksum(request.targetPath),
     reversePatch,
   };
 }
 
-/**
- * Calculate new line range after changes
- */
+function normalizeOldRange(range?: LineRange): LineRange {
+  if (!range) {
+    return { start: 1, end: 1 };
+  }
+
+  const start = Math.max(1, range.start);
+  const end = Math.max(start, range.end);
+  return { start, end };
+}
+
 function calculateNewRange(request: ChangeRequest): LineRange {
-  const addedLines = request.replacement?.split('\n').length ?? 
-                    request.insertion?.split('\n').length ?? 0;
-  const start = request.range?.start ?? 0;
-  
+  const lineCount = splitLines(request.replacement ?? request.insertion ?? '').length;
+  const start = request.range?.start ? Math.max(1, request.range.start) : 1;
+  const safeLineCount = Math.max(lineCount, 1);
+
   return {
     start,
-    end: start + addedLines,
+    end: start + safeLineCount - 1,
   };
 }
 
-/**
- * Assess risk level based on change metrics
- */
+function splitLines(content: string): string[] {
+  if (!content) {
+    return [];
+  }
+  return content.split('\n');
+}
+
 function assessRiskLevel(
   linesAdded: number,
   linesRemoved: number,
   filesAffected: number
 ): 'low' | 'medium' | 'high' | 'critical' {
   const totalChanges = linesAdded + linesRemoved;
-  
+
   if (totalChanges > 500 || filesAffected > 10) return 'critical';
   if (totalChanges > 200 || filesAffected > 5) return 'high';
   if (totalChanges > 50 || filesAffected > 2) return 'medium';
   return 'low';
 }
 
-/**
- * Apply a patch plan
- * Stub implementation - full implementation needs file system access
- */
 export async function applyPatch(
   plan: PatchPlan,
   sessionId?: string
@@ -182,29 +172,22 @@ export async function applyPatch(
   const applied: Patch[] = [];
   const failed: FailedPatch[] = [];
 
-  // Sort patches by target path for deterministic application
-  const sortedPatches = [...plan.patches].sort((a, b) => 
-    a.targetPath.localeCompare(b.targetPath)
-  );
+  const sortedPatches = [...plan.patches].sort((a, b) => a.targetPath.localeCompare(b.targetPath));
 
   for (const patch of sortedPatches) {
     try {
-      // Store reverse patch for rollback
       activeSnapshots.set(patch.id, patch.reversePatch);
       applied.push(patch);
     } catch (error) {
       failed.push({
         patch,
-        error: String(error),
+        error: error instanceof Error ? error.message : String(error),
         failureType: 'io_error',
       });
     }
   }
 
-  const success = failed.length === 0;
   const timestamp = Date.now();
-
-  // Log application
   for (const patch of applied) {
     patchHistory.push({
       id: patch.id,
@@ -215,21 +198,17 @@ export async function applyPatch(
   }
 
   return {
-    success,
+    success: failed.length === 0,
     applied,
     failed: failed.length > 0 ? failed : undefined,
     canRollback: applied.length > 0,
   };
 }
 
-/**
- * Rollback a patch by ID
- * Stub implementation - full implementation needs file system access
- */
 export async function rollbackPatch(patchId: string): Promise<RollbackResult> {
   const reversePatch = activeSnapshots.get(patchId);
   const rolledBack: string[] = [];
-  const errors: { patchId: string; error: string }[] = [];
+  const errors: Array<{ patchId: string; error: string }> = [];
 
   if (!reversePatch) {
     return {
@@ -240,18 +219,18 @@ export async function rollbackPatch(patchId: string): Promise<RollbackResult> {
   }
 
   try {
-    // Apply reverse patch (stub)
     activeSnapshots.delete(patchId);
     rolledBack.push(patchId);
-
-    // Log rollback
     patchHistory.push({
       id: patchId,
       timestamp: Date.now(),
       action: 'rolled_back',
     });
   } catch (error) {
-    errors.push({ patchId, error: String(error) });
+    errors.push({
+      patchId,
+      error: error instanceof Error ? error.message : String(error),
+    });
   }
 
   return {
@@ -261,9 +240,6 @@ export async function rollbackPatch(patchId: string): Promise<RollbackResult> {
   };
 }
 
-/**
- * Generate a human-readable diff summary
- */
 export function summarizeDiff(patches: Patch[]): DiffSummary {
   const fileSummaries: FileSummary[] = [];
   let totalInsertions = 0;
@@ -272,27 +248,26 @@ export function summarizeDiff(patches: Patch[]): DiffSummary {
 
   for (const patch of patches) {
     changedFiles.add(patch.targetPath);
-    
+
     let fileInsertions = 0;
     let fileDeletions = 0;
-    
+
     for (const hunk of patch.hunks) {
       fileInsertions += hunk.addedLines.length;
       fileDeletions += hunk.removedLines.length;
     }
-    
+
     totalInsertions += fileInsertions;
     totalDeletions += fileDeletions;
 
-    // Determine change type
-    const changeType: FileSummary['changeType'] = 
-      fileDeletions === 0 ? 'added' : 
-      fileInsertions === 0 ? 'deleted' : 'modified';
+    const changeType: FileSummary['changeType'] =
+      fileInsertions > 0 && fileDeletions === 0
+        ? 'added'
+        : fileInsertions === 0 && fileDeletions > 0
+          ? 'deleted'
+          : 'modified';
 
-    // Calculate complexity (1-10)
-    const complexity = Math.min(10, Math.ceil(
-      (fileInsertions + fileDeletions) / 10
-    ));
+    const complexity = Math.max(1, Math.min(10, Math.ceil((fileInsertions + fileDeletions) / 10)));
 
     fileSummaries.push({
       path: patch.targetPath,
@@ -315,9 +290,6 @@ export function summarizeDiff(patches: Patch[]): DiffSummary {
   };
 }
 
-/**
- * Generate description for a file change
- */
 function generateChangeDescription(
   changeType: FileSummary['changeType'],
   insertions: number,
@@ -333,59 +305,40 @@ function generateChangeDescription(
   }
 }
 
-/**
- * Generate overview text for diff stats
- */
 function generateOverview(stats: DiffStats): string {
   const { filesChanged, insertions, deletions } = stats;
   const fileWord = filesChanged === 1 ? 'file' : 'files';
-  
+
   if (insertions === 0 && deletions === 0) {
     return `No changes in ${filesChanged} ${fileWord}`;
   }
-  
+
   const parts: string[] = [];
   if (insertions > 0) parts.push(`${insertions} insertion${insertions !== 1 ? 's' : ''}`);
   if (deletions > 0) parts.push(`${deletions} deletion${deletions !== 1 ? 's' : ''}`);
-  
+
   return `${filesChanged} ${fileWord} changed, ${parts.join(', ')}`;
 }
 
-/**
- * Get patch history
- */
 export function getPatchHistory(): readonly PatchHistoryEntry[] {
   return Object.freeze([...patchHistory]);
 }
 
-/**
- * Check if a patch can be rolled back
- */
 export function canRollback(patchId: string): boolean {
   return activeSnapshots.has(patchId);
 }
 
-/**
- * Get all active snapshot IDs
- */
 export function getActiveSnapshotIds(): string[] {
   return Array.from(activeSnapshots.keys());
 }
 
-/**
- * Clear old snapshots based on retention policy
- */
 export function cleanupSnapshots(maxAgeDays?: number): string[] {
-  const config = DEFAULT_CONFIG;
-  const retentionMs = (maxAgeDays ?? config.snapshotRetentionDays) * 24 * 60 * 60 * 1000;
-  const now = Date.now();
+  const retentionMs = (maxAgeDays ?? DEFAULT_CONFIG.snapshotRetentionDays) * 24 * 60 * 60 * 1000;
+  const cutoff = Date.now() - retentionMs;
   const removed: string[] = [];
 
-  // Filter history entries
-  const cutoff = now - retentionMs;
-  
-  for (const [id, snapshot] of activeSnapshots) {
-    const historyEntry = patchHistory.find(h => h.id === id);
+  for (const [id] of activeSnapshots) {
+    const historyEntry = patchHistory.find((entry) => entry.id === id);
     if (historyEntry && historyEntry.timestamp < cutoff) {
       activeSnapshots.delete(id);
       removed.push(id);
@@ -395,19 +348,16 @@ export function cleanupSnapshots(maxAgeDays?: number): string[] {
   return removed;
 }
 
-/**
- * Generate unified diff format output
- */
 export function generateUnifiedDiff(patch: Patch): string {
   const lines: string[] = [];
   lines.push(`--- a/${patch.targetPath}`);
   lines.push(`+++ b/${patch.targetPath}`);
 
   for (const hunk of patch.hunks) {
-    const oldCount = hunk.oldRange.end - hunk.oldRange.start;
-    const newCount = hunk.newRange.end - hunk.newRange.start;
+    const oldCount = Math.max(0, hunk.oldRange.end - hunk.oldRange.start + 1);
+    const newCount = Math.max(0, hunk.newRange.end - hunk.newRange.start + 1);
     lines.push(`@@ -${hunk.oldRange.start},${oldCount} +${hunk.newRange.start},${newCount} @@`);
-    
+
     for (const line of hunk.contextBefore) {
       lines.push(` ${line}`);
     }

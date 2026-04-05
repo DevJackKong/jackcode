@@ -53,17 +53,30 @@ export interface StateTransition {
 
 const ALLOWED_TRANSITIONS: StateTransition[] = [
   { from: 'plan', to: 'execute', validator: (ctx) => ctx.plan !== undefined },
+  { from: 'plan', to: 'error' },
   { from: 'execute', to: 'review' },
   { from: 'execute', to: 'repair', validator: (ctx) => ctx.errors.length > 0 },
+  { from: 'execute', to: 'error' },
   { from: 'repair', to: 'execute', validator: (ctx) => ctx.attempts < ctx.maxAttempts },
-  { from: 'review', to: 'done' },
   { from: 'repair', to: 'error', validator: (ctx) => ctx.attempts >= ctx.maxAttempts },
+  { from: 'review', to: 'done' },
+  { from: 'review', to: 'error' },
 ];
 
 export class RuntimeStateMachine {
   private tasks: Map<string, TaskContext> = new Map();
 
   createTask(id: string, intent: string, maxAttempts = 3): TaskContext {
+    if (!id.trim()) {
+      throw new Error('Task id is required');
+    }
+    if (!intent.trim()) {
+      throw new Error('Task intent is required');
+    }
+    if (!Number.isInteger(maxAttempts) || maxAttempts < 1) {
+      throw new Error('maxAttempts must be a positive integer');
+    }
+
     const task: TaskContext = {
       id,
       state: 'plan',
@@ -92,15 +105,11 @@ export class RuntimeStateMachine {
     );
 
     if (!transition) {
-      throw new Error(
-        `Invalid transition: ${task.state} -> ${toState}`
-      );
+      throw new Error(`Invalid transition: ${task.state} -> ${toState}`);
     }
 
     if (transition.validator && !transition.validator(task)) {
-      throw new Error(
-        `Transition validation failed: ${task.state} -> ${toState}`
-      );
+      throw new Error(`Transition validation failed: ${task.state} -> ${toState}`);
     }
 
     task.state = toState;
@@ -124,15 +133,18 @@ export class RuntimeStateMachine {
     if (!task) {
       throw new Error(`Task ${id} not found`);
     }
+
     task.errors.push({
       timestamp: Date.now(),
       state: task.state,
       message,
       recoverable,
     });
+
     if (task.state === 'execute' || task.state === 'repair') {
       task.attempts++;
     }
+
     return task;
   }
 
@@ -150,6 +162,10 @@ export class RuntimeStateMachine {
   }
 
   routeToModel(task: TaskContext): ModelTier | null {
+    if (task.state === 'execute' && task.plan?.targetModel) {
+      return task.plan.targetModel;
+    }
+
     switch (task.state) {
       case 'plan':
       case 'execute':
