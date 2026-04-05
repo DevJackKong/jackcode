@@ -739,13 +739,13 @@ export class WorkflowExecutor {
       state.endTime = Date.now();
 
       return { approved: true, result: patchResult, summary };
-    } catch {
+    } catch (error) {
       state.steps[1].status = 'failed';
       state.steps[1].endTime = Date.now();
       state.steps[2].status = 'skipped';
       state.currentStepId = undefined;
       state.endTime = Date.now();
-      throw;
+      throw error;
     }
   }
 

@@ -1,12 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs';
-import path from 'node:path';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
+import path from 'node:path';
+import { RepoScanner } from './scanner.js';
 
-import { RuntimeStateMachine, type ExecutionPlan, type TaskContext } from './runtime.ts';
-import type { HandoffPayload } from '../types/session.ts';
-import type { ClassifiedFailure, RecoveryResult } from '../types/repairer.ts';
+import { RuntimeStateMachine, type ExecutionPlan, type TaskContext } from './runtime.js';
+import type { HandoffPayload } from '../types/session.js';
+import type { ClassifiedFailure, RecoveryResult } from '../types/repairer.js';
 
 const TMP_DIR = mkdtempSync(path.join(os.tmpdir(), 'jackcode-runtime-tests-'));
 mkdirSync(TMP_DIR, { recursive: true });
@@ -137,8 +138,8 @@ test('queues higher priority tasks first', () => {
   const { runtime } = createRuntime({ name: 'priority-queue' });
 
   const low = runtime.createTask('low priority', { id: 'low', priority: 'low' });
-  const critical = runtime.createTask('critical priority', { id: 'critical', priority: 'critical' });
-  const high = runtime.createTask('high priority', { id: 'high', priority: 'high' });
+  runtime.createTask('critical priority', { id: 'critical', priority: 'critical' });
+  runtime.createTask('high priority', { id: 'high', priority: 'high' });
 
   assert.equal(low.id, 'low');
   const queue = runtime.getQueue();
@@ -355,4 +356,38 @@ test('persists and recovers queued tasks', () => {
 
 test.after(() => {
   rmSync(TMP_DIR, { recursive: true, force: true });
+});
+
+test('runtime scans repo and stores scanner snapshot for session', async () => {
+  const repoDir = mkdtempSync(path.join(TMP_DIR, 'scanner-runtime-'));
+  mkdirSync(path.join(repoDir, 'src'), { recursive: true });
+  writeFileSync(path.join(repoDir, 'src/index.js'), 'export const ok = true;\n', 'utf8');
+
+  const scanner = new RepoScanner({ rootDir: repoDir });
+  let snapshotRoot: string | null = null;
+
+  const runtime = new RuntimeStateMachine(
+    {
+      scanner,
+      session: {
+        updateTaskStatus: () => true,
+        setScannerSnapshot: (_sessionId, snapshot) => {
+          snapshotRoot = (snapshot as { rootDir?: string })?.rootDir ?? null;
+          return true;
+        },
+      },
+      executor: {
+        execute: async () => ({ success: true }),
+        review: async () => ({ approved: true }),
+      },
+    },
+    { autoPersist: false }
+  );
+
+  runtime.createTask('scan repo', { id: 'scan-task', sessionId: 'session-1' });
+  runtime.setPlan('scan-task', createPlan());
+  await runtime.runTask('scan-task');
+
+  assert.equal(snapshotRoot, repoDir);
+  rmSync(repoDir, { recursive: true, force: true });
 });
